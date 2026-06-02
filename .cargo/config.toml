@@ -1,0 +1,14 @@
+[build]
+target = "riscv64gc-unknown-none-elf"
+
+[unstable]
+build-std = ["core", "alloc", "compiler_builtins"]
+
+[target.riscv64gc-unknown-none-elf]
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "code-model=medium",
+    "-C", "relocation-model=static",
+    "-C", "panic=abort",
+]
+runner = "qemu-system-riscv64 -machine virt -bios default -nographic -initrd test_root.tar -kernel"

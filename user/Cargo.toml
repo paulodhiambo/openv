@@ -1,0 +1,3 @@
+[workspace]
+members = ["libos", "init", "sh", "ls", "cat", "producer", "consumer", "net-smoltcp", "hello", "doexec"]
+resolver = "2"

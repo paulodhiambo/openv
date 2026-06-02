@@ -1,0 +1,11 @@
+[package]
+name = "cat"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libos = { path = "../libos" }
+
+[[bin]]
+name = "cat"
+path = "src/main.rs"
