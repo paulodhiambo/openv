@@ -98,6 +98,7 @@ pub fn schedule() {
                     };
 
                     let satp_val = proc.satp_val;
+                    drop(proc); // drop Arc before diverging into assembly sret
                     unsafe {
                         riscv::register::satp::write(satp_val);
                         core::arch::asm!("sfence.vma");

@@ -325,6 +325,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                         tf.regs[10] = 1;
                                     } else {
                                         drop(fds);
+                                        drop(proc);
                                         tf.sepc -= 4;
                                         crate::posix::process::RUN_QUEUE
                                             .lock()
@@ -392,6 +393,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                                 uart.put_char(b'\n');
                                                 drop(buf_lock);
                                                 drop(fds);
+                                                drop(proc);
                                                 let fg = crate::posix::process::FOREGROUND_PID
                                                     .swap(-1, Ordering::Relaxed);
                                                 let target = if fg > 0 {
@@ -417,6 +419,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                             // Block by restarting the syscall and yielding
                                             drop(buf_lock);
                                             drop(fds);
+                                            drop(proc);
                                             tf.sepc -= 4;
                                             crate::posix::process::RUN_QUEUE
                                                 .lock()
@@ -438,6 +441,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                 } else {
                                     // Block by restarting the syscall
                                     drop(fds);
+                                    drop(proc);
                                     tf.sepc -= 4; // Rewind to ecall
                                     crate::posix::process::RUN_QUEUE
                                         .lock()
@@ -479,6 +483,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                     // No data yet — yield and retry
                                     drop(data);
                                     drop(fds);
+                                    drop(proc);
                                     tf.sepc -= 4;
                                     crate::posix::process::RUN_QUEUE
                                         .lock()
@@ -906,6 +911,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                 } else {
                                     // Block until message arrives
                                     drop(fds);
+                                    drop(proc);
                                     tf.sepc -= 4;
                                     crate::posix::process::RUN_QUEUE
                                         .lock()
@@ -1239,6 +1245,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                 tf.sepc -= 4; // restart waitpid when resumed
                                 *proc.state.lock() = crate::posix::process::ProcState::Stopped;
                                 crate::posix::process::RUN_QUEUE.lock().push_back(ppid);
+                                drop(proc); // drop Arc before diverging into schedule()
                                 crate::posix::process::schedule();
                                 unsafe { __halt_cpu() }
                             } else {
