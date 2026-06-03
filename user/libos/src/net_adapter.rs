@@ -3,7 +3,9 @@
 /// Send a raw packet via kernel-provided networking syscall (stubbed)
 pub fn send_packet(packet: &[u8]) {
     // syscall number 10 reserved for net_send in this proto
-    unsafe { super::syscall(10, packet.as_ptr() as usize, packet.len(), 0); }
+    unsafe {
+        super::syscall(10, packet.as_ptr() as usize, packet.len(), 0);
+    }
 }
 
 /// Receive a raw packet into buffer, returns number of bytes received

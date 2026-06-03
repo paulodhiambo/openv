@@ -1,15 +1,21 @@
-use crate::vfs::{Vnode, VnodeType, Stat, DirEntry};
-use core::sync::atomic::Ordering;
+use crate::vfs::{DirEntry, Stat, Vnode, VnodeType};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::string::String;
+use core::sync::atomic::Ordering;
 
 /// Root of /proc — enumerates live PIDs as subdirectories.
 pub struct ProcRoot;
 
 impl Vnode for ProcRoot {
     fn stat(&self) -> Stat {
-        Stat { mode: 0o555, uid: 0, gid: 0, size: 0, vtype: VnodeType::Directory }
+        Stat {
+            mode: 0o555,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            vtype: VnodeType::Directory,
+        }
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn Vnode>, &'static str> {
@@ -31,7 +37,10 @@ impl Vnode for ProcRoot {
             let n = *pid as u32;
             let digits = fmt_u32(n);
             s.push_str(core::str::from_utf8(&digits).unwrap_or("?"));
-            entries.push(DirEntry { name: s, vtype: VnodeType::Directory });
+            entries.push(DirEntry {
+                name: s,
+                vtype: VnodeType::Directory,
+            });
         }
         Ok(entries)
     }
@@ -44,7 +53,13 @@ pub struct ProcPidDir {
 
 impl Vnode for ProcPidDir {
     fn stat(&self) -> Stat {
-        Stat { mode: 0o555, uid: 0, gid: 0, size: 0, vtype: VnodeType::Directory }
+        Stat {
+            mode: 0o555,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            vtype: VnodeType::Directory,
+        }
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn Vnode>, &'static str> {
@@ -56,7 +71,10 @@ impl Vnode for ProcPidDir {
     }
 
     fn readdir(&self) -> Result<Vec<DirEntry>, &'static str> {
-        Ok(alloc::vec![DirEntry { name: String::from("status"), vtype: VnodeType::File }])
+        Ok(alloc::vec![DirEntry {
+            name: String::from("status"),
+            vtype: VnodeType::File
+        }])
     }
 }
 
@@ -67,7 +85,13 @@ pub struct ProcPidStatus {
 
 impl Vnode for ProcPidStatus {
     fn stat(&self) -> Stat {
-        Stat { mode: 0o444, uid: 0, gid: 0, size: 0, vtype: VnodeType::File }
+        Stat {
+            mode: 0o444,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            vtype: VnodeType::File,
+        }
     }
 
     fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, &'static str> {

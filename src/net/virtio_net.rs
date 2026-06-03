@@ -1,11 +1,13 @@
 // Minimal virtio-net driver skeleton. For M1 this provides a loopback device
-use crate::net::pktbuf::PktBuf;
 use crate::net::NetDevice;
+use crate::net::pktbuf::PktBuf;
 
 pub struct LoopbackNet;
 
 impl LoopbackNet {
-    pub const fn new() -> Self { LoopbackNet }
+    pub const fn new() -> Self {
+        LoopbackNet
+    }
 
     /// Initialize and register the loopback device
     pub fn init() {
@@ -44,8 +46,8 @@ impl NetDevice for LoopbackNet {
     }
 }
 
-use spin::Mutex;
 use crate::net::pktbuf::PktBuf as _Pkt;
+use spin::Mutex;
 
 struct StaticPkt {
     len: usize,
@@ -53,7 +55,12 @@ struct StaticPkt {
 }
 
 impl StaticPkt {
-    const fn empty() -> Self { Self { len: 0, data: [0u8; super::pktbuf::MAX_PKT_SIZE] } }
+    const fn empty() -> Self {
+        Self {
+            len: 0,
+            data: [0u8; super::pktbuf::MAX_PKT_SIZE],
+        }
+    }
 }
 
 static LOOPBACK_BUF: Mutex<StaticPkt> = Mutex::new(StaticPkt::empty());

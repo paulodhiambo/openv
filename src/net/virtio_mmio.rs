@@ -7,11 +7,11 @@
 //!  - allocates a page for a virtqueue and writes the PFN
 //!  - registers a simple runtime NetDevice that will later be wired to the queue
 
-use crate::println;
 use crate::net::NetDevice;
+use crate::net::virtqueue::VirtQueue;
+use crate::println;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use crate::net::virtqueue::VirtQueue;
 
 use spin::Mutex;
 static DRIVER_GLOBAL: Mutex<Option<&'static VirtioDriver>> = Mutex::new(None);
@@ -59,7 +59,12 @@ struct VirtioDriver {
 impl VirtioDriver {
     fn new(base: usize, q_pa: usize, qsize: usize, irq: u32) -> Self {
         let vq = VirtQueue::new(q_pa, qsize);
-        VirtioDriver { base, q_pa, vq: Mutex::new(vq), irq }
+        VirtioDriver {
+            base,
+            q_pa,
+            vq: Mutex::new(vq),
+            irq,
+        }
     }
 
     fn reset(&self) {
@@ -143,11 +148,19 @@ impl NetDevice for VirtioDriver {
         let mut copied = 0usize;
         for (pa, len) in parts.iter() {
             let to_copy = core::cmp::min(*len as usize, buf.len() - copied);
-            unsafe { core::ptr::copy_nonoverlapping(*pa as *const u8, buf[copied..].as_mut_ptr(), to_copy); }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    *pa as *const u8,
+                    buf[copied..].as_mut_ptr(),
+                    to_copy,
+                );
+            }
             copied += to_copy;
             // Free page
             crate::mm::pmm::free_page(*pa as usize);
-            if copied >= buf.len() { break; }
+            if copied >= buf.len() {
+                break;
+            }
         }
         // Return descriptors to free list
         vq.free_chain(id);
@@ -176,12 +189,15 @@ pub fn probe_and_init() -> bool {
                     // Fallback: parse base from node name like 'virtio_mmio@10008000'
                     if base == 0 {
                         if let Some(idx) = node.name.rfind('@') {
-                            if let Ok(x) = usize::from_str_radix(&node.name[idx+1..], 16) {
+                            if let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16) {
                                 base = x;
                             }
                         }
                     }
-                    println!("virtio-mmio: node '{}' compat contains virtio,mmio; base={:#x}", node.name, base);
+                    println!(
+                        "virtio-mmio: node '{}' compat contains virtio,mmio; base={:#x}",
+                        node.name, base
+                    );
 
                     if base != 0 {
                         // Read magic to verify MMIO presence (best-effort)
@@ -195,11 +211,21 @@ pub fn probe_and_init() -> bool {
                         // Allocate a page for virtqueue metadata (guest physical page)
                         let q_pa = crate::mm::pmm::alloc_page().expect("failed to alloc vq page");
                         let qnum = mmio_read32(base, OFF_QUEUE_NUM_MAX);
-                        let qsize = if qnum == 0 { 256 } else { core::cmp::min(qnum, 256) };
-                        println!("virtio-mmio: allocated virtqueue page at PA {:#x}, qnum_max={}, using qsize={}", q_pa, qnum, qsize);
+                        let qsize = if qnum == 0 {
+                            256
+                        } else {
+                            core::cmp::min(qnum, 256)
+                        };
+                        println!(
+                            "virtio-mmio: allocated virtqueue page at PA {:#x}, qnum_max={}, using qsize={}",
+                            q_pa, qnum, qsize
+                        );
 
                         // Try to read an interrupt spec from DTB (best-effort). If unavailable, irq=0
-                        let irq = node.property("interrupts").and_then(|p| p.as_usize()).unwrap_or(0) as u32;
+                        let irq = node
+                            .property("interrupts")
+                            .and_then(|p| p.as_usize())
+                            .unwrap_or(0) as u32;
 
                         let drv = VirtioDriver::new(base, q_pa, qsize as usize, irq);
                         drv.reset();
@@ -265,7 +291,10 @@ impl crate::drivers::Driver for VirtioDriver {
 }
 
 /// Driver framework entry-point: called by `drivers::probe_all` when a virtio,mmio node is found.
-pub fn probe_driver(base: usize, irq: usize) -> Option<alloc::boxed::Box<dyn crate::drivers::Driver>> {
+pub fn probe_driver(
+    base: usize,
+    irq: usize,
+) -> Option<alloc::boxed::Box<dyn crate::drivers::Driver>> {
     if base == 0 {
         return None;
     }
@@ -274,8 +303,12 @@ pub fn probe_driver(base: usize, irq: usize) -> Option<alloc::boxed::Box<dyn cra
         return None;
     }
     let q_pa = crate::mm::pmm::alloc_page()?;
-    let qnum  = mmio_read32(base, OFF_QUEUE_NUM_MAX);
-    let qsize = if qnum == 0 { 256 } else { core::cmp::min(qnum, 256) };
+    let qnum = mmio_read32(base, OFF_QUEUE_NUM_MAX);
+    let qsize = if qnum == 0 {
+        256
+    } else {
+        core::cmp::min(qnum, 256)
+    };
     let drv = VirtioDriver::new(base, q_pa, qsize as usize, irq as u32);
     drv.reset();
     drv.negotiate_features();
@@ -309,7 +342,9 @@ pub fn try_dequeue_rx(buf: &mut [u8]) -> Option<usize> {
     // Copy from PA into buf
     let src = pa as *const u8;
     let to_copy = core::cmp::min(buf.len(), len as usize);
-    unsafe { core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_copy); }
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_copy);
+    }
     // Free the physical page back to PMM
     crate::mm::pmm::free_page(pa);
     Some(to_copy)

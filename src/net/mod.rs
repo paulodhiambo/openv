@@ -1,9 +1,9 @@
-pub mod pktbuf;
 pub mod core;
-pub mod virtio_net;
-pub mod virtio_mmio;
-pub mod virtqueue;
+pub mod pktbuf;
 pub mod socket;
+pub mod virtio_mmio;
+pub mod virtio_net;
+pub mod virtqueue;
 
 use spin::Mutex;
 

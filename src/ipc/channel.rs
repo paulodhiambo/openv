@@ -1,9 +1,9 @@
+use crate::ipc::handle::{Handle, Koid, generate_koid};
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::task::{Poll, Waker};
 use spin::Mutex;
-use crate::ipc::handle::{generate_koid, Handle, Koid};
 
 /// A message sent over a channel.
 pub struct Message {
@@ -56,20 +56,20 @@ impl ChannelEndpoint {
     pub fn write(&self, msg: Message) -> Result<(), &'static str> {
         let peer_arc = self.peer.lock().upgrade().ok_or("Peer closed")?;
         let mut peer_state = peer_arc.state.lock();
-        
+
         peer_state.queue.push_back(msg);
-        
+
         if let Some(waker) = peer_state.waker.take() {
             waker.wake();
         }
-        
+
         Ok(())
     }
 
     /// Attempts to read a message. Returns `Poll::Pending` and registers the waker if empty.
     pub fn poll_recv(&self, waker: &Waker) -> Poll<Result<Message, &'static str>> {
         let mut state = self.state.lock();
-        
+
         if let Some(msg) = state.queue.pop_front() {
             Poll::Ready(Ok(msg))
         } else if state.peer_closed {
@@ -79,7 +79,7 @@ impl ChannelEndpoint {
             Poll::Pending
         }
     }
-    
+
     /// Synchronous read for testing, without involving a real executor.
     pub fn try_recv(&self) -> Option<Message> {
         self.state.lock().queue.pop_front()

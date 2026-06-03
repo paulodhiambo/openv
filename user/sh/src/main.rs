@@ -3,77 +3,124 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use libos::{write, read, open, close, getdents, spawn, exit, sys_yield, create, set_raw, waitpid, mkdir, unlink};
+use libos::{
+    chdir, close, create, dup, dup2, exec, exit, fork, getdents, mkdir, open, pipe, read, set_raw,
+    sys_yield, unlink, waitpid, write,
+};
 
-// ── ANSI helpers ──────────────────────────────────────────────────────────────
-const RESET:  &[u8] = b"\x1b[0m";
-const BOLD:   &[u8] = b"\x1b[1m";
-const REV:    &[u8] = b"\x1b[7m";
-const GREEN:  &[u8] = b"\x1b[32m";
-const CYAN:   &[u8] = b"\x1b[36m";
+const RESET: &[u8] = b"\x1b[0m";
+const BOLD: &[u8] = b"\x1b[1m";
+const REV: &[u8] = b"\x1b[7m";
+const GREEN: &[u8] = b"\x1b[32m";
+const CYAN: &[u8] = b"\x1b[36m";
 const YELLOW: &[u8] = b"\x1b[33m";
-const CLR:    &[u8] = b"\x1b[2J\x1b[H";
+const CLR: &[u8] = b"\x1b[2J\x1b[H";
 
-fn wrt(s: &[u8])   { write(1, s.as_ptr(), s.len()); }
-fn wrt_str(s: &str) { wrt(s.as_bytes()); }
-fn wrt_nl()         { wrt(b"\n"); }
+fn wrt(s: &[u8]) {
+    write(1, s.as_ptr(), s.len());
+}
+fn wrt_str(s: &str) {
+    wrt(s.as_bytes());
+}
+fn wrt_nl() {
+    wrt(b"\n");
+}
 
 fn wrt_num(mut n: usize) {
-    if n == 0 { wrt(b"0"); return; }
+    if n == 0 {
+        wrt(b"0");
+        return;
+    }
     let mut tmp = [0u8; 20];
     let mut len = 0;
-    while n > 0 { tmp[len] = b'0' + (n % 10) as u8; n /= 10; len += 1; }
+    while n > 0 {
+        tmp[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
     let mut out = [0u8; 20];
-    for i in 0..len { out[i] = tmp[len - 1 - i]; }
+    for i in 0..len {
+        out[i] = tmp[len - 1 - i];
+    }
     wrt(&out[..len]);
 }
 
 fn fmt_decimal(buf: &mut [u8], mut n: usize) -> usize {
-    if n == 0 { buf[0] = b'0'; return 1; }
+    if n == 0 {
+        buf[0] = b'0';
+        return 1;
+    }
     let mut tmp = [0u8; 20];
     let mut len = 0;
-    while n > 0 { tmp[len] = b'0' + (n % 10) as u8; n /= 10; len += 1; }
-    for i in 0..len { buf[i] = tmp[len - 1 - i]; }
+    while n > 0 {
+        tmp[len] = b'0' + (n % 10) as u8;
+        n /= 10;
+        len += 1;
+    }
+    for i in 0..len {
+        buf[i] = tmp[len - 1 - i];
+    }
     len
 }
 
-// Emit ESC[nD (move cursor left n columns)
 fn move_left(n: usize) {
-    if n == 0 { return; }
+    if n == 0 {
+        return;
+    }
     let mut seq = [0u8; 8];
-    seq[0] = 0x1b; seq[1] = b'[';
+    seq[0] = 0x1b;
+    seq[1] = b'[';
     let mut p = 2;
     p += fmt_decimal(&mut seq[p..], n);
-    seq[p] = b'D'; p += 1;
+    seq[p] = b'D';
+    p += 1;
     wrt(&seq[..p]);
 }
 
+// ── Pipeline stage ────────────────────────────────────────────────────────────
+
+struct Stage {
+    args: Vec<Vec<u8>>,
+    stdin_file: Option<Vec<u8>>,
+    stdout_file: Option<Vec<u8>>,
+}
+
 // ── Shell ─────────────────────────────────────────────────────────────────────
+
 struct Shell {
-    cwd:     Vec<u8>,
+    cwd: Vec<u8>,
     history: Vec<Vec<u8>>,
 }
 
 impl Shell {
     fn new() -> Self {
-        Shell { cwd: b"/".to_vec(), history: Vec::new() }
+        Shell {
+            cwd: b"/".to_vec(),
+            history: Vec::new(),
+        }
     }
 
     fn prompt(&self) {
-        wrt(GREEN); wrt(b"guest@openv"); wrt(RESET);
-        wrt(b":"); wrt(CYAN);
-        if self.cwd == b"/" { wrt(b"~"); } else { wrt(&self.cwd); }
-        wrt(RESET); wrt(b"$ ");
+        wrt(GREEN);
+        wrt(b"guest@openv");
+        wrt(RESET);
+        wrt(b":");
+        wrt(CYAN);
+        if self.cwd == b"/" {
+            wrt(b"~");
+        } else {
+            wrt(&self.cwd);
+        }
+        wrt(RESET);
+        wrt(b"$ ");
     }
 
-    // Raw-mode line editor: arrow keys, history, basic editing.
-    // Caller must already have enabled raw mode.
     fn read_line_raw(&mut self) -> Vec<u8> {
         let hist_len = self.history.len();
-        let mut buf: Vec<u8>  = Vec::new();
+        let mut buf: Vec<u8> = Vec::new();
         let mut cursor: usize = 0;
-        let mut hist_idx      = hist_len; // past-end = live input
-        let mut saved: Vec<u8> = Vec::new(); // saved live input during history nav
+        let mut hist_idx = hist_len;
+        let mut saved: Vec<u8> = Vec::new();
 
         loop {
             let c = read_raw_byte();
@@ -83,23 +130,26 @@ impl Shell {
                     return buf;
                 }
 
-                // ── Escape sequences (arrows, Home, End, Delete) ──────────────
                 0x1b => {
                     let b1 = read_raw_byte();
-                    if b1 != b'[' { continue; }
+                    if b1 != b'[' {
+                        continue;
+                    }
                     let b2 = read_raw_byte();
                     match b2 {
-                        b'A' => { // Up — previous history entry
+                        b'A' => {
                             if hist_idx > 0 {
-                                if hist_idx == hist_len { saved = buf.clone(); }
+                                if hist_idx == hist_len {
+                                    saved = buf.clone();
+                                }
                                 hist_idx -= 1;
                                 let entry = self.history[hist_idx].clone();
                                 Self::replace_input(&buf, cursor, &entry);
                                 cursor = entry.len();
-                                buf    = entry;
+                                buf = entry;
                             }
                         }
-                        b'B' => { // Down — next history entry
+                        b'B' => {
                             if hist_idx < hist_len {
                                 hist_idx += 1;
                                 let entry = if hist_idx == hist_len {
@@ -109,35 +159,35 @@ impl Shell {
                                 };
                                 Self::replace_input(&buf, cursor, &entry);
                                 cursor = entry.len();
-                                buf    = entry;
+                                buf = entry;
                             }
                         }
-                        b'C' => { // Right
+                        b'C' => {
                             if cursor < buf.len() {
                                 wrt(&buf[cursor..cursor + 1]);
                                 cursor += 1;
                             }
                         }
-                        b'D' => { // Left
+                        b'D' => {
                             if cursor > 0 {
                                 move_left(1);
                                 cursor -= 1;
                             }
                         }
-                        b'H' => { // Home
+                        b'H' => {
                             if cursor > 0 {
                                 move_left(cursor);
                                 cursor = 0;
                             }
                         }
-                        b'F' => { // End
+                        b'F' => {
                             if cursor < buf.len() {
                                 wrt(&buf[cursor..]);
                                 cursor = buf.len();
                             }
                         }
-                        b'3' => { // Delete key (ESC[3~)
-                            read_raw_byte(); // consume '~'
+                        b'3' => {
+                            read_raw_byte();
                             if cursor < buf.len() {
                                 buf.remove(cursor);
                                 wrt(&buf[cursor..]);
@@ -149,7 +199,6 @@ impl Shell {
                     }
                 }
 
-                // ── Backspace ─────────────────────────────────────────────────
                 0x7f | 0x08 => {
                     if cursor > 0 {
                         buf.remove(cursor - 1);
@@ -161,35 +210,40 @@ impl Shell {
                     }
                 }
 
-                // ── Control keys ──────────────────────────────────────────────
-                0x03 => { // Ctrl-C — cancel line
+                0x03 => {
                     wrt(b"^C\r\n");
                     return Vec::new();
                 }
-                0x01 => { // Ctrl-A — beginning of line
-                    if cursor > 0 { move_left(cursor); cursor = 0; }
+                0x01 => {
+                    if cursor > 0 {
+                        move_left(cursor);
+                        cursor = 0;
+                    }
                 }
-                0x05 => { // Ctrl-E — end of line
+                0x05 => {
                     if cursor < buf.len() {
                         wrt(&buf[cursor..]);
                         cursor = buf.len();
                     }
                 }
-                0x15 => { // Ctrl-U — kill to start of line
+                0x15 => {
                     move_left(cursor);
-                    for _ in 0..buf.len() { wrt(b" "); }
+                    for _ in 0..buf.len() {
+                        wrt(b" ");
+                    }
                     move_left(buf.len());
                     buf.clear();
                     cursor = 0;
                 }
 
-                // ── Printable characters ──────────────────────────────────────
                 c if c >= 0x20 => {
                     buf.insert(cursor, c);
                     cursor += 1;
-                    wrt(&buf[cursor - 1..]); // print from insertion point to end
+                    wrt(&buf[cursor - 1..]);
                     let tail = buf.len() - cursor;
-                    if tail > 0 { move_left(tail); }
+                    if tail > 0 {
+                        move_left(tail);
+                    }
                 }
 
                 _ => {}
@@ -197,87 +251,370 @@ impl Shell {
         }
     }
 
-    // Overwrite the current on-screen input with new_buf, erasing any leftover characters.
     fn replace_input(old_buf: &[u8], old_cursor: usize, new_buf: &[u8]) {
         move_left(old_cursor);
         wrt(new_buf);
         if old_buf.len() > new_buf.len() {
             let extra = old_buf.len() - new_buf.len();
-            for _ in 0..extra { wrt(b" "); }
+            for _ in 0..extra {
+                wrt(b" ");
+            }
             move_left(extra);
         }
     }
 
-    fn parse(line: &[u8]) -> Vec<Vec<u8>> {
-        let mut args: Vec<Vec<u8>> = Vec::new();
-        let mut cur: Vec<u8> = Vec::new();
-        let mut in_q = false;
-        let mut qch  = 0u8;
-        for &b in line {
-            if in_q {
-                if b == qch { in_q = false; } else { cur.push(b); }
-            } else if b == b'"' || b == b'\'' {
-                in_q = true; qch = b;
-            } else if b == b' ' || b == b'\t' {
-                if !cur.is_empty() { args.push(cur.clone()); cur.clear(); }
-            } else {
-                cur.push(b);
+    // Collapse `.` and `..` in an absolute path.
+    fn normalize_path(path: &[u8]) -> Vec<u8> {
+        let mut parts: Vec<&[u8]> = Vec::new();
+        for component in path.split(|&b| b == b'/') {
+            match component {
+                b"" | b"." => {}
+                b".." => {
+                    parts.pop();
+                }
+                other => parts.push(other),
             }
         }
-        if !cur.is_empty() { args.push(cur); }
-        args
+        let mut result = Vec::new();
+        result.push(b'/');
+        for (i, part) in parts.iter().enumerate() {
+            if i > 0 {
+                result.push(b'/');
+            }
+            result.extend_from_slice(part);
+        }
+        result
+    }
+
+    fn is_builtin(cmd: &[u8]) -> bool {
+        matches!(
+            cmd,
+            b"echo"
+                | b"ls"
+                | b"cat"
+                | b"pwd"
+                | b"cd"
+                | b"mkdir"
+                | b"rm"
+                | b"help"
+                | b"?"
+                | b"clear"
+                | b"history"
+                | b".history"
+                | b"nano"
+                | b"whoami"
+                | b"hostname"
+                | b"uname"
+                | b"uname-a"
+                | b"exit"
+                | b"quit"
+        )
+    }
+
+    // Tokenise `line` and split into pipeline stages.
+    fn parse_pipeline(line: &[u8]) -> Vec<Stage> {
+        // Phase 1: produce tokens (words + operators |  <  >  >>)
+        let mut tokens: Vec<Vec<u8>> = Vec::new();
+        let mut cur: Vec<u8> = Vec::new();
+        let mut in_q = false;
+        let mut qch = 0u8;
+        let mut i = 0;
+        while i < line.len() {
+            let b = line[i];
+            if in_q {
+                if b == qch {
+                    in_q = false;
+                } else {
+                    cur.push(b);
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' | b'\'' => {
+                    in_q = true;
+                    qch = b;
+                    i += 1;
+                }
+                b'|' | b'<' => {
+                    if !cur.is_empty() {
+                        tokens.push(core::mem::take(&mut cur));
+                    }
+                    let mut tok = Vec::new();
+                    tok.push(b);
+                    tokens.push(tok);
+                    i += 1;
+                }
+                b'>' => {
+                    if !cur.is_empty() {
+                        tokens.push(core::mem::take(&mut cur));
+                    }
+                    if i + 1 < line.len() && line[i + 1] == b'>' {
+                        tokens.push(b">>".to_vec());
+                        i += 2;
+                    } else {
+                        tokens.push(b">".to_vec());
+                        i += 1;
+                    }
+                }
+                b' ' | b'\t' => {
+                    if !cur.is_empty() {
+                        tokens.push(core::mem::take(&mut cur));
+                    }
+                    i += 1;
+                }
+                _ => {
+                    cur.push(b);
+                    i += 1;
+                }
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+
+        // Phase 2: build stages
+        let mut stages: Vec<Stage> = Vec::new();
+        let mut cur_stage = Stage {
+            args: Vec::new(),
+            stdin_file: None,
+            stdout_file: None,
+        };
+        let mut j = 0;
+        while j < tokens.len() {
+            match tokens[j].as_slice() {
+                b"|" => {
+                    stages.push(cur_stage);
+                    cur_stage = Stage {
+                        args: Vec::new(),
+                        stdin_file: None,
+                        stdout_file: None,
+                    };
+                }
+                b"<" => {
+                    j += 1;
+                    if j < tokens.len() {
+                        cur_stage.stdin_file = Some(tokens[j].clone());
+                    }
+                }
+                b">" | b">>" => {
+                    j += 1;
+                    if j < tokens.len() {
+                        cur_stage.stdout_file = Some(tokens[j].clone());
+                    }
+                }
+                _ => {
+                    cur_stage.args.push(tokens[j].clone());
+                }
+            }
+            j += 1;
+        }
+        if !cur_stage.args.is_empty() {
+            stages.push(cur_stage);
+        }
+        stages
     }
 
     fn resolve(&self, p: &[u8]) -> Vec<u8> {
-        if p.starts_with(b"/") { return p.to_vec(); }
-        let mut full = self.cwd.clone();
-        if !full.ends_with(b"/") { full.push(b'/'); }
-        full.extend_from_slice(p);
-        full
+        let raw = if p.starts_with(b"/") {
+            p.to_vec()
+        } else {
+            let mut full = self.cwd.clone();
+            if !full.ends_with(b"/") {
+                full.push(b'/');
+            }
+            full.extend_from_slice(p);
+            full
+        };
+        Self::normalize_path(&raw)
     }
 
-    fn execute(&mut self, args: &[Vec<u8>]) {
+    // Redirect fd 1 to `outfile`; returns old fd (or -1 if no redirection).
+    fn apply_out_redir(&self, outfile: &Option<Vec<u8>>) -> i32 {
+        if let Some(f) = outfile {
+            let saved = dup(1);
+            let path = self.resolve(f);
+            let fd = create(&path);
+            if fd >= 0 {
+                dup2(fd, 1);
+                close(fd);
+            }
+            saved
+        } else {
+            -1
+        }
+    }
+
+    // Redirect fd 0 from `infile`; returns old fd (or -1 if no redirection).
+    fn apply_in_redir(&self, infile: &Option<Vec<u8>>) -> i32 {
+        if let Some(f) = infile {
+            let saved = dup(0);
+            let path = self.resolve(f);
+            let fd = open(path.as_ptr(), path.len(), 0);
+            if fd >= 0 {
+                dup2(fd, 0);
+                close(fd);
+            }
+            saved
+        } else {
+            -1
+        }
+    }
+
+    fn undo_redir(target_fd: i32, saved: i32) {
+        if saved >= 0 {
+            dup2(saved, target_fd);
+            close(saved);
+        }
+    }
+
+    fn build_path(cmd: &[u8]) -> Vec<u8> {
+        let mut path = Vec::new();
+        if !cmd.starts_with(b"/") {
+            path.push(b'/');
+        }
+        path.extend_from_slice(cmd);
+        path
+    }
+
+    fn exec_child(&self, args: &[Vec<u8>]) -> ! {
+        if !args.is_empty() {
+            let path = Self::build_path(&args[0]);
+            exec(&path); // returns only on failure
+            // Print error to stderr
+            write(2, b"sh: exec: ".as_ptr(), 10);
+            write(2, args[0].as_ptr(), args[0].len());
+            write(2, b"\n".as_ptr(), 1);
+        }
+        exit(127)
+    }
+
+    // Execute a single stage (no pipeline context).
+    fn exec_single(&mut self, stage: &Stage) {
+        if stage.args.is_empty() {
+            return;
+        }
+        if Self::is_builtin(&stage.args[0]) {
+            let saved_out = self.apply_out_redir(&stage.stdout_file);
+            let saved_in = self.apply_in_redir(&stage.stdin_file);
+            self.dispatch(&stage.args);
+            Self::undo_redir(1, saved_out);
+            Self::undo_redir(0, saved_in);
+        } else {
+            set_raw(0);
+            let pid = fork();
+            if pid == 0 {
+                self.apply_out_redir(&stage.stdout_file);
+                self.apply_in_redir(&stage.stdin_file);
+                self.exec_child(&stage.args);
+            } else if pid > 0 {
+                let mut status = 0i32;
+                waitpid(pid, &mut status as *mut i32);
+            } else {
+                wrt(b"sh: fork failed\n");
+            }
+            set_raw(1);
+        }
+    }
+
+    // Execute a multi-stage pipeline.
+    fn exec_pipeline(&mut self, stages: &[Stage]) {
+        set_raw(0);
+        let mut pids: Vec<i32> = Vec::new();
+        let mut prev_read: i32 = -1;
+
+        for (i, stage) in stages.iter().enumerate() {
+            let is_last = i + 1 == stages.len();
+            let (cur_read, cur_write) = if !is_last {
+                let mut fds = [0u32; 2];
+                pipe(&mut fds as *mut [u32; 2]);
+                (fds[0] as i32, fds[1] as i32)
+            } else {
+                (-1, -1)
+            };
+
+            let pid = fork();
+            if pid == 0 {
+                // Wire up pipes
+                if prev_read >= 0 {
+                    dup2(prev_read, 0);
+                    close(prev_read);
+                }
+                if cur_write >= 0 {
+                    dup2(cur_write, 1);
+                    close(cur_write);
+                }
+                if cur_read >= 0 {
+                    close(cur_read);
+                }
+                // Explicit file redirections override pipe setup
+                self.apply_out_redir(&stage.stdout_file);
+                self.apply_in_redir(&stage.stdin_file);
+
+                if Self::is_builtin(&stage.args[0]) {
+                    self.dispatch(&stage.args);
+                    exit(0);
+                } else {
+                    self.exec_child(&stage.args);
+                }
+            }
+
+            // Parent: release pipe ends the child now owns
+            if prev_read >= 0 {
+                close(prev_read);
+            }
+            if cur_write >= 0 {
+                close(cur_write);
+            }
+            prev_read = cur_read;
+            if pid > 0 {
+                pids.push(pid);
+            }
+        }
+
+        for pid in pids {
+            let mut status = 0i32;
+            waitpid(pid, &mut status as *mut i32);
+        }
+        set_raw(1);
+    }
+
+    // Dispatch builtins; external commands print an error (use exec_single/exec_pipeline instead).
+    fn dispatch(&mut self, args: &[Vec<u8>]) {
+        if args.is_empty() {
+            return;
+        }
         let cmd = args[0].as_slice();
         match cmd {
-            b"echo"                  => self.cmd_echo(&args[1..]),
-            b"ls"                    => self.cmd_ls(&args[1..]),
-            b"cat"                   => self.cmd_cat(&args[1..]),
-            b"pwd"                   => { wrt(&self.cwd); wrt_nl(); }
-            b"cd"                    => self.cmd_cd(&args[1..]),
-            b"mkdir"                 => self.cmd_mkdir(&args[1..]),
-            b"rm"                    => self.cmd_rm(&args[1..]),
-            b"help" | b"?"           => self.cmd_help(),
-            b"clear"                 => wrt(CLR),
+            b"echo" => self.cmd_echo(&args[1..]),
+            b"ls" => self.cmd_ls(&args[1..]),
+            b"cat" => self.cmd_cat(&args[1..]),
+            b"pwd" => {
+                wrt(&self.cwd);
+                wrt_nl();
+            }
+            b"cd" => self.cmd_cd(&args[1..]),
+            b"mkdir" => self.cmd_mkdir(&args[1..]),
+            b"rm" => self.cmd_rm(&args[1..]),
+            b"help" | b"?" => self.cmd_help(),
+            b"clear" => wrt(CLR),
             b"history" | b".history" => self.cmd_history(),
             b"nano" => {
-                // Nano manages raw mode internally; restore ours after it exits.
                 set_raw(0);
                 self.cmd_nano(&args[1..]);
                 set_raw(1);
             }
-            b"whoami"             => wrt(b"guest\n"),
-            b"hostname"           => wrt(b"openv\n"),
+            b"whoami" => wrt(b"guest\n"),
+            b"hostname" => wrt(b"openv\n"),
             b"uname" | b"uname-a" => wrt(b"openv 0.1.0 riscv64gc-unknown-none-elf\n"),
-            b"exit" | b"quit"     => { set_raw(0); exit(0); }
-            _ => {
-                // External binary: drop raw mode so child gets cooked console,
-                // then restore it after the child exits. This also ensures a
-                // failed spawn never leaves the shell in a broken input state.
-                let mut path: Vec<u8> = Vec::new();
-                if !cmd.starts_with(b"/") { path.push(b'/'); }
-                path.extend_from_slice(cmd);
-
+            b"exit" | b"quit" => {
                 set_raw(0);
-                let pid = spawn(path.as_ptr(), path.len());
-                if pid < 0 {
-                    wrt(b"sh: ");
-                    wrt(cmd);
-                    wrt(b": command not found\n");
-                } else {
-                    let mut status: i32 = 0;
-                    waitpid(pid, &mut status as *mut i32);
-                }
-                set_raw(1); // always restore — even after a failed spawn
+                exit(0);
+            }
+            _ => {
+                wrt(b"sh: ");
+                wrt(cmd);
+                wrt(b": command not found\n");
             }
         }
     }
@@ -286,40 +623,74 @@ impl Shell {
 
     fn cmd_echo(&self, args: &[Vec<u8>]) {
         let mut first = true;
-        for arg in args { if !first { wrt(b" "); } first = false; wrt(arg); }
+        for arg in args {
+            if !first {
+                wrt(b" ");
+            }
+            first = false;
+            wrt(arg);
+        }
         wrt_nl();
     }
 
     fn cmd_ls(&self, args: &[Vec<u8>]) {
-        let path = if args.is_empty() { self.cwd.clone() } else { self.resolve(&args[0]) };
+        let path = if args.is_empty() {
+            self.cwd.clone()
+        } else {
+            self.resolve(&args[0])
+        };
         let mut buf = [0u8; 4096];
         let n = getdents(path.as_ptr(), path.len(), buf.as_mut_ptr(), buf.len());
         if n < 0 {
-            wrt(b"ls: cannot access '"); wrt(&path); wrt(b"': No such file or directory\n");
+            wrt(b"ls: cannot access '");
+            wrt(&path);
+            wrt(b"': No such file or directory\n");
             return;
         }
         let mut pos = 0usize;
         while pos < n as usize {
             let start = pos;
-            while pos < n as usize && buf[pos] != 0 { pos += 1; }
-            if pos > start { wrt(CYAN); wrt(&buf[start..pos]); wrt(RESET); wrt(b"\n"); }
+            while pos < n as usize && buf[pos] != 0 {
+                pos += 1;
+            }
+            if pos > start {
+                wrt(CYAN);
+                wrt(&buf[start..pos]);
+                wrt(RESET);
+                wrt(b"\n");
+            }
             pos += 1;
         }
     }
 
     fn cmd_cat(&self, args: &[Vec<u8>]) {
-        if args.is_empty() { wrt(b"cat: missing file argument\n"); return; }
+        if args.is_empty() {
+            // Read from stdin until EOF
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = read(0, buf.as_mut_ptr(), buf.len());
+                if n <= 0 {
+                    break;
+                }
+                wrt(&buf[..n as usize]);
+            }
+            return;
+        }
         for arg in args {
             let path = self.resolve(arg);
             let fd = open(path.as_ptr(), path.len(), 0);
             if fd < 0 {
-                wrt(b"cat: "); wrt(&path); wrt(b": No such file or directory\n");
+                wrt(b"cat: ");
+                wrt(&path);
+                wrt(b": No such file or directory\n");
                 continue;
             }
             let mut buf = [0u8; 1024];
             loop {
                 let n = read(fd as usize, buf.as_mut_ptr(), buf.len());
-                if n <= 0 { break; }
+                if n <= 0 {
+                    break;
+                }
                 wrt(&buf[..n as usize]);
             }
             close(fd);
@@ -327,32 +698,46 @@ impl Shell {
     }
 
     fn cmd_cd(&mut self, args: &[Vec<u8>]) {
-        let path = if args.is_empty() { b"/".to_vec() } else { self.resolve(&args[0]) };
-        let mut buf = [0u8; 16];
-        let n = getdents(path.as_ptr(), path.len(), buf.as_mut_ptr(), buf.len());
-        if n < 0 {
-            wrt(b"cd: "); wrt(&path); wrt(b": No such file or directory\n");
+        let path = if args.is_empty() {
+            b"/".to_vec()
         } else {
+            self.resolve(&args[0])
+        };
+        if chdir(&path) == 0 {
             self.cwd = path;
+        } else {
+            wrt(b"cd: ");
+            wrt(&path);
+            wrt(b": No such file or directory\n");
         }
     }
 
     fn cmd_mkdir(&self, args: &[Vec<u8>]) {
-        if args.is_empty() { wrt(b"mkdir: missing operand\n"); return; }
+        if args.is_empty() {
+            wrt(b"mkdir: missing operand\n");
+            return;
+        }
         for arg in args {
             let path = self.resolve(arg);
             if mkdir(&path) != 0 {
-                wrt(b"mkdir: cannot create directory '"); wrt(&path); wrt(b"'\n");
+                wrt(b"mkdir: cannot create directory '");
+                wrt(&path);
+                wrt(b"'\n");
             }
         }
     }
 
     fn cmd_rm(&self, args: &[Vec<u8>]) {
-        if args.is_empty() { wrt(b"rm: missing operand\n"); return; }
+        if args.is_empty() {
+            wrt(b"rm: missing operand\n");
+            return;
+        }
         for arg in args {
             let path = self.resolve(arg);
             if unlink(&path) != 0 {
-                wrt(b"rm: cannot remove '"); wrt(&path); wrt(b"': No such file or directory\n");
+                wrt(b"rm: cannot remove '");
+                wrt(&path);
+                wrt(b"': No such file or directory\n");
             }
         }
     }
@@ -363,11 +748,14 @@ impl Shell {
             return;
         }
         for (i, entry) in self.history.iter().enumerate() {
-            // Right-align the index number in a 4-wide field
             let idx = i + 1;
-            if idx < 10   { wrt(b"   "); }
-            else if idx < 100  { wrt(b"  "); }
-            else if idx < 1000 { wrt(b" "); }
+            if idx < 10 {
+                wrt(b"   ");
+            } else if idx < 100 {
+                wrt(b"  ");
+            } else if idx < 1000 {
+                wrt(b" ");
+            }
             wrt_num(idx);
             wrt(b"  ");
             wrt(entry);
@@ -376,67 +764,84 @@ impl Shell {
     }
 
     fn cmd_help(&self) {
-        wrt(BOLD); wrt(b"openv shell builtins:\n"); wrt(RESET);
+        wrt(BOLD);
+        wrt(b"openv shell builtins:\n");
+        wrt(RESET);
         let cmds = [
-            ("echo [args]",   "Print arguments to stdout"),
-            ("ls [path]",     "List directory contents"),
-            ("cat <file>",    "Print file to stdout"),
-            ("pwd",           "Print working directory"),
-            ("cd [path]",     "Change directory (default /)"),
-            ("mkdir <dir>",   "Create directory"),
-            ("rm <file>",     "Remove file or directory"),
-            ("nano <file>",   "Text editor (^O save, ^X exit)"),
-            ("history",       "Show command history"),
-            ("clear",         "Clear the screen"),
-            ("whoami",        "Print current user"),
-            ("hostname",      "Print hostname"),
-            ("uname",         "Print system info"),
-            ("exit",          "Exit the shell"),
+            ("echo [args]", "Print arguments to stdout"),
+            ("ls [path]", "List directory contents"),
+            ("cat [file]", "Print file (or stdin) to stdout"),
+            ("pwd", "Print working directory"),
+            ("cd [path]", "Change directory (default /)"),
+            ("mkdir <dir>", "Create directory"),
+            ("rm <file>", "Remove file or directory"),
+            ("nano <file>", "Text editor (^O save, ^X exit)"),
+            ("history", "Show command history"),
+            ("clear", "Clear the screen"),
+            ("whoami", "Print current user"),
+            ("hostname", "Print hostname"),
+            ("uname", "Print system info"),
+            ("exit", "Exit the shell"),
         ];
+        wrt(b"  Pipelines: cmd | cmd    Redirect: > file  < file\n");
         wrt(b"  Editing: Up/Down=history  Left/Right=move  Ctrl-A/E=start/end  Ctrl-U=kill\n\n");
         for (cmd, desc) in &cmds {
-            wrt(b"  "); wrt(CYAN); wrt_str(cmd); wrt(RESET);
+            wrt(b"  ");
+            wrt(CYAN);
+            wrt_str(cmd);
+            wrt(RESET);
             let pad = 18usize.saturating_sub(cmd.len());
-            for _ in 0..pad { wrt(b" "); }
-            wrt_str(desc); wrt_nl();
+            for _ in 0..pad {
+                wrt(b" ");
+            }
+            wrt_str(desc);
+            wrt_nl();
         }
     }
 
     fn cmd_nano(&self, args: &[Vec<u8>]) {
-        if args.is_empty() { wrt(b"nano: missing filename\n"); return; }
+        if args.is_empty() {
+            wrt(b"nano: missing filename\n");
+            return;
+        }
         let path = self.resolve(&args[0]);
         NanoEditor::new(path).run();
     }
 
     fn run(&mut self) {
-        set_raw(1); // raw mode for the entire shell session
+        set_raw(1);
         loop {
             self.prompt();
             let line = self.read_line_raw();
-            if line.is_empty() { continue; }
-            let args = Self::parse(&line);
-            if args.is_empty() { continue; }
-            // Append to history, skipping consecutive duplicates
-            if self.history.last().map(|e| e.as_slice()) != Some(line.as_slice()) {
-                self.history.push(line);
+            if line.is_empty() {
+                continue;
             }
-            // args is already parsed and owned; execute uses it directly
-            self.execute(&args);
+            if self.history.last().map(|e| e.as_slice()) != Some(line.as_slice()) {
+                self.history.push(line.clone());
+            }
+            let stages = Self::parse_pipeline(&line);
+            match stages.len() {
+                0 => continue,
+                1 => self.exec_single(&stages[0]),
+                _ => self.exec_pipeline(&stages),
+            }
         }
     }
 }
 
 // ── Nano editor ───────────────────────────────────────────────────────────────
 
-const TERM_ROWS:    usize = 24;
-const TERM_COLS:    usize = 80;
+const TERM_ROWS: usize = 24;
+const TERM_COLS: usize = 80;
 const CONTENT_ROWS: usize = TERM_ROWS - 3;
 
 fn read_raw_byte() -> u8 {
     let mut c = 0u8;
     loop {
         let n = read(0, &mut c as *mut u8, 1);
-        if n > 0 { return c; }
+        if n > 0 {
+            return c;
+        }
         sys_yield();
     }
 }
@@ -446,7 +851,9 @@ fn read_key() -> NanoKey {
     match c {
         0x1b => {
             let b1 = read_raw_byte();
-            if b1 != b'[' { return NanoKey::Other; }
+            if b1 != b'[' {
+                return NanoKey::Other;
+            }
             let b2 = read_raw_byte();
             match b2 {
                 b'A' => NanoKey::Up,
@@ -455,9 +862,18 @@ fn read_key() -> NanoKey {
                 b'D' => NanoKey::Left,
                 b'H' => NanoKey::Home,
                 b'F' => NanoKey::End,
-                b'3' => { read_raw_byte(); NanoKey::Delete }
-                b'5' => { read_raw_byte(); NanoKey::PageUp }
-                b'6' => { read_raw_byte(); NanoKey::PageDown }
+                b'3' => {
+                    read_raw_byte();
+                    NanoKey::Delete
+                }
+                b'5' => {
+                    read_raw_byte();
+                    NanoKey::PageUp
+                }
+                b'6' => {
+                    read_raw_byte();
+                    NanoKey::PageDown
+                }
                 _ => NanoKey::Other,
             }
         }
@@ -474,38 +890,53 @@ fn read_key() -> NanoKey {
 #[derive(Debug)]
 enum NanoKey {
     Char(u8),
-    Enter, Backspace, Delete,
-    Up, Down, Left, Right,
-    Home, End, PageUp, PageDown,
-    CtrlO, CtrlX, CtrlK,
+    Enter,
+    Backspace,
+    Delete,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    CtrlO,
+    CtrlX,
+    CtrlK,
     Other,
 }
 
 fn move_cursor(row: usize, col: usize) {
     let mut buf = [0u8; 16];
-    buf[0] = 0x1b; buf[1] = b'[';
+    buf[0] = 0x1b;
+    buf[1] = b'[';
     let mut p = 2;
     p += fmt_decimal(&mut buf[p..], row);
-    buf[p] = b';'; p += 1;
+    buf[p] = b';';
+    p += 1;
     p += fmt_decimal(&mut buf[p..], col);
-    buf[p] = b'H'; p += 1;
+    buf[p] = b'H';
+    p += 1;
     wrt(&buf[..p]);
 }
 
 fn pad_line(used: usize) {
     let n = TERM_COLS.saturating_sub(used);
-    for _ in 0..n { wrt(b" "); }
+    for _ in 0..n {
+        wrt(b" ");
+    }
     wrt(RESET);
 }
 
 struct NanoEditor {
     filename: Vec<u8>,
-    lines:    Vec<Vec<u8>>,
-    row:      usize,
-    col:      usize,
-    scroll:   usize,
+    lines: Vec<Vec<u8>>,
+    row: usize,
+    col: usize,
+    scroll: usize,
     modified: bool,
-    msg:      Vec<u8>,
+    msg: Vec<u8>,
 }
 
 impl NanoEditor {
@@ -517,7 +948,9 @@ impl NanoEditor {
             let mut buf = [0u8; 4096];
             loop {
                 let n = read(fd as usize, buf.as_mut_ptr(), buf.len());
-                if n <= 0 { break; }
+                if n <= 0 {
+                    break;
+                }
                 content.extend_from_slice(&buf[..n as usize]);
             }
             close(fd);
@@ -528,20 +961,35 @@ impl NanoEditor {
                     start = i + 1;
                 }
             }
-            if start < content.len() { lines.push(content[start..].to_vec()); }
+            if start < content.len() {
+                lines.push(content[start..].to_vec());
+            }
         }
-        if lines.is_empty() { lines.push(Vec::new()); }
-        NanoEditor { filename, lines, row: 0, col: 0, scroll: 0, modified: false, msg: Vec::new() }
+        if lines.is_empty() {
+            lines.push(Vec::new());
+        }
+        NanoEditor {
+            filename,
+            lines,
+            row: 0,
+            col: 0,
+            scroll: 0,
+            modified: false,
+            msg: Vec::new(),
+        }
     }
 
     fn render(&self) {
         wrt(b"\x1b[?25l");
         wrt(CLR);
         move_cursor(1, 1);
-        wrt(REV); wrt(BOLD);
+        wrt(REV);
+        wrt(BOLD);
         wrt(b"  openv nano 0.1   ");
         wrt(&self.filename);
-        if self.modified { wrt(b"  [Modified]"); }
+        if self.modified {
+            wrt(b"  [Modified]");
+        }
         pad_line(19 + self.filename.len() + if self.modified { 12 } else { 0 });
 
         for i in 0..CONTENT_ROWS {
@@ -557,10 +1005,14 @@ impl NanoEditor {
         move_cursor(TERM_ROWS - 1, 1);
         wrt(b"\x1b[K");
         if !self.msg.is_empty() {
-            wrt(YELLOW); wrt(&self.msg); wrt(RESET);
+            wrt(YELLOW);
+            wrt(&self.msg);
+            wrt(RESET);
         } else {
-            wrt(b"Ln "); wrt_num(self.row + 1);
-            wrt(b", Col "); wrt_num(self.col + 1);
+            wrt(b"Ln ");
+            wrt_num(self.row + 1);
+            wrt(b", Col ");
+            wrt_num(self.col + 1);
         }
 
         move_cursor(TERM_ROWS, 1);
@@ -574,23 +1026,31 @@ impl NanoEditor {
     }
 
     fn adjust_scroll(&mut self) {
-        if self.row < self.scroll { self.scroll = self.row; }
-        else if self.row >= self.scroll + CONTENT_ROWS {
+        if self.row < self.scroll {
+            self.scroll = self.row;
+        } else if self.row >= self.scroll + CONTENT_ROWS {
             self.scroll = self.row + 1 - CONTENT_ROWS;
         }
     }
 
     fn clamp_col(&mut self) {
         let len = self.lines[self.row].len();
-        if self.col > len { self.col = len; }
+        if self.col > len {
+            self.col = len;
+        }
     }
 
     fn save(&mut self) {
         let fd = create(&self.filename);
-        if fd < 0 { self.msg = b"Error: cannot write file!".to_vec(); return; }
+        if fd < 0 {
+            self.msg = b"Error: cannot write file!".to_vec();
+            return;
+        }
         for (i, line) in self.lines.iter().enumerate() {
             write(fd as usize, line.as_ptr(), line.len());
-            if i + 1 < self.lines.len() { write(fd as usize, b"\n".as_ptr(), 1); }
+            if i + 1 < self.lines.len() {
+                write(fd as usize, b"\n".as_ptr(), 1);
+            }
         }
         write(fd as usize, b"\n".as_ptr(), 1);
         close(fd);
@@ -605,21 +1065,33 @@ impl NanoEditor {
             NanoKey::CtrlO => self.save(),
             NanoKey::CtrlK => {
                 self.lines.remove(self.row);
-                if self.lines.is_empty() { self.lines.push(Vec::new()); }
-                if self.row >= self.lines.len() { self.row = self.lines.len() - 1; }
-                self.clamp_col(); self.modified = true;
+                if self.lines.is_empty() {
+                    self.lines.push(Vec::new());
+                }
+                if self.row >= self.lines.len() {
+                    self.row = self.lines.len() - 1;
+                }
+                self.clamp_col();
+                self.modified = true;
             }
             NanoKey::Up => {
-                if self.row > 0 { self.row -= 1; self.clamp_col(); self.adjust_scroll(); }
+                if self.row > 0 {
+                    self.row -= 1;
+                    self.clamp_col();
+                    self.adjust_scroll();
+                }
             }
             NanoKey::Down => {
                 if self.row + 1 < self.lines.len() {
-                    self.row += 1; self.clamp_col(); self.adjust_scroll();
+                    self.row += 1;
+                    self.clamp_col();
+                    self.adjust_scroll();
                 }
             }
             NanoKey::Left => {
-                if self.col > 0 { self.col -= 1; }
-                else if self.row > 0 {
+                if self.col > 0 {
+                    self.col -= 1;
+                } else if self.row > 0 {
                     self.row -= 1;
                     self.col = self.lines[self.row].len();
                     self.adjust_scroll();
@@ -627,26 +1099,37 @@ impl NanoEditor {
             }
             NanoKey::Right => {
                 let len = self.lines[self.row].len();
-                if self.col < len { self.col += 1; }
-                else if self.row + 1 < self.lines.len() {
-                    self.row += 1; self.col = 0; self.adjust_scroll();
+                if self.col < len {
+                    self.col += 1;
+                } else if self.row + 1 < self.lines.len() {
+                    self.row += 1;
+                    self.col = 0;
+                    self.adjust_scroll();
                 }
             }
-            NanoKey::Home     => { self.col = 0; }
-            NanoKey::End      => { self.col = self.lines[self.row].len(); }
-            NanoKey::PageUp   => {
+            NanoKey::Home => {
+                self.col = 0;
+            }
+            NanoKey::End => {
+                self.col = self.lines[self.row].len();
+            }
+            NanoKey::PageUp => {
                 self.row = self.row.saturating_sub(CONTENT_ROWS);
-                self.clamp_col(); self.adjust_scroll();
+                self.clamp_col();
+                self.adjust_scroll();
             }
             NanoKey::PageDown => {
                 self.row = (self.row + CONTENT_ROWS).min(self.lines.len() - 1);
-                self.clamp_col(); self.adjust_scroll();
+                self.clamp_col();
+                self.adjust_scroll();
             }
             NanoKey::Enter => {
                 let rest = self.lines[self.row].split_off(self.col);
                 self.row += 1;
                 self.lines.insert(self.row, rest);
-                self.col = 0; self.adjust_scroll(); self.modified = true;
+                self.col = 0;
+                self.adjust_scroll();
+                self.modified = true;
             }
             NanoKey::Backspace => {
                 if self.col > 0 {
@@ -658,21 +1141,25 @@ impl NanoEditor {
                     self.row -= 1;
                     self.col = self.lines[self.row].len();
                     self.lines[self.row].extend_from_slice(&cur);
-                    self.adjust_scroll(); self.modified = true;
+                    self.adjust_scroll();
+                    self.modified = true;
                 }
             }
             NanoKey::Delete => {
                 let len = self.lines[self.row].len();
                 if self.col < len {
-                    self.lines[self.row].remove(self.col); self.modified = true;
+                    self.lines[self.row].remove(self.col);
+                    self.modified = true;
                 } else if self.row + 1 < self.lines.len() {
                     let next = self.lines.remove(self.row + 1);
-                    self.lines[self.row].extend_from_slice(&next); self.modified = true;
+                    self.lines[self.row].extend_from_slice(&next);
+                    self.modified = true;
                 }
             }
             NanoKey::Char(c) => {
                 self.lines[self.row].insert(self.col, c);
-                self.col += 1; self.modified = true;
+                self.col += 1;
+                self.modified = true;
             }
             NanoKey::Other => {}
         }
@@ -684,7 +1171,9 @@ impl NanoEditor {
         loop {
             self.render();
             let key = read_key();
-            if !self.handle(key) { break; }
+            if !self.handle(key) {
+                break;
+            }
         }
         set_raw(0);
         wrt(CLR);

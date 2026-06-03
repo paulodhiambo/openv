@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use libos::{write, exit};
+use libos::{exit, write};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {

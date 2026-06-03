@@ -28,47 +28,54 @@ fn page_index(pa: usize) -> usize {
 
 pub fn init(dtb_ptr: usize) {
     let fdt = unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8).unwrap() };
-    
+
     // Find the memory node
     let memory = fdt.memory();
-    let region = memory.regions().next().expect("No memory region found in DTB");
-    
+    let region = memory
+        .regions()
+        .next()
+        .expect("No memory region found in DTB");
+
     let ram_start = region.starting_address as usize;
     let ram_size = region.size.unwrap_or(0);
     unsafe {
         RAM_START = ram_start;
         RAM_END = ram_start + ram_size;
     }
-    
+
     // Find reserved regions (FDT and Initrd)
     let fdt_start = dtb_ptr;
     let fdt_end = fdt_start + fdt.total_size();
-    
+
     let mut initrd_start = 0;
     let mut initrd_end = 0;
     if let Some(chosen) = fdt.find_node("/chosen") {
-        if let (Some(start_prop), Some(end_prop)) = (chosen.property("linux,initrd-start"), chosen.property("linux,initrd-end")) {
+        if let (Some(start_prop), Some(end_prop)) = (
+            chosen.property("linux,initrd-start"),
+            chosen.property("linux,initrd-end"),
+        ) {
             initrd_start = start_prop.as_usize().unwrap_or(0);
             initrd_end = end_prop.as_usize().unwrap_or(0);
         }
     }
-    
+
     // Kernel ends at _stack_end. Align to next page.
-    let kernel_end = unsafe { (&_stack_end as *const u8 as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1) };
-    
+    let kernel_end =
+        unsafe { (&_stack_end as *const u8 as usize + PAGE_SIZE - 1) & !(PAGE_SIZE - 1) };
+
     // Initialize our free list
     unsafe {
         NEXT_FREE_PAGE = 0; // We will build the list backwards or just append carefully
         let mut prev_page = 0;
-        
+
         let mut curr = kernel_end;
         while curr + PAGE_SIZE <= RAM_END {
             let next = curr + PAGE_SIZE;
-            
+
             // Check if this page overlaps with FDT or Initrd
             let overlaps_fdt = curr < fdt_end && next > fdt_start;
             let overlaps_initrd = initrd_start > 0 && curr < initrd_end && next > initrd_start;
-            
+
             if !overlaps_fdt && !overlaps_initrd {
                 if NEXT_FREE_PAGE == 0 {
                     NEXT_FREE_PAGE = curr;
@@ -77,14 +84,14 @@ pub fn init(dtb_ptr: usize) {
                 }
                 prev_page = curr;
             }
-            
+
             curr = next;
         }
         if prev_page != 0 {
             (prev_page as *mut usize).write_volatile(0);
         }
     }
-    
+
     println!("PMM initialized.");
     println!("RAM Start: {:#x}", ram_start);
     println!("RAM Size: {} MB", ram_size / 1024 / 1024);
@@ -116,7 +123,7 @@ pub fn alloc_page() -> Option<usize> {
 pub fn free_page(page: usize) {
     assert!(page % PAGE_SIZE == 0);
     unsafe {
-            (page as *mut usize).write_volatile(NEXT_FREE_PAGE);
+        (page as *mut usize).write_volatile(NEXT_FREE_PAGE);
         NEXT_FREE_PAGE = page;
     }
 }

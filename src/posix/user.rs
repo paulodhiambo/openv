@@ -8,12 +8,12 @@ pub type Uid = u32;
 pub type Gid = u32;
 
 // ── Well-known IDs ─────────────────────────────────────────────────────────
-pub const ROOT_UID:  Uid = 0;
-pub const ROOT_GID:  Gid = 0;
+pub const ROOT_UID: Uid = 0;
+pub const ROOT_GID: Gid = 0;
 pub const GUEST_UID: Uid = 1000;
 pub const GUEST_GID: Gid = 1000;
 /// Debian/Ubuntu convention: gid 27 = sudo group
-pub const SUDO_GID:  Gid = 27;
+pub const SUDO_GID: Gid = 27;
 
 // ── FNV-1a 64-bit (const-fn, usable in static initialisers) ───────────────
 pub const fn fnv1a(data: &[u8]) -> u64 {
@@ -33,45 +33,57 @@ pub fn verify_password(stored_hash: u64, plaintext: &[u8]) -> bool {
 
 // ── Static user database (/etc/passwd + /etc/shadow equivalent) ───────────
 pub struct UserEntry {
-    pub uid:           Uid,
-    pub gid:           Gid,
-    pub name:          &'static str,
+    pub uid: Uid,
+    pub gid: Gid,
+    pub name: &'static str,
     pub password_hash: u64,
-    pub home:          &'static str,
-    pub shell:         &'static str,
+    pub home: &'static str,
+    pub shell: &'static str,
 }
 
 pub struct GroupEntry {
-    pub gid:     Gid,
-    pub name:    &'static str,
+    pub gid: Gid,
+    pub name: &'static str,
     pub members: &'static [Uid],
 }
 
 static USERS: &[UserEntry] = &[
     UserEntry {
-        uid:           ROOT_UID,
-        gid:           ROOT_GID,
-        name:          "root",
+        uid: ROOT_UID,
+        gid: ROOT_GID,
+        name: "root",
         password_hash: fnv1a(b"root"),
-        home:          "/root",
-        shell:         "/sh",
+        home: "/root",
+        shell: "/sh",
     },
     UserEntry {
-        uid:           GUEST_UID,
-        gid:           GUEST_GID,
-        name:          "guest",
+        uid: GUEST_UID,
+        gid: GUEST_GID,
+        name: "guest",
         password_hash: fnv1a(b"guest"),
-        home:          "/home/guest",
-        shell:         "/sh",
+        home: "/home/guest",
+        shell: "/sh",
     },
 ];
 
 // ── Static group database (/etc/group equivalent) ─────────────────────────
 static GROUPS: &[GroupEntry] = &[
-    GroupEntry { gid: ROOT_GID,  name: "root",  members: &[ROOT_UID]           },
-    GroupEntry { gid: GUEST_GID, name: "guest", members: &[GUEST_UID]          },
+    GroupEntry {
+        gid: ROOT_GID,
+        name: "root",
+        members: &[ROOT_UID],
+    },
+    GroupEntry {
+        gid: GUEST_GID,
+        name: "guest",
+        members: &[GUEST_UID],
+    },
     // sudo group: both root and guest can escalate
-    GroupEntry { gid: SUDO_GID,  name: "sudo",  members: &[ROOT_UID, GUEST_UID] },
+    GroupEntry {
+        gid: SUDO_GID,
+        name: "sudo",
+        members: &[ROOT_UID, GUEST_UID],
+    },
 ];
 
 // ── Lookup helpers ─────────────────────────────────────────────────────────
@@ -106,18 +118,22 @@ pub fn groups_of(uid: Uid) -> alloc::vec::Vec<Gid> {
 /// Verify username + password. Returns the matching UserEntry on success.
 pub fn authenticate<'a>(username: &str, password: &[u8]) -> Option<&'static UserEntry> {
     let user = find_by_name(username)?;
-    if verify_password(user.password_hash, password) { Some(user) } else { None }
+    if verify_password(user.password_hash, password) {
+        Some(user)
+    } else {
+        None
+    }
 }
 
 /// Verify a UID's password directly (used by sudo: verify current user's creds).
 pub fn authenticate_uid(uid: Uid, password: &[u8]) -> bool {
-    find_by_uid(uid)
-        .map_or(false, |u| verify_password(u.password_hash, password))
+    find_by_uid(uid).map_or(false, |u| verify_password(u.password_hash, password))
 }
 
 // ── Privilege checks ───────────────────────────────────────────────────────
 pub fn in_group(uid: Uid, gid: Gid) -> bool {
-    GROUPS.iter()
+    GROUPS
+        .iter()
         .find(|g| g.gid == gid)
         .map_or(false, |g| g.members.contains(&uid))
 }

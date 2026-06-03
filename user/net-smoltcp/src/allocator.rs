@@ -18,10 +18,18 @@ unsafe impl GlobalAlloc for BumpAllocator {
             let cur_off = OFFSET.load(Ordering::SeqCst);
             let cur_ptr = heap_start + cur_off;
             let aligned = (cur_ptr + align - 1) & !(align - 1);
-            let next_ptr = match aligned.checked_add(size) { Some(n) => n, None => return null_mut() };
+            let next_ptr = match aligned.checked_add(size) {
+                Some(n) => n,
+                None => return null_mut(),
+            };
             let new_off = next_ptr - heap_start;
-            if new_off > heap_size { return null_mut(); }
-            if OFFSET.compare_exchange(cur_off, new_off, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            if new_off > heap_size {
+                return null_mut();
+            }
+            if OFFSET
+                .compare_exchange(cur_off, new_off, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
                 return aligned as *mut u8;
             }
             // otherwise retry
@@ -37,7 +45,7 @@ unsafe impl GlobalAlloc for BumpAllocator {
 static A: BumpAllocator = BumpAllocator;
 
 // Provide a small heap region (placed here so the binary contains it). Size tuned conservatively.
-#[link_section = ".uninit" ]
+#[link_section = ".uninit"]
 static mut HEAP_SPACE: [u8; 128 * 1024] = [0u8; 128 * 1024];
 
 pub unsafe fn init_allocator() {

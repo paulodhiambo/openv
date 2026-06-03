@@ -46,18 +46,25 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
-    unsafe { BOOT_DTB_PTR = dtb_ptr; }
+    unsafe {
+        BOOT_DTB_PTR = dtb_ptr;
+    }
     // Raw UART test: manually write "hartid=N" bypassing fmt
     {
         let mut u = uart::Uart::new();
-        for &b in b"hartid=" { u.put_char(b); }
+        for &b in b"hartid=" {
+            u.put_char(b);
+        }
         u.put_char(b'0' + hartid as u8);
-        u.put_char(b'\r'); u.put_char(b'\n');
+        u.put_char(b'\r');
+        u.put_char(b'\n');
     }
     // Test raw put_char after initialization
     {
         let mut u = uart::Uart::new();
-        for &b in b"RAW_TEST_START\n" { u.put_char(b); }
+        for &b in b"RAW_TEST_START\n" {
+            u.put_char(b);
+        }
     }
     crate::println!("Hello from openv!");
     crate::println!("Booted on hart ID: {}", hartid);
@@ -65,7 +72,9 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // Test raw put_char after println!
     {
         let mut u = uart::Uart::new();
-        for &b in b"RAW_TEST_END\n" { u.put_char(b); }
+        for &b in b"RAW_TEST_END\n" {
+            u.put_char(b);
+        }
     }
 
     // Initialize Memory Management
@@ -80,13 +89,22 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // Initrd parsing
     let fdt = unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8).unwrap() };
     if let Some(chosen) = fdt.find_node("/chosen") {
-        if let (Some(start_prop), Some(end_prop)) = (chosen.property("linux,initrd-start"), chosen.property("linux,initrd-end")) {
+        if let (Some(start_prop), Some(end_prop)) = (
+            chosen.property("linux,initrd-start"),
+            chosen.property("linux,initrd-end"),
+        ) {
             let start = start_prop.as_usize().unwrap_or(0);
             let end = end_prop.as_usize().unwrap_or(0);
-            
+
             if start > 0 && end > start {
-                crate::println!("Found initrd at {:#x} - {:#x} ({} bytes)", start, end, end - start);
-                let initrd_slice = unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
+                crate::println!(
+                    "Found initrd at {:#x} - {:#x} ({} bytes)",
+                    start,
+                    end,
+                    end - start
+                );
+                let initrd_slice =
+                    unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
                 let root_fs = vfs::tar::parse_tar(initrd_slice);
                 {
                     let mut mt = vfs::MOUNT_TABLE.lock();
@@ -123,18 +141,25 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
     // Test the global heap allocator
     let test_box = Box::new(42);
-    crate::println!("Successfully allocated Box on the heap. Value: {}", test_box);
+    crate::println!(
+        "Successfully allocated Box on the heap. Value: {}",
+        test_box
+    );
 
     // Test VMO
     if let Some(vmo) = mm::vmo::Vmo::new(8192) {
-        crate::println!("Created VMO of size {} bytes across {} physical pages.", vmo.size(), vmo.pages().len());
+        crate::println!(
+            "Created VMO of size {} bytes across {} physical pages.",
+            vmo.size(),
+            vmo.pages().len()
+        );
     } else {
         crate::println!("Failed to create VMO.");
     }
 
     // Test IPC Channels
     let (ep1, ep2) = ipc::channel::ChannelEndpoint::create_pair();
-    
+
     let msg_str = b"Hello from Endpoint 1!";
     let mut msg_bytes = Vec::new();
     msg_bytes.extend_from_slice(msg_str);
@@ -159,7 +184,7 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // Test POSIX Process logic
     crate::raw_print!("[HART-ONLY] kmain: about to create init process\n");
     let init_pid = posix::process::Process::new(0).pid; // Mock init process
-    
+
     // Start secondary HARTs now that kernel data structures are ready
     smp::start_secondaries();
 

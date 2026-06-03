@@ -1,9 +1,10 @@
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-use alloc::sync::Arc;
-use spin::Mutex;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use crate::ipc::handle::HandleTable;
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use spin::Mutex;
 
 pub type Pid = i32;
 pub type Pgid = i32;
@@ -32,6 +33,8 @@ pub struct Process {
     pub satp_val: usize,
     /// Bottom (lowest address) of the heap-allocated kernel stack.
     pub kernel_stack_bottom: usize,
+    /// Current working directory — inherited from parent, updated by chdir.
+    pub cwd: Mutex<String>,
     // Fields to support synchronous waitpid
     pub wait_target: Mutex<Option<Pid>>,
     pub wait_status_ptr: Mutex<Option<usize>>,
@@ -41,7 +44,8 @@ pub struct Process {
 static NEXT_PID: AtomicI32 = AtomicI32::new(1);
 
 pub static PROCESS_TABLE: Mutex<BTreeMap<Pid, Arc<Process>>> = Mutex::new(BTreeMap::new());
-pub static RUN_QUEUE: Mutex<alloc::collections::VecDeque<Pid>> = Mutex::new(alloc::collections::VecDeque::new());
+pub static RUN_QUEUE: Mutex<alloc::collections::VecDeque<Pid>> =
+    Mutex::new(alloc::collections::VecDeque::new());
 
 static CURRENT_PIDS: [AtomicI32; crate::smp::MAX_HARTS] = [
     AtomicI32::new(0),
@@ -56,7 +60,9 @@ pub fn generate_pid() -> Pid {
 
 pub fn current_hart() -> usize {
     let tp: usize;
-    unsafe { core::arch::asm!("mv {}, tp", out(reg) tp, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("mv {}, tp", out(reg) tp, options(nomem, nostack));
+    }
     tp.min(crate::smp::MAX_HARTS - 1)
 }
 
@@ -102,7 +108,9 @@ pub fn schedule() {
         } else {
             // Idle: rearm timer (clears STIP) and wait for the next tick.
             crate::timer::set_next_timer();
-            unsafe { core::arch::asm!("wfi"); }
+            unsafe {
+                core::arch::asm!("wfi");
+            }
         }
     }
 }
@@ -144,25 +152,26 @@ impl Process {
             fds
         };
 
-        let (uid, gid, euid, egid) = if ppid != 0 {
+        let (uid, gid, euid, egid, cwd) = if ppid != 0 {
             if let Some(parent) = PROCESS_TABLE.lock().get(&ppid) {
                 (
                     parent.uid.load(Ordering::Relaxed),
                     parent.gid.load(Ordering::Relaxed),
                     parent.euid.load(Ordering::Relaxed),
                     parent.egid.load(Ordering::Relaxed),
+                    parent.cwd.lock().clone(),
                 )
             } else {
-                (0, 0, 0, 0)
+                (0, 0, 0, 0, String::from("/"))
             }
         } else {
-            (0, 0, 0, 0)
+            (0, 0, 0, 0, String::from("/"))
         };
 
         let proc = Arc::new(Process {
             pid,
             ppid,
-            pgid: pid, // By default, new process is its own process group leader
+            pgid: pid,
             sid: pid,
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
@@ -174,6 +183,7 @@ impl Process {
             trap_frame: Mutex::new(tf),
             satp_val,
             kernel_stack_bottom: kstack_bottom,
+            cwd: Mutex::new(cwd),
             wait_target: Mutex::new(None),
             wait_status_ptr: Mutex::new(None),
             wait_result: Mutex::new(None),

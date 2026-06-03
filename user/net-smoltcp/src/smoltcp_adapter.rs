@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use heapless::Vec as HVec;
-use smoltcp::phy::{self, DeviceCapabilities, Device, Medium, ChecksumCapabilities};
+use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 
 use crate::device::SmolDevice;
@@ -11,12 +11,16 @@ pub struct RxToken {
 }
 
 impl RxToken {
-    pub fn new(buf: HVec<u8, 1536>) -> Self { RxToken { buf } }
+    pub fn new(buf: HVec<u8, 1536>) -> Self {
+        RxToken { buf }
+    }
 }
 
 impl phy::RxToken for RxToken {
     fn consume<R, F>(self, f: F) -> R
-    where F: FnOnce(&[u8]) -> R {
+    where
+        F: FnOnce(&[u8]) -> R,
+    {
         f(&self.buf)
     }
 }
@@ -33,7 +37,9 @@ impl<'a> TxToken<'a> {
 
 impl<'a> phy::TxToken for TxToken<'a> {
     fn consume<R, F>(self, len: usize, f: F) -> R
-    where F: FnOnce(&mut [u8]) -> R {
+    where
+        F: FnOnce(&mut [u8]) -> R,
+    {
         // stack buffer
         let mut tmp = [0u8; 1536];
         let r = f(&mut tmp[..len]);
@@ -54,8 +60,14 @@ impl SmolPhyDevice {
 }
 
 impl Device for SmolPhyDevice {
-    type RxToken<'a> = RxToken where Self: 'a;
-    type TxToken<'a> = TxToken<'a> where Self: 'a;
+    type RxToken<'a>
+        = RxToken
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = TxToken<'a>
+    where
+        Self: 'a;
 
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();

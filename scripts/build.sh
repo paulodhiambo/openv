@@ -1,49 +1,56 @@
 #!/bin/bash
+# Build kernel, userspace, and initrd in one step.
+#
+# Usage:
+#   ./scripts/build.sh            # debug
+#   ./scripts/build.sh --release  # release
+#
+# Override the binary list:
+#   BINS="init sh ls" ./scripts/build.sh
 set -e
 
-# Always run from the project root regardless of where the script is invoked from
 cd "$(dirname "$0")/.."
 
-# ── Userspace ─────────────────────────────────────────────────────────────────
+BINS="${BINS:-init sh ls cat hello producer consumer doexec forktest net-smoltcp}"
+USER_BUILD_DIR="debug"
+KERNEL_FLAGS=""
+USER_FLAGS=""
+
+if [ "$1" = "--release" ]; then
+    KERNEL_FLAGS="--release"
+    USER_FLAGS="--release"
+    USER_BUILD_DIR="release"
+fi
+
+# ── 1. Userspace ───────────────────────────────────────────────────────────────
 echo "[1/3] Building userspace..."
-(cd user && cargo build)
+(cd user && cargo build $USER_FLAGS)
 
-# ── Initrd ────────────────────────────────────────────────────────────────────
+# ── 2. Initrd ──────────────────────────────────────────────────────────────────
 echo "[2/3] Packaging initrd..."
-mkdir -p test_root
+mkdir -p test_root/proc test_root/dev
 
-copy_if_exists() {
-    local src="user/target/riscv64gc-unknown-none-elf/debug/$1"
-    local dst="test_root/$2"
+for bin in $BINS; do
+    src="user/target/riscv64gc-unknown-none-elf/$USER_BUILD_DIR/$bin"
     if [ -f "$src" ]; then
-        cp "$src" "$dst"
-        echo "  copied $1 → $dst"
+        cp "$src" "test_root/$bin"
+        echo "  copied $bin"
     else
-        echo "  warning: $src not found, skipping"
+        echo "  (skipping $bin — not found at $src)"
     fi
-}
-
-copy_if_exists init    init
-copy_if_exists sh      sh
-copy_if_exists ls      ls
-copy_if_exists cat     cat
-copy_if_exists producer producer
-copy_if_exists consumer consumer
-copy_if_exists net-smoltcp net-smoltcp
+done
 
 echo "Hello from initrd TAR!" > test_root/dummy.txt
 
-# Build tar from whatever is present in test_root
-(
-    cd test_root
-    FILES=$(find . -maxdepth 1 -not -name '.' | sed 's|^\./||' | tr '\n' ' ')
-    tar -cf ../test_root.tar $FILES
-    echo "  initrd: test_root.tar ($(du -sh ../test_root.tar | cut -f1))"
-)
+cd test_root
+# Build tar from all entries, respecting subdirectories (proc/, dev/)
+tar -cf ../test_root.tar .
+cd ..
+echo "  initrd: test_root.tar ($(du -sh test_root.tar | cut -f1))"
 
-# ── Kernel ────────────────────────────────────────────────────────────────────
+# ── 3. Kernel ──────────────────────────────────────────────────────────────────
 echo "[3/3] Building kernel..."
-cargo build
+cargo build $KERNEL_FLAGS
 
 echo ""
 echo "Build complete. Run with: ./scripts/run.sh"

@@ -1,7 +1,7 @@
 use crate::vfs::memfs::{MemDir, RoFile};
-use alloc::sync::Arc;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 /// Parses a basic ustar archive from memory and returns a populated MemDir root.
@@ -68,7 +68,10 @@ pub fn parse_tar(data: &[u8]) -> Arc<MemDir> {
         offset += 512;
 
         // Split path into components, strip leading/trailing slashes.
-        let components: Vec<&str> = name_str.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+        let components: Vec<&str> = name_str
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
         if components.is_empty() {
             offset += (size + 511) & !511;
             continue;
@@ -88,7 +91,8 @@ pub fn parse_tar(data: &[u8]) -> Arc<MemDir> {
                     s
                 };
                 if !dirs.contains_key(&child_path) {
-                    let parent_dir = dirs.get(&parent_path)
+                    let parent_dir = dirs
+                        .get(&parent_path)
                         .cloned()
                         .unwrap_or_else(|| root.clone());
                     let new_dir = Arc::new(MemDir::new(uid, gid, mode));
@@ -99,9 +103,8 @@ pub fn parse_tar(data: &[u8]) -> Arc<MemDir> {
             }
         } else if typeflag == b'0' || typeflag == 0 {
             // Regular file
-            let file_slice: &'static [u8] = unsafe {
-                core::slice::from_raw_parts(data.as_ptr().add(offset), size)
-            };
+            let file_slice: &'static [u8] =
+                unsafe { core::slice::from_raw_parts(data.as_ptr().add(offset), size) };
             let file_node = Arc::new(RoFile::new(file_slice, uid, gid, mode));
 
             // Ensure parent directory exists
@@ -126,9 +129,7 @@ pub fn parse_tar(data: &[u8]) -> Arc<MemDir> {
                         s
                     };
                     if !dirs.contains_key(&cp) {
-                        let parent_dir = dirs.get(&pp)
-                            .cloned()
-                            .unwrap_or_else(|| root.clone());
+                        let parent_dir = dirs.get(&pp).cloned().unwrap_or_else(|| root.clone());
                         let new_dir = Arc::new(MemDir::new(0, 0, 0o755));
                         parent_dir.add_child(comp, new_dir.clone() as _);
                         dirs.insert(cp.clone(), new_dir);
@@ -137,7 +138,8 @@ pub fn parse_tar(data: &[u8]) -> Arc<MemDir> {
                 }
             }
 
-            let parent_dir = dirs.get(&parent_path)
+            let parent_dir = dirs
+                .get(&parent_path)
                 .cloned()
                 .unwrap_or_else(|| root.clone());
             let basename = components.last().unwrap();

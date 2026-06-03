@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use libos::{write, exit, open, read, close};
+use libos::{close, exit, open, read, write};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
@@ -15,7 +15,7 @@ pub extern "C" fn main() -> i32 {
         write(1, msg.as_ptr(), msg.len());
         return 1;
     }
-    
+
     let mut buf = [0u8; 1024];
     loop {
         let n = read(fd as usize, buf.as_mut_ptr(), buf.len());
@@ -24,7 +24,7 @@ pub extern "C" fn main() -> i32 {
         }
         write(1, buf.as_ptr(), n as usize);
     }
-    
+
     close(fd);
     0
 }

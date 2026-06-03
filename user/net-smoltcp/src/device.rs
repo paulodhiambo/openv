@@ -9,7 +9,9 @@ pub struct SmolDevice {
 
 impl SmolDevice {
     pub fn new() -> Self {
-        SmolDevice { rx_buf: [0u8; 1536] }
+        SmolDevice {
+            rx_buf: [0u8; 1536],
+        }
     }
 
     /// Try to receive a frame. Returns Some(len) on success, None if no frame available.

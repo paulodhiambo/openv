@@ -1,5 +1,5 @@
+use crate::mm::pmm::{PAGE_SIZE, alloc_page};
 use buddy_system_allocator::LockedHeap;
-use crate::mm::pmm::{alloc_page, PAGE_SIZE};
 
 #[global_allocator]
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
@@ -21,7 +21,11 @@ pub fn init() {
                     seg_start = pa;
                 }
                 Some(prev) if prev + PAGE_SIZE != pa => {
-                    unsafe { HEAP_ALLOCATOR.lock().add_to_heap(seg_start, prev + PAGE_SIZE); }
+                    unsafe {
+                        HEAP_ALLOCATOR
+                            .lock()
+                            .add_to_heap(seg_start, prev + PAGE_SIZE);
+                    }
                     total_added += (prev - seg_start) + PAGE_SIZE;
                     seg_start = pa;
                 }
@@ -32,8 +36,16 @@ pub fn init() {
         }
     }
     if let Some(end) = prev_pa {
-        unsafe { HEAP_ALLOCATOR.lock().add_to_heap(seg_start, end + PAGE_SIZE); }
+        unsafe {
+            HEAP_ALLOCATOR
+                .lock()
+                .add_to_heap(seg_start, end + PAGE_SIZE);
+        }
         total_added += (end - seg_start) + PAGE_SIZE;
     }
-    crate::println!("Heap: {} pages ({} MB) added to heap allocator", n, total_added / 1024 / 1024);
+    crate::println!(
+        "Heap: {} pages ({} MB) added to heap allocator",
+        n,
+        total_added / 1024 / 1024
+    );
 }

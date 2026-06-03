@@ -35,7 +35,9 @@ pub extern "C" fn secondary_kmain(hartid: usize, _dtb_ptr: usize) -> ! {
 
 pub fn send_ipi_all_except_self() {
     let self_hart: usize;
-    unsafe { core::arch::asm!("mv {}, tp", out(reg) self_hart, options(nomem, nostack)); }
+    unsafe {
+        core::arch::asm!("mv {}, tp", out(reg) self_hart, options(nomem, nostack));
+    }
     let self_hart = self_hart.min(MAX_HARTS - 1);
     let mut mask: usize = 0;
     for i in 0..MAX_HARTS {

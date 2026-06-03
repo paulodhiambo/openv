@@ -1,10 +1,10 @@
 #![no_std]
 extern crate alloc;
 
-use core::arch::asm;
-use core::panic::PanicInfo;
-use core::arch::global_asm;
 use buddy_system_allocator::LockedHeap;
+use core::arch::asm;
+use core::arch::global_asm;
+use core::panic::PanicInfo;
 
 // ── User-space heap (2 MB in BSS, zero-filled before main) ───────────────────
 const USER_HEAP_SIZE: usize = 2 * 1024 * 1024;
@@ -101,7 +101,12 @@ pub extern "C" fn open(path_ptr: *const u8, path_len: usize, flags: u32) -> i32 
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn getdents(path_ptr: *const u8, path_len: usize, buf: *mut u8, len: usize) -> isize {
+pub extern "C" fn getdents(
+    path_ptr: *const u8,
+    path_len: usize,
+    buf: *mut u8,
+    len: usize,
+) -> isize {
     syscall4(12, path_ptr as usize, path_len, buf as usize, len) as isize
 }
 
@@ -122,7 +127,13 @@ pub fn unlink(path: &[u8]) -> i32 {
 
 /// Rename `old` to `new`. Returns 0 on success, -1 on error.
 pub fn rename(old: &[u8], new: &[u8]) -> i32 {
-    syscall4(29, old.as_ptr() as usize, old.len(), new.as_ptr() as usize, new.len()) as i32
+    syscall4(
+        29,
+        old.as_ptr() as usize,
+        old.len(),
+        new.as_ptr() as usize,
+        new.len(),
+    ) as i32
 }
 
 /// Enter (1) or leave (0) raw terminal mode (character-by-character input).
@@ -235,6 +246,36 @@ pub extern "C" fn recv(fd: i32, buf: *mut u8, len: usize, _flags: i32) -> isize 
     syscall(48, fd as usize, buf as usize, len) as isize
 }
 
+/// Return the PID of the calling process.
+pub fn getpid() -> i32 {
+    syscall(53, 0, 0, 0) as i32
+}
+
+/// Return the PID of the parent process.
+pub fn getppid() -> i32 {
+    syscall(54, 0, 0, 0) as i32
+}
+
+/// Change the current working directory.  Returns 0 on success, -1 on error.
+pub fn chdir(path: &[u8]) -> i32 {
+    syscall(55, path.as_ptr() as usize, path.len(), 0) as i32
+}
+
+/// Copy the current working directory into `buf`.  Returns bytes written.
+pub fn getcwd(buf: &mut [u8]) -> usize {
+    syscall(56, buf.as_mut_ptr() as usize, buf.len(), 0)
+}
+
+/// Duplicate `fd` to the lowest available descriptor.  Returns new fd or -1.
+pub fn dup(fd: i32) -> i32 {
+    syscall(57, fd as usize, 0, 0) as i32
+}
+
+/// Duplicate `oldfd` to `newfd`, closing `newfd` first.  Returns `newfd` or -1.
+pub fn dup2(oldfd: i32, newfd: i32) -> i32 {
+    syscall(58, oldfd as usize, newfd as usize, 0) as i32
+}
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     exit(1);
@@ -257,7 +298,9 @@ fn errno_from_usize(v: usize) -> Option<Errno> {
     }
     // If value encodes usize::MAX - ERR, extract ERR
     let err = (usize::MAX).wrapping_sub(v) as i32;
-    if err == 0 { return None; }
+    if err == 0 {
+        return None;
+    }
     match err {
         1 => Some(Errno::EPERM),
         12 => Some(Errno::EACCES),
@@ -312,7 +355,12 @@ pub fn exec(path: &[u8]) -> i32 {
 /// Wait for a child process to change state. If target_pid == -1, waits for any child.
 /// Returns child's pid on success and writes exit status to `status_ptr` if non-null.
 pub fn waitpid_res(target_pid: i32, status_ptr: *mut i32, options: i32) -> Result<i32, Errno> {
-    match check_ret(syscall(52, target_pid as usize, status_ptr as usize, options as usize)) {
+    match check_ret(syscall(
+        52,
+        target_pid as usize,
+        status_ptr as usize,
+        options as usize,
+    )) {
         Ok(v) => Ok(v as i32),
         Err(e) => Err(e),
     }

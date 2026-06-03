@@ -1,8 +1,21 @@
+# Build artifacts
 /target
-
 /user/target
+/test_root
+/test_root.tar
+/openv.img
+/openv.bin
 
+# IDE
 .claude
 .idea
+.vscode
 
-openv.img
+# macOS
+.DS_Store
+
+# Editor swap
+*.swp
+*.swo
+*~
+\#*\#

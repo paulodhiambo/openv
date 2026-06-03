@@ -10,15 +10,13 @@ type ProbeFn = fn(base: usize, irq: usize) -> Option<Box<dyn Driver>>;
 
 struct DriverEntry {
     compatible: &'static [&'static str],
-    probe:      ProbeFn,
+    probe: ProbeFn,
 }
 
-static DRIVER_TABLE: &[DriverEntry] = &[
-    DriverEntry {
-        compatible: &["virtio,mmio"],
-        probe:      crate::net::virtio_mmio::probe_driver,
-    },
-];
+static DRIVER_TABLE: &[DriverEntry] = &[DriverEntry {
+    compatible: &["virtio,mmio"],
+    probe: crate::net::virtio_mmio::probe_driver,
+}];
 
 pub static ACTIVE_DRIVERS: Mutex<Vec<Box<dyn Driver>>> = Mutex::new(Vec::new());
 
@@ -35,10 +33,7 @@ pub fn probe_all(dtb_ptr: usize) {
             if let Some(comp_str) = comp_prop.as_str() {
                 for entry in DRIVER_TABLE {
                     if entry.compatible.iter().any(|c| comp_str.contains(c)) {
-                        let mut base = node
-                            .property("reg")
-                            .and_then(|p| p.as_usize())
-                            .unwrap_or(0);
+                        let mut base = node.property("reg").and_then(|p| p.as_usize()).unwrap_or(0);
                         if base == 0 {
                             if let Some(idx) = node.name.rfind('@') {
                                 if let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16) {
