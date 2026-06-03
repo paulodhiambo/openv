@@ -1,0 +1,35 @@
+name: Build and Artifacts
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Rust toolchain
+      run: rustup show
+
+    - name: Build Userspace and Kernel
+      run: ./scripts/build.sh
+
+    - name: Upload Kernel Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: openv-kernel
+        path: target/riscv64gc-unknown-none-elf/debug/openv
+
+    - name: Upload Initrd Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: test_root.tar
+        path: test_root.tar

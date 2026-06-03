@@ -1,0 +1,11 @@
+[package]
+name = "forktest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libos = { path = "../libos" }
+
+[[bin]]
+name = "forktest"
+path = "src/main.rs"
