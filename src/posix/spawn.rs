@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 pub const USER_STACK_TOP: usize = 0x200000000; // 8GB
-pub const USER_STACK_PAGES: usize = 4;
+pub const USER_STACK_PAGES: usize = 8; // 32 KB — enough for smoltcp + daemon stacks in debug builds
 
 pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     let proc = Process::new(ppid);
