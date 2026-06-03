@@ -246,6 +246,11 @@ pub extern "C" fn recv(fd: i32, buf: *mut u8, len: usize, _flags: i32) -> isize 
     syscall(48, fd as usize, buf as usize, len) as isize
 }
 
+/// Non-blocking channel read. Returns bytes read, or 0 if no message is pending. Never sleeps.
+pub fn try_recv(fd: usize, buf: *mut u8, len: usize) -> isize {
+    syscall(49, fd, buf as usize, len) as isize
+}
+
 /// Return the PID of the calling process.
 pub fn getpid() -> i32 {
     syscall(53, 0, 0, 0) as i32

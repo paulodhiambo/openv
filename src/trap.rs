@@ -926,6 +926,38 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         tf.regs[10] = usize::MAX
                     }
                 }
+                49 => {
+                    // sys_try_recv(fd, buf_ptr, max_len) — non-blocking Channel read
+                    // Returns bytes read, or 0 if no message is pending (never sleeps).
+                    let fd = arg0 as u32;
+                    let buf_ptr = arg1 as *mut u8;
+                    let max_len = arg2 as usize;
+                    let proc = crate::posix::process::PROCESS_TABLE
+                        .lock()
+                        .get(&crate::posix::process::current_pid())
+                        .cloned()
+                        .unwrap();
+                    let fds = proc.fds.lock();
+                    if let Some(obj) = fds.get(fd) {
+                        match obj {
+                            crate::ipc::handle::KernelObject::Channel(ep) => {
+                                if let Some(msg) = ep.try_recv() {
+                                    let to_copy = core::cmp::min(msg.bytes.len(), max_len);
+                                    let dst = unsafe {
+                                        core::slice::from_raw_parts_mut(buf_ptr, to_copy)
+                                    };
+                                    dst.copy_from_slice(&msg.bytes[..to_copy]);
+                                    tf.regs[10] = to_copy;
+                                } else {
+                                    tf.regs[10] = 0; // no data, return 0 (no block)
+                                }
+                            }
+                            _ => tf.regs[10] = usize::MAX,
+                        }
+                    } else {
+                        tf.regs[10] = usize::MAX;
+                    }
+                }
                 23 => {
                     // sys_setuid
                     let proc = crate::posix::process::PROCESS_TABLE

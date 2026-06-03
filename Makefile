@@ -12,6 +12,7 @@ BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp
 QEMU_MEM   ?= 128M
 QEMU_CPUS  ?= 1
 QEMU_FLAGS  = -machine virt -bios default -nographic -m $(QEMU_MEM) -smp $(QEMU_CPUS)
+QEMU_NET    = -netdev user,id=net0 -device virtio-net-device,netdev=net0
 QEMU_DISK   = -drive id=disk0,file=$(DISK_IMG),format=raw,if=none -device virtio-blk-device,drive=disk0
 
 .PHONY: help build build-kernel build-user build-release initrd              \
@@ -114,17 +115,17 @@ run: $(KERNEL) $(INITRD)
 	@echo ''
 	@if [ -f $(DISK_IMG) ]; then \
 	  echo '  disk   : $(DISK_IMG) (persistent OFS)'; \
-	  qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK); \
+	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK); \
 	else \
-	  qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL); \
+	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL); \
 	fi
 
 debug: $(KERNEL) $(INITRD)
 	@echo 'Booting openv with GDB server on :1234...'
 	@if [ -f $(DISK_IMG) ]; then \
-	  qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK) -s -S; \
+	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK) -s -S; \
 	else \
-	  qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL) -s -S; \
+	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) -s -S; \
 	fi
 
 # ── Disk image ─────────────────────────────────────────────────────────────────
