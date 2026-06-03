@@ -123,13 +123,13 @@ pub fn exit(pid: Pid, status: i32) {
         }
     }
 
-    // Phase 3: Wake parent if it is waiting for this child (or any child).
+    // Phase 3: Wake parent if it is blocked waiting for this child (or any child).
     if ppid != 0 {
         let table = PROCESS_TABLE.lock();
         if let Some(parent) = table.get(&ppid) {
-            let delivered = {
+            let should_wake = {
                 let target = parent.wait_target.lock();
-                if target.is_none() || *target == Some(pid) || *target == Some(-1) {
+                if target.is_none() || *target == Some(pid) || *target == Some(-1i32) {
                     *parent.wait_result.lock() = Some((pid, status));
                     true
                 } else {
@@ -137,10 +137,20 @@ pub fn exit(pid: Pid, status: i32) {
                 }
             };
 
-            *parent.state.lock() = ProcState::Running;
-            crate::posix::process::RUN_QUEUE.lock().push_back(parent.pid);
-
-            let _ = delivered;
+            if should_wake {
+                let was_stopped = {
+                    let mut state = parent.state.lock();
+                    if matches!(*state, crate::posix::process::ProcState::Stopped) {
+                        *state = crate::posix::process::ProcState::Running;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if was_stopped {
+                    crate::posix::process::RUN_QUEUE.lock().push_back(parent.pid);
+                }
+            }
         }
     }
 }
@@ -185,8 +195,9 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
 }
 
 /// Replace current process image with new ELF (execve-like minimal).
+/// Returns the entry point VA so the trap handler can install it into sepc.
 /// arg0: path_ptr, arg1: path_len
-pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<(), &'static str> {
+pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static str> {
     let ppid = crate::posix::process::current_pid();
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = core::str::from_utf8(path_bytes).map_err(|_| "Invalid UTF-8 path")?;
@@ -202,27 +213,19 @@ pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<(), &'static str
     // Get current process and its old root
     let proc = crate::posix::process::PROCESS_TABLE.lock().get(&ppid).cloned().unwrap();
     let old_satp = proc.satp_val;
-    let old_root_pa = old_satp & 0xFFFFFFFFFFF;
+    let old_root_pa = (old_satp & 0xFFFFFFFFFFF) << 12; // PPN → PA
 
     // Create a fresh page table for the process
     let new_root_pa = crate::mm::vmm::PageTable::new_process_table()?;
     let new_ppn = new_root_pa >> 12;
-    let new_satp = (8 << 60) | new_ppn;
+    let new_satp = (8usize << 60) | new_ppn;
 
-    // Destroy old user mappings (free pages / decrement refs)
-    crate::mm::vmm::destroy_user_space(old_root_pa)?;
-
-    // Install new page table into process
-    unsafe {
-        let p_ptr = alloc::sync::Arc::as_ptr(&proc) as *mut crate::posix::process::Process;
-        (*p_ptr).satp_val = new_satp;
-    }
-
-    // Load ELF into new page table
+    // Load ELF and stack into the NEW page table BEFORE touching the old one.
+    // If we destroyed the old space first, PMM could reuse its root page for a
+    // new mapping while the CPU still page-walks via the old satp — corruption.
     let new_pt = unsafe { &mut *(new_root_pa as *mut crate::mm::vmm::PageTable) };
     let entry_point = crate::posix::elf::load_elf(&file_data, new_pt)?;
 
-    // Allocate and map user stack
     let stack_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
     for i in 0..USER_STACK_PAGES {
         let va = stack_base + i * PAGE_SIZE;
@@ -230,15 +233,20 @@ pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<(), &'static str
         new_pt.map_page(va, pa, PTE_R | PTE_W | PTE_U)?;
     }
 
-    // Update trap frame for current process
-    {
-        let mut tf = proc.trap_frame.lock();
-        tf.sepc = entry_point;
-        tf.regs[2] = USER_STACK_TOP; // SP
-        tf.sstatus = (1 << 5) | (1 << 18);
+    // Install the new page table into the process struct, then switch the CPU
+    // to it before freeing the old space — ensures no stale satp walk.
+    unsafe {
+        let p_ptr = alloc::sync::Arc::as_ptr(&proc) as *mut crate::posix::process::Process;
+        (*p_ptr).satp_val = new_satp;
+        riscv::register::satp::write(new_satp);
+        core::arch::asm!("sfence.vma");
     }
 
-    Ok(())
+    // Now safe: CPU uses new PT, old space can be freed.
+    crate::mm::vmm::destroy_user_space(old_root_pa)?;
+
+    // Return entry_point — trap handler sets sepc, sp, sstatus (satp already switched above).
+    Ok(entry_point)
 }
 
 /// Remove a newly-created but not-yet-running process from the system

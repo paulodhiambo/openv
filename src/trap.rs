@@ -333,15 +333,16 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                             drop(buf_lock);
                                             drop(fds);
                                             tf.sepc -= 4;
-                                        } else if c == 0x03 { // Ctrl-C
+                                        } else if c == 0x03 { // Ctrl-C — kill the running process
                                             uart.put_char(b'^');
                                             uart.put_char(b'C');
                                             uart.put_char(b'\n');
-                                            buf_lock.clear();
-                                            // Restart syscall
                                             drop(buf_lock);
                                             drop(fds);
-                                            tf.sepc -= 4;
+                                            let pid = crate::posix::process::current_pid();
+                                            crate::posix::spawn::exit(pid, 130);
+                                            crate::posix::process::schedule();
+                                            unsafe { __halt_cpu() }
                                         } else {
                                             // Regular character
                                             buf_lock.push(c);
@@ -821,7 +822,24 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let path_ptr = arg0 as *const u8;
                     let path_len = arg1 as usize;
                     match crate::posix::spawn::sys_exec(path_ptr, path_len) {
-                        Ok(()) => { tf.regs[10] = 0; }
+                        Ok(entry_point) => {
+                            // sys_exec has already installed the new page table into
+                            // the process struct; now switch the CPU to it and jump to
+                            // the new entry point — do NOT advance sepc by 4.
+                            let new_satp = crate::posix::process::PROCESS_TABLE.lock()
+                                .get(&crate::posix::process::current_pid())
+                                .map(|p| p.satp_val)
+                                .unwrap_or(0);
+                            unsafe {
+                                riscv::register::satp::write(new_satp);
+                                core::arch::asm!("sfence.vma");
+                            }
+                            tf.sepc = entry_point;
+                            tf.regs[2] = crate::posix::spawn::USER_STACK_TOP;
+                            tf.sstatus = (1 << 5) | (1 << 18);
+                            tf.regs[10] = 0;
+                            return tf as *mut _;
+                        }
                         Err(_) => { tf.regs[10] = usize::MAX; }
                     }
                 }
@@ -838,14 +856,34 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     }; // PROCESS_TABLE lock dropped here
 
                     if let Some((zpid, zstatus)) = delivered {
-                        // Reap the zombie.
-                        {
+                        // Extract resources then remove — must free after lock is released.
+                        let (kstack, zombie_satp) = {
                             let mut table = crate::posix::process::PROCESS_TABLE.lock();
+                            let r = table.get(&zpid)
+                                .map(|p| (p.kernel_stack_bottom, p.satp_val))
+                                .unwrap_or((0, 0));
                             table.remove(&zpid);
                             if let Some(parent) = table.get(&ppid) {
                                 parent.children.lock().retain(|&p| p != zpid);
                             }
+                            if let Some(parent) = table.get(&ppid) {
+                                *parent.wait_target.lock() = None;
+                                *parent.wait_status_ptr.lock() = None;
+                            }
+                            r
+                        };
+                        // Free resources after lock is dropped.
+                        if kstack != 0 {
+                            const KSZ: usize = 65536;
+                            unsafe {
+                                alloc::alloc::dealloc(
+                                    kstack as *mut u8,
+                                    core::alloc::Layout::from_size_align(KSZ, 16).unwrap(),
+                                );
+                            }
                         }
+                        let root_pa = (zombie_satp & 0xFFFFFFFFFFF) << 12;
+                        if root_pa != 0 { let _ = crate::mm::vmm::destroy_user_space(root_pa); }
                         if !status_ptr.is_null() {
                             unsafe { *status_ptr = zstatus; }
                         }
@@ -872,14 +910,33 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         }; // PROCESS_TABLE lock dropped here
 
                         if let Some((zpid, zstatus)) = found_zombie {
-                            // Reap immediately.
-                            {
+                            // Extract resources then remove.
+                            let (kstack, zombie_satp) = {
                                 let mut table = crate::posix::process::PROCESS_TABLE.lock();
+                                let r = table.get(&zpid)
+                                    .map(|p| (p.kernel_stack_bottom, p.satp_val))
+                                    .unwrap_or((0, 0));
                                 table.remove(&zpid);
                                 if let Some(parent) = table.get(&ppid) {
                                     parent.children.lock().retain(|&p| p != zpid);
                                 }
+                                if let Some(parent) = table.get(&ppid) {
+                                    *parent.wait_target.lock() = None;
+                                    *parent.wait_status_ptr.lock() = None;
+                                }
+                                r
+                            };
+                            if kstack != 0 {
+                                const KSZ: usize = 65536;
+                                unsafe {
+                                    alloc::alloc::dealloc(
+                                        kstack as *mut u8,
+                                        core::alloc::Layout::from_size_align(KSZ, 16).unwrap(),
+                                    );
+                                }
                             }
+                            let root_pa = (zombie_satp & 0xFFFFFFFFFFF) << 12;
+                            if root_pa != 0 { let _ = crate::mm::vmm::destroy_user_space(root_pa); }
                             if !status_ptr.is_null() {
                                 unsafe { *status_ptr = zstatus; }
                             }
