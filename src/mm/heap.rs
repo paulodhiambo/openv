@@ -5,7 +5,10 @@ use buddy_system_allocator::LockedHeap;
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::empty();
 
 pub fn init() {
-    // Hand up to 2048 PMM pages (8 MB) to the buddy allocator.
+    // Hand up to 8192 PMM pages (32 MB) to the buddy allocator.
+    // The buddy allocator rounds each allocation to the nearest power of 2,
+    // so loading a large binary (e.g. 4 MB file → 8 MB buddy block) needs
+    // enough head-room above that block for the rest of the kernel.
     // Pages from alloc_page() may NOT be contiguous if the PMM free list
     // had gaps (e.g. FDT or initrd reservations).  We group consecutive
     // pages into segments and add each segment separately so the buddy
@@ -14,7 +17,7 @@ pub fn init() {
     let mut prev_pa: Option<usize> = None;
     let mut seg_start = 0;
     let mut total_added = 0usize;
-    for _ in 0..2048 {
+    for _ in 0..8192 {
         if let Some(pa) = alloc_page() {
             match prev_pa {
                 None => {

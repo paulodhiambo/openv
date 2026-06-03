@@ -90,14 +90,97 @@ struct Stage {
 struct Shell {
     cwd: Vec<u8>,
     history: Vec<Vec<u8>>,
+    env: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl Shell {
     fn new() -> Self {
+        let mut env: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        env.push((b"HOME".to_vec(),     b"/".to_vec()));
+        env.push((b"USER".to_vec(),     b"guest".to_vec()));
+        env.push((b"SHELL".to_vec(),    b"/sh".to_vec()));
+        env.push((b"PATH".to_vec(),     b"/".to_vec()));
+        env.push((b"HOSTNAME".to_vec(), b"openv".to_vec()));
+        env.push((b"PWD".to_vec(),      b"/".to_vec()));
         Shell {
             cwd: b"/".to_vec(),
             history: Vec::new(),
+            env,
         }
+    }
+
+    // ── Environment variable helpers ──────────────────────────────────────────
+
+    fn env_get<'a>(&'a self, name: &[u8]) -> Option<&'a [u8]> {
+        self.env.iter().find(|(k, _)| k.as_slice() == name).map(|(_, v)| v.as_slice())
+    }
+
+    fn env_set(&mut self, name: Vec<u8>, value: Vec<u8>) {
+        if let Some(e) = self.env.iter_mut().find(|(k, _)| k.as_slice() == name.as_slice()) {
+            e.1 = value;
+        } else {
+            self.env.push((name, value));
+        }
+    }
+
+    fn env_unset(&mut self, name: &[u8]) {
+        self.env.retain(|(k, _)| k.as_slice() != name);
+    }
+
+    // Expand `$VAR` and `${VAR}` in `line`; single-quoted spans are left as-is.
+    fn expand_vars(line: &[u8], env: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        let mut in_single = false;
+        while i < line.len() {
+            let b = line[i];
+            if in_single {
+                if b == b'\'' { in_single = false; } else { out.push(b); }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'\'' => { in_single = true; i += 1; }
+                b'$' if i + 1 < line.len() => {
+                    i += 1;
+                    if line[i] == b'{' {
+                        i += 1;
+                        let start = i;
+                        while i < line.len() && line[i] != b'}' { i += 1; }
+                        let name = &line[start..i];
+                        if i < line.len() { i += 1; }
+                        if let Some((_, v)) = env.iter().find(|(k, _)| k.as_slice() == name) {
+                            out.extend_from_slice(v);
+                        }
+                    } else if line[i].is_ascii_alphabetic() || line[i] == b'_' {
+                        let start = i;
+                        while i < line.len() && (line[i].is_ascii_alphanumeric() || line[i] == b'_') {
+                            i += 1;
+                        }
+                        let name = &line[start..i];
+                        if let Some((_, v)) = env.iter().find(|(k, _)| k.as_slice() == name) {
+                            out.extend_from_slice(v);
+                        }
+                        // undefined vars expand to empty (POSIX)
+                    } else {
+                        out.push(b'$');
+                    }
+                }
+                _ => { out.push(b); i += 1; }
+            }
+        }
+        out
+    }
+
+    // Detect a bare `NAME=value` line (no spaces in name).
+    fn parse_assignment(line: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+        let eq = line.iter().position(|&b| b == b'=')?;
+        let name = &line[..eq];
+        if name.is_empty() { return None; }
+        let first = name[0];
+        if !first.is_ascii_alphabetic() && first != b'_' { return None; }
+        if !name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_') { return None; }
+        Some((name.to_vec(), line[eq + 1..].to_vec()))
     }
 
     fn prompt(&self) {
@@ -460,6 +543,10 @@ impl Shell {
                 | b"hostname"
                 | b"uname"
                 | b"uname-a"
+                | b"export"
+                | b"unset"
+                | b"env"
+                | b"printenv"
                 | b"exit"
                 | b"quit"
         )
@@ -766,6 +853,9 @@ impl Shell {
             b"whoami" => wrt(b"guest\n"),
             b"hostname" => wrt(b"openv\n"),
             b"uname" | b"uname-a" => wrt(b"openv 0.1.0 riscv64gc-unknown-none-elf\n"),
+            b"export" => self.cmd_export(&args[1..]),
+            b"unset" => self.cmd_unset(&args[1..]),
+            b"env" | b"printenv" => self.cmd_env(),
             b"exit" | b"quit" => {
                 set_raw(0);
                 exit(0);
@@ -937,6 +1027,7 @@ impl Shell {
             self.resolve(&args[0])
         };
         if chdir(&path) == 0 {
+            self.env_set(b"PWD".to_vec(), path.clone());
             self.cwd = path;
         } else {
             wrt(b"cd: ");
@@ -975,6 +1066,40 @@ impl Shell {
         }
     }
 
+    fn cmd_export(&mut self, args: &[Vec<u8>]) {
+        if args.is_empty() {
+            self.cmd_env();
+            return;
+        }
+        for arg in args {
+            if let Some((name, value)) = Self::parse_assignment(arg) {
+                let expanded = Self::expand_vars(&value, &self.env);
+                self.env_set(name, expanded);
+            } else {
+                // `export NAME` with no value: ensure it exists (set empty if absent)
+                let name = arg.clone();
+                if self.env_get(&name).is_none() {
+                    self.env_set(name, Vec::new());
+                }
+            }
+        }
+    }
+
+    fn cmd_unset(&mut self, args: &[Vec<u8>]) {
+        for arg in args {
+            self.env_unset(arg);
+        }
+    }
+
+    fn cmd_env(&self) {
+        for (name, value) in &self.env {
+            wrt(name);
+            wrt(b"=");
+            wrt(value);
+            wrt_nl();
+        }
+    }
+
     fn cmd_history(&self) {
         if self.history.is_empty() {
             wrt(b"(no history)\n");
@@ -1001,20 +1126,23 @@ impl Shell {
         wrt(b"openv shell builtins:\n");
         wrt(RESET);
         let cmds = [
-            ("echo [args]", "Print arguments to stdout"),
-            ("ls [path]", "List directory contents"),
-            ("cat [file]", "Print file (or stdin) to stdout"),
-            ("pwd", "Print working directory"),
-            ("cd [path]", "Change directory (default /)"),
-            ("mkdir <dir>", "Create directory"),
-            ("rm <file>", "Remove file or directory"),
-            ("nano <file>", "Text editor (^O save, ^X exit)"),
-            ("history", "Show command history"),
-            ("clear", "Clear the screen"),
-            ("whoami", "Print current user"),
-            ("hostname", "Print hostname"),
-            ("uname", "Print system info"),
-            ("exit", "Exit the shell"),
+            ("echo [args]",        "Print arguments to stdout"),
+            ("ls [path]",          "List directory contents"),
+            ("cat [file]",         "Print file (or stdin) to stdout"),
+            ("pwd",                "Print working directory"),
+            ("cd [path]",          "Change directory (default /)"),
+            ("mkdir <dir>",        "Create directory"),
+            ("rm <file>",          "Remove file or directory"),
+            ("nano <file>",        "Text editor (^O save, ^X exit)"),
+            ("export [NAME=VAL]",  "Set/show environment variables"),
+            ("unset <NAME>",       "Remove an environment variable"),
+            ("env",                "List all environment variables"),
+            ("history",            "Show command history"),
+            ("clear",              "Clear the screen"),
+            ("whoami",             "Print current user"),
+            ("hostname",           "Print hostname"),
+            ("uname",              "Print system info"),
+            ("exit",               "Exit the shell"),
         ];
         wrt(b"  Pipelines: cmd | cmd    Redirect: > file  < file\n");
         wrt(b"  Editing: Up/Down=history  Left/Right=move  Ctrl-A/E=start/end  Ctrl-U=kill\n\n");
@@ -1052,7 +1180,20 @@ impl Shell {
             if self.history.last().map(|e| e.as_slice()) != Some(line.as_slice()) {
                 self.history.push(line.clone());
             }
-            let stages = Self::parse_pipeline(&line);
+            // Bare `NAME=value` — assignment only, no command.
+            let trimmed = {
+                let mut s = line.as_slice();
+                while s.first() == Some(&b' ') || s.first() == Some(&b'\t') { s = &s[1..]; }
+                s
+            };
+            if let Some((name, value)) = Self::parse_assignment(trimmed) {
+                let expanded = Self::expand_vars(&value, &self.env);
+                self.env_set(name, expanded);
+                continue;
+            }
+            // Expand $VAR references, then parse and execute.
+            let expanded = Self::expand_vars(&line, &self.env);
+            let stages = Self::parse_pipeline(&expanded);
             match stages.len() {
                 0 => continue,
                 1 => self.exec_single(&stages[0]),
