@@ -236,6 +236,10 @@ impl Shell {
                     cursor = 0;
                 }
 
+                0x09 => {
+                    self.tab_complete(&mut buf, &mut cursor);
+                }
+
                 c if c >= 0x20 => {
                     buf.insert(cursor, c);
                     cursor += 1;
@@ -261,6 +265,156 @@ impl Shell {
             }
             move_left(extra);
         }
+    }
+
+    // ── Tab completion ────────────────────────────────────────────────────────
+
+    fn tab_complete(&self, buf: &mut Vec<u8>, cursor: &mut usize) {
+        // Find start of the word ending at cursor
+        let word_start = {
+            let mut i = *cursor;
+            while i > 0 && buf[i - 1] != b' ' && buf[i - 1] != b'\t' {
+                i -= 1;
+            }
+            i
+        };
+        let prefix = buf[word_start..*cursor].to_vec();
+
+        // Command context when everything before word_start is whitespace
+        let is_cmd = buf[..word_start].iter().all(|&b| b == b' ' || b == b'\t');
+
+        let matches = if is_cmd {
+            self.complete_command(&prefix)
+        } else {
+            self.complete_path(&prefix)
+        };
+
+        match matches.len() {
+            0 => {
+                wrt(b"\x07"); // bell — no match
+            }
+            1 => {
+                Self::apply_completion(buf, cursor, word_start, &matches[0]);
+            }
+            _ => {
+                // Print all candidates on a new line, then redraw prompt + input
+                wrt(b"\r\n");
+                for m in &matches {
+                    wrt(m);
+                    wrt(b"  ");
+                }
+                wrt(b"\r\n");
+                self.prompt();
+                wrt(&buf[..*cursor]);
+                let tail = buf.len() - *cursor;
+                if tail > 0 {
+                    wrt(&buf[*cursor..]);
+                    move_left(tail);
+                }
+            }
+        }
+    }
+
+    fn apply_completion(buf: &mut Vec<u8>, cursor: &mut usize, word_start: usize, completion: &[u8]) {
+        let old_word_len = *cursor - word_start;
+        let tail: Vec<u8> = buf[*cursor..].to_vec();
+
+        if old_word_len > 0 {
+            move_left(old_word_len);
+        }
+        wrt(completion);
+        if !tail.is_empty() {
+            wrt(&tail);
+            move_left(tail.len());
+        }
+        // Erase any leftover chars if the old word was longer
+        if old_word_len > completion.len() {
+            let extra = old_word_len - completion.len();
+            for _ in 0..extra {
+                wrt(b" ");
+            }
+            move_left(extra);
+        }
+
+        buf.truncate(word_start);
+        buf.extend_from_slice(completion);
+        *cursor = buf.len();
+        buf.extend_from_slice(&tail);
+    }
+
+    // Complete a command name: builtins + executables in /.
+    fn complete_command(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        if prefix.starts_with(b"/") {
+            return self.complete_path(prefix);
+        }
+        const BUILTINS: &[&[u8]] = &[
+            b"echo", b"ls", b"cat", b"pwd", b"cd", b"mkdir", b"rm",
+            b"help", b"clear", b"history", b"nano", b"whoami",
+            b"hostname", b"uname", b"exit",
+        ];
+        let mut matches: Vec<Vec<u8>> = Vec::new();
+        for &b in BUILTINS {
+            if b.starts_with(prefix) {
+                matches.push(b.to_vec());
+            }
+        }
+        // Also scan / for executables
+        let root = b"/";
+        let mut dbuf = [0u8; 4096];
+        let n = getdents(root.as_ptr(), root.len(), dbuf.as_mut_ptr(), dbuf.len());
+        if n > 0 {
+            let mut pos = 0usize;
+            while pos < n as usize {
+                let start = pos;
+                while pos < n as usize && dbuf[pos] != 0 {
+                    pos += 1;
+                }
+                if pos > start {
+                    let entry = &dbuf[start..pos];
+                    if entry.starts_with(prefix) && !matches.iter().any(|m| m.as_slice() == entry) {
+                        matches.push(entry.to_vec());
+                    }
+                }
+                pos += 1;
+            }
+        }
+        matches
+    }
+
+    // Complete a path argument.
+    fn complete_path(&self, prefix: &[u8]) -> Vec<Vec<u8>> {
+        let (dir_path, name_prefix, path_prefix) =
+            if let Some(pos) = prefix.iter().rposition(|&b| b == b'/') {
+                let dir = &prefix[..=pos];
+                let name = prefix[pos + 1..].to_vec();
+                (self.resolve(dir), name, prefix[..=pos].to_vec())
+            } else {
+                (self.cwd.clone(), prefix.to_vec(), Vec::new())
+            };
+
+        let mut dbuf = [0u8; 4096];
+        let n = getdents(dir_path.as_ptr(), dir_path.len(), dbuf.as_mut_ptr(), dbuf.len());
+        if n < 0 {
+            return Vec::new();
+        }
+        let mut matches = Vec::new();
+        let mut pos = 0usize;
+        while pos < n as usize {
+            let start = pos;
+            while pos < n as usize && dbuf[pos] != 0 {
+                pos += 1;
+            }
+            if pos > start {
+                let entry = &dbuf[start..pos];
+                if entry != b"." && entry != b".." && entry.starts_with(name_prefix.as_slice()) {
+                    let mut completion = path_prefix.clone();
+                    completion.extend_from_slice(entry);
+                    matches.push(completion);
+                }
+            }
+            pos += 1;
+        }
+        matches
     }
 
     // Collapse `.` and `..` in an absolute path.
@@ -585,6 +739,11 @@ impl Shell {
             return;
         }
         let cmd = args[0].as_slice();
+        // --help flag: show usage and return
+        if args.iter().any(|a| a.as_slice() == b"--help") {
+            Self::show_cmd_help(cmd);
+            return;
+        }
         match cmd {
             b"echo" => self.cmd_echo(&args[1..]),
             b"ls" => self.cmd_ls(&args[1..]),
@@ -620,6 +779,80 @@ impl Shell {
     }
 
     // ── Builtins ──────────────────────────────────────────────────────────────
+
+    fn show_cmd_help(cmd: &[u8]) {
+        match cmd {
+            b"echo" => {
+                wrt(b"Usage: echo [arg...]\n");
+                wrt(b"  Print arguments to stdout separated by spaces.\n");
+            }
+            b"ls" => {
+                wrt(b"Usage: ls [path]\n");
+                wrt(b"  List directory contents.\n");
+                wrt(b"  With no argument, lists the current directory.\n");
+            }
+            b"cat" => {
+                wrt(b"Usage: cat [file...]\n");
+                wrt(b"  Concatenate files and print to stdout.\n");
+                wrt(b"  With no arguments, reads from stdin until EOF (Ctrl-D).\n");
+            }
+            b"pwd" => {
+                wrt(b"Usage: pwd\n");
+                wrt(b"  Print the current working directory.\n");
+            }
+            b"cd" => {
+                wrt(b"Usage: cd [path]\n");
+                wrt(b"  Change the current directory.\n");
+                wrt(b"  With no argument, changes to /.\n");
+            }
+            b"mkdir" => {
+                wrt(b"Usage: mkdir <dir...>\n");
+                wrt(b"  Create one or more directories.\n");
+            }
+            b"rm" => {
+                wrt(b"Usage: rm <file...>\n");
+                wrt(b"  Remove one or more files.\n");
+            }
+            b"nano" => {
+                wrt(b"Usage: nano <file>\n");
+                wrt(b"  Open a file in the text editor.\n");
+                wrt(b"  ^O: save   ^X: exit   ^K: delete line\n");
+            }
+            b"history" | b".history" => {
+                wrt(b"Usage: history\n");
+                wrt(b"  Display the command history list.\n");
+            }
+            b"clear" => {
+                wrt(b"Usage: clear\n");
+                wrt(b"  Clear the terminal screen.\n");
+            }
+            b"whoami" => {
+                wrt(b"Usage: whoami\n");
+                wrt(b"  Print the current user name.\n");
+            }
+            b"hostname" => {
+                wrt(b"Usage: hostname\n");
+                wrt(b"  Print the system hostname.\n");
+            }
+            b"uname" | b"uname-a" => {
+                wrt(b"Usage: uname\n");
+                wrt(b"  Print system information (OS, version, architecture).\n");
+            }
+            b"exit" | b"quit" => {
+                wrt(b"Usage: exit\n");
+                wrt(b"  Exit the shell.\n");
+            }
+            b"help" | b"?" => {
+                wrt(b"Usage: help\n");
+                wrt(b"  Show a summary of all built-in commands.\n");
+            }
+            _ => {
+                wrt(b"No help available for '");
+                wrt(cmd);
+                wrt(b"'.\n");
+            }
+        }
+    }
 
     fn cmd_echo(&self, args: &[Vec<u8>]) {
         let mut first = true;
