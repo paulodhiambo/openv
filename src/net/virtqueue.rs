@@ -28,8 +28,9 @@ pub struct VirtQueue {
     avail_flags: *mut u16,
     avail_idx: *mut u16,
     avail_ring: *mut u16,
-    used_flags: *mut u32,
-    used_idx: *mut u32,
+    // Used ring: flags and idx are u16 (not u32) per the virtio spec.
+    used_flags: *mut u16,
+    used_idx: *mut u16,
     used_ring: *mut UsedElem,
     free_list: Mutex<Vec<u16>>,
     last_used_idx: u32,
@@ -61,8 +62,9 @@ impl VirtQueue {
         let used_offset = avail_offset + 2 * 2 + avail_ring_bytes; // flags+idx (2*2 bytes) + ring
         // align used_offset to 4
         let used_offset = (used_offset + 3) & !3;
-        let used_ptr = (page_pa + used_offset) as *mut u32; // flags and idx are u32 each
-        let used_ring_ptr = unsafe { (page_pa + used_offset + 8) as *mut UsedElem };
+        // used ring: u16 flags + u16 idx (4 bytes total header), then UsedElem array
+        let used_ptr = (page_pa + used_offset) as *mut u16;
+        let used_ring_ptr = unsafe { (page_pa + used_offset + 4) as *mut UsedElem };
 
         // Initialize free list
         let mut free = Vec::new();
@@ -77,7 +79,7 @@ impl VirtQueue {
             avail_idx: unsafe { avail_ptr.add(1) },
             avail_ring: avail_ring_ptr,
             used_flags: used_ptr,
-            used_idx: unsafe { used_ptr.add(1) },
+            used_idx: unsafe { used_ptr.add(1) }, // offset +2 (one u16)
             used_ring: used_ring_ptr,
             free_list: Mutex::new(free),
             last_used_idx: 0,
@@ -146,8 +148,9 @@ impl VirtQueue {
         // Ensure we observe device writes
         fence(Ordering::Acquire);
         let mut out = Vec::new();
+        // used_idx is u16; compare as u16 to handle wrapping at 65536.
         let used_i = unsafe { read_volatile(self.used_idx) };
-        while self.last_used_idx as u32 != used_i {
+        while self.last_used_idx as u16 != used_i {
             let idx = (self.last_used_idx as usize) % self.size;
             let ue = unsafe { &*self.used_ring.add(idx) };
             out.push((ue.id as u16, ue.len));

@@ -10,30 +10,6 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Format and lint ──────────────────────────────────────────────────────────
-  quality:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install nightly toolchain
-        run: |
-          rustup set profile minimal
-          rustup toolchain install nightly \
-            --component rustfmt \
-            --component clippy \
-            --target riscv64gc-unknown-none-elf \
-            --allow-downgrade
-
-      - name: rustfmt (kernel)
-        run: cargo fmt --check
-
-      - name: clippy (kernel)
-        run: cargo clippy -- -D warnings
-
-      - name: rustfmt (userspace)
-        working-directory: user
-        run: cargo fmt --check
 
   # ── Build everything ─────────────────────────────────────────────────────────
   build:

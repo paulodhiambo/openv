@@ -291,6 +291,8 @@ impl crate::drivers::Driver for VirtioDriver {
 }
 
 /// Driver framework entry-point: called by `drivers::probe_all` when a virtio,mmio node is found.
+const VIRTIO_NET_DEVICE_ID: u32 = 1;
+
 pub fn probe_driver(
     base: usize,
     irq: usize,
@@ -300,6 +302,10 @@ pub fn probe_driver(
     }
     let magic = mmio_read32(base, OFF_MAGIC);
     if magic != VIRTIO_MAGIC {
+        return None;
+    }
+    let device_id = mmio_read32(base, OFF_DEVICE_ID);
+    if device_id != VIRTIO_NET_DEVICE_ID {
         return None;
     }
     let q_pa = crate::mm::pmm::alloc_page()?;

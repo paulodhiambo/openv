@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
+pub mod block;
 pub mod drivers;
 pub mod ipc;
 pub mod mm;
@@ -120,6 +121,17 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     ));
                 }
                 crate::println!("VFS: Mounted MemFS at /, ProcFS at /proc, DevFS at /dev.");
+
+                // Mount persistent OFS filesystem at /mnt if a block device is present.
+                if let Some(ofs_root) = vfs::blockfs::try_mount() {
+                    let mut mt = vfs::MOUNT_TABLE.lock();
+                    // Ensure /mnt exists in the initrd tarfs
+                    mt.mounts.push((
+                        alloc::string::String::from("/mnt"),
+                        ofs_root,
+                    ));
+                    crate::println!("VFS: mounted OFS at /mnt");
+                }
             }
         }
     } else {

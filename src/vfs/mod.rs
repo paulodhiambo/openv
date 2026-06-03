@@ -1,3 +1,4 @@
+pub mod blockfs;
 pub mod devfs;
 pub mod memfs;
 pub mod procfs;

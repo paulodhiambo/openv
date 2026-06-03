@@ -4,15 +4,18 @@ KERNEL      := $(KERNEL_DIR)/openv
 KERNEL_REL  := target/$(TARGET)/release/openv
 INITRD      := test_root.tar
 IMG         := openv.img
+DISK_IMG    := disk.img
+DISK_SIZE_MB := 8
 
 # Overridable via env or make args
 BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp
 QEMU_MEM   ?= 128M
 QEMU_CPUS  ?= 1
 QEMU_FLAGS  = -machine virt -bios default -nographic -m $(QEMU_MEM) -smp $(QEMU_CPUS)
+QEMU_DISK   = -drive id=disk0,file=$(DISK_IMG),format=raw,if=none -device virtio-blk-device,drive=disk0
 
 .PHONY: help build build-kernel build-user build-release initrd              \
-        run all debug image image-release                                     \
+        run all debug image image-release disk                                \
         clean clean-user check clippy fmt                                     \
         $(BINS:%=test_root/%)
 
@@ -96,6 +99,12 @@ test_root/proc test_root/dev:
 
 # ── Run ────────────────────────────────────────────────────────────────────────
 
+disk: $(DISK_IMG)
+
+$(DISK_IMG):
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=$(DISK_SIZE_MB) 2>/dev/null
+	@echo '  disk   : $(DISK_IMG) ($(DISK_SIZE_MB) MB)'
+
 run: $(KERNEL) $(INITRD)
 	@echo 'Booting openv...'
 	@echo '  kernel : $(KERNEL)'
@@ -103,11 +112,20 @@ run: $(KERNEL) $(INITRD)
 	@echo '  memory : $(QEMU_MEM)'
 	@echo '  (Ctrl-A X to quit QEMU)'
 	@echo ''
-	qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL)
+	@if [ -f $(DISK_IMG) ]; then \
+	  echo '  disk   : $(DISK_IMG) (persistent OFS)'; \
+	  qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK); \
+	else \
+	  qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL); \
+	fi
 
 debug: $(KERNEL) $(INITRD)
 	@echo 'Booting openv with GDB server on :1234...'
-	qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL) -s -S
+	@if [ -f $(DISK_IMG) ]; then \
+	  qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK) -s -S; \
+	else \
+	  qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL) -s -S; \
+	fi
 
 # ── Disk image ─────────────────────────────────────────────────────────────────
 
@@ -132,7 +150,7 @@ fmt:
 # ── Clean ──────────────────────────────────────────────────────────────────────
 
 clean:
-	rm -rf openv.img openv.bin
+	rm -rf openv.img openv.bin $(DISK_IMG)
 	cd user && cargo clean
 	cargo clean
 
