@@ -43,6 +43,9 @@ pub struct Process {
 
 static NEXT_PID: AtomicI32 = AtomicI32::new(1);
 
+/// PID of the current foreground process (-1 = none). Set by sys_set_fg_pid.
+pub static FOREGROUND_PID: AtomicI32 = AtomicI32::new(-1);
+
 pub static PROCESS_TABLE: Mutex<BTreeMap<Pid, Arc<Process>>> = Mutex::new(BTreeMap::new());
 pub static RUN_QUEUE: Mutex<alloc::collections::VecDeque<Pid>> =
     Mutex::new(alloc::collections::VecDeque::new());

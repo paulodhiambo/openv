@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use libos::{
     chdir, close, create, dup, dup2, exec, exit, fork, getdents, mkdir, open, pipe, read, set_raw,
-    sys_yield, unlink, waitpid, write,
+    set_fg_pid, sys_yield, unlink, waitpid, write,
 };
 
 const RESET: &[u8] = b"\x1b[0m";
@@ -750,7 +750,9 @@ impl Shell {
                 self.exec_child(&stage.args);
             } else if pid > 0 {
                 let mut status = 0i32;
+                set_fg_pid(pid);
                 waitpid(pid, &mut status as *mut i32);
+                set_fg_pid(-1);
             } else {
                 wrt(b"sh: fork failed\n");
             }
@@ -813,10 +815,12 @@ impl Shell {
             }
         }
 
-        for pid in pids {
+        for pid in &pids {
+            set_fg_pid(*pid);
             let mut status = 0i32;
-            waitpid(pid, &mut status as *mut i32);
+            waitpid(*pid, &mut status as *mut i32);
         }
+        set_fg_pid(-1);
         set_raw(1);
     }
 

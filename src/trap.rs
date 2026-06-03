@@ -384,14 +384,22 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                                 drop(fds);
                                                 tf.sepc -= 4;
                                             } else if c == 0x03 {
-                                                // Ctrl-C — kill the running process
+                                                // Ctrl-C — kill the registered foreground
+                                                // process (the child the shell is waiting
+                                                // on), or fall back to the current process.
                                                 uart.put_char(b'^');
                                                 uart.put_char(b'C');
                                                 uart.put_char(b'\n');
                                                 drop(buf_lock);
                                                 drop(fds);
-                                                let pid = crate::posix::process::current_pid();
-                                                crate::posix::spawn::exit(pid, 130);
+                                                let fg = crate::posix::process::FOREGROUND_PID
+                                                    .swap(-1, Ordering::Relaxed);
+                                                let target = if fg > 0 {
+                                                    fg
+                                                } else {
+                                                    crate::posix::process::current_pid()
+                                                };
+                                                crate::posix::spawn::exit(target, 130);
                                                 crate::posix::process::schedule();
                                                 unsafe { __halt_cpu() }
                                             } else {
@@ -1379,6 +1387,13 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         tf.regs[10] = usize::MAX;
                     }
                 }
+                60 => {
+                    // sys_set_fg_pid(pid) — register foreground process for SIGINT delivery
+                    let pid = arg0 as i32;
+                    crate::posix::process::FOREGROUND_PID
+                        .store(pid, Ordering::Relaxed);
+                    tf.regs[10] = 0;
+                }
                 _ => {
                     panic!("Unknown syscall {}", syscall_num);
                 }
@@ -1421,6 +1436,32 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
         // to acquire, causing a deadlock with spin::Mutex.
         scause::Trap::Interrupt(5) => {
             crate::timer::set_next_timer();
+
+            // Poll UART for Ctrl+C while the foreground process is not doing read().
+            // The timer fires only in user mode (interrupts disabled in kernel mode),
+            // so no Rust locks are held here — safe to call exit() + schedule().
+            {
+                let mut uart = crate::uart::Uart::new();
+                if let Some(c) = uart.try_get_char() {
+                    if c == 0x03 {
+                        let fg = crate::posix::process::FOREGROUND_PID
+                            .swap(-1, Ordering::Relaxed);
+                        if fg > 0 {
+                            uart.put_char(b'^');
+                            uart.put_char(b'C');
+                            uart.put_char(b'\n');
+                            crate::posix::spawn::exit(fg, 130);
+                            crate::posix::process::schedule();
+                            unsafe { __halt_cpu() }
+                        }
+                    } else {
+                        // Non-Ctrl+C: push into the line discipline buffer for the
+                        // next read() syscall to pick up.
+                        LINE_DISC_BUFFER.lock().push(c);
+                    }
+                }
+            }
+
             let pid = crate::posix::process::current_pid();
             if pid != 0 {
                 crate::posix::process::RUN_QUEUE.lock().push_back(pid);

@@ -276,6 +276,12 @@ pub fn dup2(oldfd: i32, newfd: i32) -> i32 {
     syscall(58, oldfd as usize, newfd as usize, 0) as i32
 }
 
+/// Register `pid` as the current foreground process for Ctrl+C delivery.
+/// Pass -1 to clear (no foreground process).
+pub fn set_fg_pid(pid: i32) {
+    syscall(60, pid as usize, 0, 0);
+}
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     exit(1);
