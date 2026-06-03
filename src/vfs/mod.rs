@@ -113,30 +113,19 @@ pub static MOUNT_TABLE: Mutex<MountTable> = Mutex::new(MountTable {
 });
 
 /// Returns (parent_dir_vnode, filename) for the given path.
+/// Uses lookup_path for the parent so mount points are honoured.
 pub fn lookup_parent(path: &str) -> Result<(Arc<dyn Vnode>, alloc::string::String), &'static str> {
-    let root = {
-        let mt = MOUNT_TABLE.lock();
-        mt.root
-            .as_ref()
-            .ok_or("No root filesystem mounted")?
-            .clone()
+    let (parent_path, name) = match path.rfind('/') {
+        Some(idx) => (&path[..idx.max(1)], &path[idx + 1..]),
+        None => ("/", path),
     };
 
-    let parts: alloc::vec::Vec<&str> = path
-        .split('/')
-        .filter(|c| !c.is_empty() && *c != ".")
-        .collect();
-
-    if parts.is_empty() {
-        return Err("Invalid path");
+    if name.is_empty() {
+        return Err("Invalid path: trailing slash");
     }
 
-    let filename = alloc::string::String::from(*parts.last().unwrap());
-    let mut current = root;
-    for part in &parts[..parts.len() - 1] {
-        current = current.lookup(part)?;
-    }
-    Ok((current, filename))
+    let parent = lookup_path(parent_path)?;
+    Ok((parent, alloc::string::String::from(name)))
 }
 
 /// Traverse a path, honouring mount points (longest prefix match first).
