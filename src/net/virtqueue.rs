@@ -1,6 +1,6 @@
-use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{fence, Ordering};
 use alloc::vec::Vec;
+use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{Ordering, fence};
 use spin::Mutex;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;

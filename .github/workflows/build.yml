@@ -1,4 +1,4 @@
-name: Build and Artifacts
+name: CI
 
 on:
   push:
@@ -10,26 +10,102 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── Format and lint ──────────────────────────────────────────────────────────
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install nightly \
+            --component rustfmt \
+            --component clippy \
+            --target riscv64gc-unknown-none-elf \
+            --allow-downgrade
+
+      - name: rustfmt (kernel)
+        run: cargo fmt --check
+
+      - name: clippy (kernel)
+        run: cargo clippy -- -D warnings
+
+      - name: rustfmt (userspace)
+        working-directory: user
+        run: cargo fmt --check
+
+  # ── Build everything ─────────────────────────────────────────────────────────
   build:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Rust toolchain
-      run: rustup show
+      - name: Install nightly toolchain
+        run: |
+          rustup set profile minimal
+          rustup toolchain install nightly \
+            --component rust-src \
+            --component llvm-tools-preview \
+            --target riscv64gc-unknown-none-elf \
+            --allow-downgrade
+          rustup target add riscv64gc-unknown-none-elf --toolchain nightly
 
-    - name: Build Userspace and Kernel
-      run: ./scripts/build.sh
+      - name: Restore Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            user/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'user/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
-    - name: Upload Kernel Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: openv-kernel
-        path: target/riscv64gc-unknown-none-elf/debug/openv
+      - name: Build userspace
+        working-directory: user
+        run: cargo build
 
-    - name: Upload Initrd Artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: test_root.tar
-        path: test_root.tar
+      - name: Package initrd
+        run: |
+          mkdir -p test_root/proc test_root/dev
+          for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp; do
+            src="user/target/riscv64gc-unknown-none-elf/debug/$bin"
+            if [ -f "$src" ]; then
+              cp "$src" "test_root/$bin"
+            fi
+          done
+          echo "Hello from initrd TAR!" > test_root/dummy.txt
+          cd test_root && tar -cf ../test_root.tar .
+
+      - name: Build kernel (debug)
+        run: cargo build
+
+      - name: Build kernel (release)
+        run: cargo build --release
+
+      - name: Verify kernel ELF
+        run: |
+          file target/riscv64gc-unknown-none-elf/debug/openv
+          file target/riscv64gc-unknown-none-elf/release/openv
+          size target/riscv64gc-unknown-none-elf/debug/openv
+          size target/riscv64gc-unknown-none-elf/release/openv
+
+      - name: Upload kernel (debug)
+        uses: actions/upload-artifact@v4
+        with:
+          name: openv-kernel-debug
+          path: target/riscv64gc-unknown-none-elf/debug/openv
+
+      - name: Upload kernel (release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: openv-kernel-release
+          path: target/riscv64gc-unknown-none-elf/release/openv
+
+      - name: Upload initrd
+        uses: actions/upload-artifact@v4
+        with:
+          name: initrd
+          path: test_root.tar

@@ -1,30 +1,45 @@
-use crate::vfs::{Vnode, VnodeType, Stat, DirEntry};
+use crate::vfs::{DirEntry, Stat, Vnode, VnodeType};
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::string::String;
 
 /// Root of /dev — contains null, zero, tty.
 pub struct DevRoot;
 
 impl Vnode for DevRoot {
     fn stat(&self) -> Stat {
-        Stat { mode: 0o755, uid: 0, gid: 0, size: 0, vtype: VnodeType::Directory }
+        Stat {
+            mode: 0o755,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            vtype: VnodeType::Directory,
+        }
     }
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn Vnode>, &'static str> {
         match name {
             "null" => Ok(Arc::new(DevNull)),
             "zero" => Ok(Arc::new(DevZero)),
-            "tty"  => Ok(Arc::new(DevTty)),
-            _      => Err("Not found"),
+            "tty" => Ok(Arc::new(DevTty)),
+            _ => Err("Not found"),
         }
     }
 
     fn readdir(&self) -> Result<Vec<DirEntry>, &'static str> {
         Ok(alloc::vec![
-            DirEntry { name: String::from("null"), vtype: VnodeType::File },
-            DirEntry { name: String::from("zero"), vtype: VnodeType::File },
-            DirEntry { name: String::from("tty"),  vtype: VnodeType::File },
+            DirEntry {
+                name: String::from("null"),
+                vtype: VnodeType::File
+            },
+            DirEntry {
+                name: String::from("zero"),
+                vtype: VnodeType::File
+            },
+            DirEntry {
+                name: String::from("tty"),
+                vtype: VnodeType::File
+            },
         ])
     }
 }
@@ -34,7 +49,13 @@ pub struct DevNull;
 
 impl Vnode for DevNull {
     fn stat(&self) -> Stat {
-        Stat { mode: 0o666, uid: 0, gid: 0, size: 0, vtype: VnodeType::File }
+        Stat {
+            mode: 0o666,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            vtype: VnodeType::File,
+        }
     }
 
     fn read(&self, _offset: usize, _buf: &mut [u8]) -> Result<usize, &'static str> {
@@ -51,7 +72,13 @@ pub struct DevZero;
 
 impl Vnode for DevZero {
     fn stat(&self) -> Stat {
-        Stat { mode: 0o666, uid: 0, gid: 0, size: 0, vtype: VnodeType::File }
+        Stat {
+            mode: 0o666,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            vtype: VnodeType::File,
+        }
     }
 
     fn read(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
@@ -71,7 +98,13 @@ pub struct DevTty;
 
 impl Vnode for DevTty {
     fn stat(&self) -> Stat {
-        Stat { mode: 0o666, uid: 0, gid: 0, size: 0, vtype: VnodeType::File }
+        Stat {
+            mode: 0o666,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            vtype: VnodeType::File,
+        }
     }
 
     fn read(&self, _offset: usize, buf: &mut [u8]) -> Result<usize, &'static str> {

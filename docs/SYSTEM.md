@@ -39,5 +39,5 @@ The network stack is based on **smoltcp** (`no_std` TCP/IP).
 - **Stack**: `src/net/stack.rs` manages the `smoltcp` interface and polling.
 
 ## 6. Development Workflow
-- **Build**: `./build_run.sh` builds userland, packages it into a `tar` file (initrd), and runs the kernel.
+- **Build**: `./scripts/build.sh` builds kernel, userspace, and packages initrd. `./scripts/run.sh` boots it in QEMU.
 - **Testing**: Golden-transcript testing on serial output is the recommended approach for verification.

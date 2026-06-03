@@ -8,7 +8,10 @@ pub struct PktBuf {
 
 impl PktBuf {
     pub const fn empty() -> Self {
-        Self { len: 0, data: [0u8; MAX_PKT_SIZE] }
+        Self {
+            len: 0,
+            data: [0u8; MAX_PKT_SIZE],
+        }
     }
 
     pub fn from_slice(slice: &[u8]) -> Self {

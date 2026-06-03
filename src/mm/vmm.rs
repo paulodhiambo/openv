@@ -1,7 +1,7 @@
-use riscv::register::satp;
-use core::arch::asm;
-use crate::println;
 use crate::mm::pmm::alloc_page;
+use crate::println;
+use core::arch::asm;
+use riscv::register::satp;
 
 pub const PTE_V: usize = 1 << 0;
 pub const PTE_R: usize = 1 << 1;
@@ -35,12 +35,8 @@ impl PageTable {
 
     /// Maps a 4KB page at the given virtual address to the given physical address.
     pub fn map_page(&mut self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
-        let vpn = [
-            (va >> 12) & 0x1FF,
-            (va >> 21) & 0x1FF,
-            (va >> 30) & 0x1FF,
-        ];
-        
+        let vpn = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
+
         let mut pt = self;
         for level in (1..=2).rev() {
             let entry = &mut pt.entries[vpn[level]];
@@ -52,15 +48,15 @@ impl PageTable {
             let next_pt_pa = (*entry >> 10) << 12;
             pt = unsafe { &mut *(next_pt_pa as *mut PageTable) };
         }
-        
+
         let entry = &mut pt.entries[vpn[0]];
         if *entry & PTE_V != 0 {
             return Err("Page already mapped");
         }
-        
+
         let ppn = pa >> 12;
         *entry = (ppn << 10) | PTE_V | flags;
-        
+
         Ok(())
     }
 }
@@ -72,7 +68,11 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
 
     // Safety: raw pointer dereferences are safe because we are given valid physical
     // addresses of page tables that we own (or are currently in use by the parent).
-    unsafe fn clone_level(parent_pa: usize, child_pa: usize, level: usize) -> Result<(), &'static str> {
+    unsafe fn clone_level(
+        parent_pa: usize,
+        child_pa: usize,
+        level: usize,
+    ) -> Result<(), &'static str> {
         let parent_pt = unsafe { &mut *(parent_pa as *mut PageTable) };
         let child_pt = unsafe { &mut *(child_pa as *mut PageTable) };
 
@@ -202,7 +202,9 @@ unsafe fn destroy_level(pt_pa: usize, level: usize) {
     let pt = unsafe { &mut *(pt_pa as *mut PageTable) };
     for idx in 0..512 {
         let entry = pt.entries[idx];
-        if entry == 0 { continue; }
+        if entry == 0 {
+            continue;
+        }
         let is_leaf = (entry & (PTE_R | PTE_X)) != 0;
         if is_leaf {
             let pa = (entry >> 10) << 12;
@@ -236,7 +238,9 @@ pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
         // For entries that correspond to kernel identity mapping (first 4), skip
         for i in 0..512 {
             let entry = root.entries[i];
-            if entry == 0 { continue; }
+            if entry == 0 {
+                continue;
+            }
             // Indices 0-3 at root level are kernel 1GB identity mappings — never free them.
             if i < 4 {
                 continue;
@@ -289,7 +293,9 @@ pub fn handle_user_page_fault(fault_va: usize) -> Result<(), &'static str> {
 
     let pa = crate::mm::pmm::alloc_page().ok_or("OOM in demand paging")?;
     // Zero the new page
-    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
+    unsafe {
+        core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE);
+    }
 
     match pt.map_page(page_va, pa, PTE_R | PTE_W | PTE_U) {
         Ok(()) => {
@@ -310,9 +316,9 @@ pub fn init() {
     unsafe {
         ROOT_PAGE_TABLE = root_page;
     }
-    
+
     let root = unsafe { &mut *(root_page as *mut PageTable) };
-    
+
     // Identity map the first 4GB of physical address space using 1GB mega-pages
     // This covers our UART MMIO (0x1000_0000) and RAM (0x8000_0000)
     for i in 0..4 {
@@ -321,11 +327,11 @@ pub fn init() {
         // Set Valid, Read, Write, Execute flags
         root.entries[i] = (ppn << 10) | PTE_V | PTE_R | PTE_W | PTE_X;
     }
-    
+
     let ppn = root_page >> 12;
     // satp MODE: 8 means Sv39
-    let satp_val = (8 << 60) | ppn; 
-    
+    let satp_val = (8 << 60) | ppn;
+
     unsafe {
         satp::write(satp_val);
         asm!("sfence.vma");

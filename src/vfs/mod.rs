@@ -1,12 +1,12 @@
-pub mod memfs;
-pub mod tar;
-pub mod procfs;
 pub mod devfs;
+pub mod memfs;
+pub mod procfs;
+pub mod tar;
 
+use crate::posix::process::Process;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 use spin::Mutex;
-use crate::posix::process::Process;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VnodeType {
@@ -100,14 +100,14 @@ pub fn check_access(proc: &Process, node: &dyn Vnode, requested: AccessMask) -> 
 
 /// Global mount table: one root FS plus optional prefix-mount points.
 pub struct MountTable {
-    pub root:   Option<Arc<dyn Vnode>>,
+    pub root: Option<Arc<dyn Vnode>>,
     /// Additional mounts as (absolute_path_prefix, vnode_root).
     /// Checked before falling through to root FS; longest prefix wins.
     pub mounts: alloc::vec::Vec<(alloc::string::String, Arc<dyn Vnode>)>,
 }
 
 pub static MOUNT_TABLE: Mutex<MountTable> = Mutex::new(MountTable {
-    root:   None,
+    root: None,
     mounts: alloc::vec::Vec::new(),
 });
 
@@ -115,7 +115,10 @@ pub static MOUNT_TABLE: Mutex<MountTable> = Mutex::new(MountTable {
 pub fn lookup_parent(path: &str) -> Result<(Arc<dyn Vnode>, alloc::string::String), &'static str> {
     let root = {
         let mt = MOUNT_TABLE.lock();
-        mt.root.as_ref().ok_or("No root filesystem mounted")?.clone()
+        mt.root
+            .as_ref()
+            .ok_or("No root filesystem mounted")?
+            .clone()
     };
 
     let parts: alloc::vec::Vec<&str> = path
@@ -140,7 +143,11 @@ pub fn lookup_path(path: &str) -> Result<Arc<dyn Vnode>, &'static str> {
     // Collect mounts and root while holding the lock, then release.
     let (root, mounts) = {
         let mt = MOUNT_TABLE.lock();
-        let root = mt.root.as_ref().ok_or("No root filesystem mounted")?.clone();
+        let root = mt
+            .root
+            .as_ref()
+            .ok_or("No root filesystem mounted")?
+            .clone();
         let mounts = mt.mounts.clone();
         (root, mounts)
     };

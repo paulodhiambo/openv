@@ -1,4 +1,4 @@
-use crate::vfs::{Vnode, VnodeType, Stat, DirEntry};
+use crate::vfs::{DirEntry, Stat, Vnode, VnodeType};
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
@@ -8,38 +8,48 @@ use spin::Mutex;
 
 pub struct MemFile {
     data: Mutex<Vec<u8>>,
-    uid:  u32,
-    gid:  u32,
+    uid: u32,
+    gid: u32,
     mode: u32,
 }
 
 impl MemFile {
     pub fn new(data: Vec<u8>, uid: u32, gid: u32, mode: u32) -> Self {
-        Self { data: Mutex::new(data), uid, gid, mode }
+        Self {
+            data: Mutex::new(data),
+            uid,
+            gid,
+            mode,
+        }
     }
 }
 
 /// Read-only file backed by a slice of initrd memory — zero heap copies.
 pub struct RoFile {
     data: &'static [u8],
-    uid:  u32,
-    gid:  u32,
+    uid: u32,
+    gid: u32,
     mode: u32,
 }
 
 impl RoFile {
     pub fn new(data: &'static [u8], uid: u32, gid: u32, mode: u32) -> Self {
-        Self { data, uid, gid, mode }
+        Self {
+            data,
+            uid,
+            gid,
+            mode,
+        }
     }
 }
 
 impl crate::vfs::Vnode for RoFile {
     fn stat(&self) -> crate::vfs::Stat {
         crate::vfs::Stat {
-            mode:  self.mode,
-            uid:   self.uid,
-            gid:   self.gid,
-            size:  self.data.len(),
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            size: self.data.len(),
             vtype: crate::vfs::VnodeType::File,
         }
     }
@@ -58,10 +68,10 @@ impl crate::vfs::Vnode for RoFile {
 impl Vnode for MemFile {
     fn stat(&self) -> Stat {
         Stat {
-            mode:  self.mode,
-            uid:   self.uid,
-            gid:   self.gid,
-            size:  self.data.lock().len(),
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            size: self.data.lock().len(),
             vtype: VnodeType::File,
         }
     }
@@ -95,8 +105,8 @@ impl Vnode for MemFile {
 
 pub struct MemDir {
     children: Mutex<BTreeMap<String, Arc<dyn Vnode>>>,
-    uid:  u32,
-    gid:  u32,
+    uid: u32,
+    gid: u32,
     mode: u32,
 }
 
@@ -118,10 +128,10 @@ impl MemDir {
 impl Vnode for MemDir {
     fn stat(&self) -> Stat {
         Stat {
-            mode:  self.mode,
-            uid:   self.uid,
-            gid:   self.gid,
-            size:  0,
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            size: 0,
             vtype: VnodeType::Directory,
         }
     }
@@ -136,10 +146,13 @@ impl Vnode for MemDir {
 
     fn readdir(&self) -> Result<Vec<DirEntry>, &'static str> {
         let children = self.children.lock();
-        Ok(children.iter().map(|(name, node)| DirEntry {
-            name:  name.clone(),
-            vtype: node.stat().vtype,
-        }).collect())
+        Ok(children
+            .iter()
+            .map(|(name, node)| DirEntry {
+                name: name.clone(),
+                vtype: node.stat().vtype,
+            })
+            .collect())
     }
 
     /// Create (or truncate) a regular file in this directory, return the vnode.
@@ -166,7 +179,11 @@ impl Vnode for MemDir {
     }
 
     fn unlink(&self, name: &str) -> Result<(), &'static str> {
-        self.children.lock().remove(name).map(|_| ()).ok_or("Not found")
+        self.children
+            .lock()
+            .remove(name)
+            .map(|_| ())
+            .ok_or("Not found")
     }
 
     fn rename(&self, old_name: &str, new_name: &str) -> Result<(), &'static str> {

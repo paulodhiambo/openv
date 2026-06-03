@@ -1,19 +1,21 @@
 #![no_std]
 #![no_main]
 
-use libos::{write, spawn, sys_yield, waitpid};
+use libos::{spawn, sys_yield, waitpid, write};
 
-fn wrt(s: &[u8]) { write(1, s.as_ptr(), s.len()); }
+fn wrt(s: &[u8]) {
+    write(1, s.as_ptr(), s.len());
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> ! {
     // ── Boot banner ───────────────────────────────────────────────────────────
-    wrt(b"\x1b[2J\x1b[H");  // clear screen
+    wrt(b"\x1b[2J\x1b[H"); // clear screen
     wrt(b"\x1b[1m\x1b[32m");
-    wrt(b"  ___  ____  ___  __ __  _  _\n");
-    wrt(b" / _ \\|  _ \\| __||  V  || \\| |\n");
-    wrt(b"| (_) | |_) | _| | \\_/ ||    |\n");
-    wrt(b" \\___/|  __/|___||_| |_||_|\\_|\n");
+    wrt(b"  ___  ____  ___  _  _  __   __ \n");
+    wrt(b" / _ \\|  _ \\| __|| \\| | \\ \\ / /\n");
+    wrt(b"| (_) | |_) | _| |  \\ |  \\ V / \n");
+    wrt(b" \\___/|  __/|___||_|\\_|   \\_/  \n");
     wrt(b"      |_|\n");
     wrt(b"\x1b[0m");
     wrt(b"\x1b[36m  openv v0.1.0  \x1b[0m");
@@ -43,7 +45,9 @@ pub extern "C" fn main() -> ! {
         let sh_pid = spawn(b"/sh".as_ptr(), 3);
         if sh_pid < 0 {
             wrt(b"\x1b[31mError: failed to spawn /sh\x1b[0m\n");
-            loop { sys_yield(); }
+            loop {
+                sys_yield();
+            }
         }
 
         // Reap /sh and any other children that exit while we wait.
@@ -68,7 +72,9 @@ fn ok_line(msg: &[u8]) {
     wrt(msg);
     // right-align [ OK ]
     let pad = 50usize.saturating_sub(msg.len());
-    for _ in 0..pad { wrt(b" "); }
+    for _ in 0..pad {
+        wrt(b" ");
+    }
     wrt(b"\x1b[32m[ OK ]\x1b[0m\n");
 }
 
@@ -76,6 +82,8 @@ fn fail_line(msg: &[u8]) {
     wrt(b"  \x1b[2m*\x1b[0m ");
     wrt(msg);
     let pad = 50usize.saturating_sub(msg.len());
-    for _ in 0..pad { wrt(b" "); }
+    for _ in 0..pad {
+        wrt(b" ");
+    }
     wrt(b"\x1b[31m[FAIL]\x1b[0m\n");
 }

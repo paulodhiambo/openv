@@ -1,11 +1,11 @@
-use crate::posix::process::{Process, Pid, PROCESS_TABLE};
-use crate::vfs::lookup_path;
+use crate::mm::pmm::{PAGE_SIZE, alloc_page};
+use crate::mm::vmm::{PTE_R, PTE_U, PTE_W};
 use crate::posix::elf::load_elf;
-use crate::mm::vmm::{PTE_R, PTE_W, PTE_U};
-use crate::mm::pmm::{alloc_page, PAGE_SIZE};
-use core::sync::atomic::Ordering;
-use alloc::vec::Vec;
+use crate::posix::process::{PROCESS_TABLE, Pid, Process};
+use crate::vfs::lookup_path;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 pub const USER_STACK_TOP: usize = 0x200000000; // 8GB
 pub const USER_STACK_PAGES: usize = 4;
@@ -69,7 +69,8 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     for i in 0..USER_STACK_PAGES {
         let va = stack_base + i * PAGE_SIZE;
         let pa = alloc_page().ok_or_else(|| cleanup("Failed to alloc user stack"))?;
-        pt.map_page(va, pa, PTE_R | PTE_W | PTE_U).map_err(cleanup)?;
+        pt.map_page(va, pa, PTE_R | PTE_W | PTE_U)
+            .map_err(cleanup)?;
     }
 
     // Configure TrapFrame
@@ -95,6 +96,9 @@ pub fn exit(pid: Pid, status: i32) {
             None => return,
             Some(proc) => {
                 *proc.state.lock() = ProcState::Zombie(status);
+                // POSIX: close all fds on exit so pipe-write ends drop immediately,
+                // allowing blocked readers to see EOF without waiting for reap.
+                proc.fds.lock().close_all();
                 crate::println!("exit: pid {} status {}", pid, status);
                 let children = proc.children.lock().clone();
                 (proc.ppid, children)
@@ -148,7 +152,9 @@ pub fn exit(pid: Pid, status: i32) {
                     }
                 };
                 if was_stopped {
-                    crate::posix::process::RUN_QUEUE.lock().push_back(parent.pid);
+                    crate::posix::process::RUN_QUEUE
+                        .lock()
+                        .push_back(parent.pid);
                 }
             }
         }
@@ -169,11 +175,10 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
         let parent_root_pa = (parent_proc.satp_val & 0xFFFFFFFFFFF) << 12;
         let child_root_pa = (child.satp_val & 0xFFFFFFFFFFF) << 12;
 
-        crate::mm::vmm::clone_user_space(parent_root_pa, child_root_pa)
-            .map_err(|e| {
-                crate::println!("sys_fork: clone_user_space failed: {}", e);
-                "fork failed: clone failed"
-            })?;
+        crate::mm::vmm::clone_user_space(parent_root_pa, child_root_pa).map_err(|e| {
+            crate::println!("sys_fork: clone_user_space failed: {}", e);
+            "fork failed: clone failed"
+        })?;
 
         // Flush the parent's TLB: we cleared PTE_W on its writable user pages,
         // but stale TLB entries would let writes bypass the read-only PTE and
@@ -186,8 +191,8 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
         let child_kernel_sp = child_tf.kernel_sp; // preserve child's own kernel stack
         *child_tf = *parent_tf;
         child_tf.kernel_sp = child_kernel_sp;
-        child_tf.regs[10] = 0;    // fork() returns 0 in the child
-        child_tf.sepc += 4;       // advance past the ecall instruction
+        child_tf.regs[10] = 0; // fork() returns 0 in the child
+        child_tf.sepc += 4; // advance past the ecall instruction
     }
 
     crate::posix::process::RUN_QUEUE.lock().push_back(child.pid);
@@ -205,13 +210,19 @@ pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static 
     // Lookup and read file
     let vnode = crate::vfs::lookup_path(path)?;
     let stat = vnode.stat();
-    if stat.size == 0 { return Err("Empty binary"); }
+    if stat.size == 0 {
+        return Err("Empty binary");
+    }
     let mut file_data = alloc::vec::Vec::new();
     file_data.resize(stat.size, 0);
     vnode.read(0, &mut file_data)?;
 
     // Get current process and its old root
-    let proc = crate::posix::process::PROCESS_TABLE.lock().get(&ppid).cloned().unwrap();
+    let proc = crate::posix::process::PROCESS_TABLE
+        .lock()
+        .get(&ppid)
+        .cloned()
+        .unwrap();
     let old_satp = proc.satp_val;
     let old_root_pa = (old_satp & 0xFFFFFFFFFFF) << 12; // PPN → PA
 

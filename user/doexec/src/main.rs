@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use libos::{write, syscall, sys_yield};
+use libos::{sys_yield, syscall, write};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
@@ -17,5 +17,7 @@ pub extern "C" fn main() -> i32 {
     }
 
     // If exec succeeded, this process image is replaced and we never reach here.
-    loop { sys_yield(); }
+    loop {
+        sys_yield();
+    }
 }

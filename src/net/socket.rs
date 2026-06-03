@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 
-use alloc::vec::Vec;
-use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
-use spin::Mutex;
 use crate::ipc::channel::ChannelEndpoint;
 use crate::posix::process::Pid;
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use spin::Mutex;
 
 // Simple socket registry for proxying sockets to a userspace network daemon.
 
@@ -31,7 +31,11 @@ pub fn push_new_socket(sid: u32, ep: Arc<ChannelEndpoint>) {
 
 pub fn pop_new_socket() -> Option<(u32, Arc<ChannelEndpoint>)> {
     let mut v = NEW_SOCKS.lock();
-    if v.is_empty() { None } else { Some(v.remove(0)) }
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.remove(0))
+    }
 }
 
 pub fn register_socket_owner(sid: u32, owner_pid: Pid, owner_fd: u32) {
@@ -59,8 +63,14 @@ pub fn add_pending_accept(sid: u32, pid: Pid) {
 pub fn pop_waiting_pid(sid: u32) -> Option<Pid> {
     let mut m = PENDING_ACCEPTS.lock();
     if let Some(vec) = m.get_mut(&sid) {
-        if vec.is_empty() { None } else { Some(vec.remove(0)) }
-    } else { None }
+        if vec.is_empty() {
+            None
+        } else {
+            Some(vec.remove(0))
+        }
+    } else {
+        None
+    }
 }
 
 pub fn push_pending_accepted(sid: u32, user_fd: u32) {
@@ -78,6 +88,12 @@ pub const OPCODE_RECV: u8 = 5;
 pub fn pop_pending_accepted(sid: u32) -> Option<u32> {
     let mut m = PENDING_ACCEPTED.lock();
     if let Some(vec) = m.get_mut(&sid) {
-        if vec.is_empty() { None } else { Some(vec.remove(0)) }
-    } else { None }
+        if vec.is_empty() {
+            None
+        } else {
+            Some(vec.remove(0))
+        }
+    } else {
+        None
+    }
 }

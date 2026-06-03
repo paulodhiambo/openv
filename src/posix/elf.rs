@@ -1,5 +1,5 @@
-use crate::mm::vmm::{PageTable, PTE_R, PTE_W, PTE_X, PTE_U, PTE_V};
-use crate::mm::pmm::{alloc_page, PAGE_SIZE};
+use crate::mm::pmm::{PAGE_SIZE, alloc_page};
+use crate::mm::vmm::{PTE_R, PTE_U, PTE_V, PTE_W, PTE_X, PageTable};
 #[repr(C)]
 struct ElfHeader {
     ident: [u8; 16],
@@ -41,12 +41,12 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
     if data.len() < core::mem::size_of::<ElfHeader>() {
         return Err("File too small");
     }
-    
+
     let header = unsafe { &*(data.as_ptr() as *const ElfHeader) };
     if header.ident[0..4] != [0x7f, b'E', b'L', b'F'] {
         return Err("Not an ELF file");
     }
-    
+
     let phoff = header.phoff as usize;
     let phnum = header.phnum as usize;
     let phentsize = header.phentsize as usize;
@@ -55,7 +55,8 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
     if phentsize < core::mem::size_of::<ProgramHeader>() {
         return Err("invalid program header entry size");
     }
-    let ph_end = phoff.checked_add(phnum.checked_mul(phentsize).ok_or("integer overflow")?)
+    let ph_end = phoff
+        .checked_add(phnum.checked_mul(phentsize).ok_or("integer overflow")?)
         .ok_or("integer overflow")?;
     if ph_end > data.len() {
         return Err("program headers extend past end of file");
@@ -74,7 +75,9 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
 
             // Validate that the file data for this segment fits within the binary.
             if file_size > 0 {
-                let file_end = offset_in_file.checked_add(file_size).ok_or("integer overflow")?;
+                let file_end = offset_in_file
+                    .checked_add(file_size)
+                    .ok_or("integer overflow")?;
                 if file_end > data.len() {
                     return Err("segment data extends past end of file");
                 }
@@ -87,9 +90,15 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
 
             // Flags
             let mut flags = PTE_U;
-            if (ph.flags & PF_R) != 0 { flags |= PTE_R; }
-            if (ph.flags & PF_W) != 0 { flags |= PTE_W; }
-            if (ph.flags & PF_X) != 0 { flags |= PTE_X; }
+            if (ph.flags & PF_R) != 0 {
+                flags |= PTE_R;
+            }
+            if (ph.flags & PF_W) != 0 {
+                flags |= PTE_W;
+            }
+            if (ph.flags & PF_X) != 0 {
+                flags |= PTE_X;
+            }
 
             let mut va = start_va & !(PAGE_SIZE - 1);
 
@@ -121,6 +130,6 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
             }
         }
     }
-    
+
     Ok(header.entry as usize)
 }
