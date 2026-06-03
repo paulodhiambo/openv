@@ -19,6 +19,42 @@ impl MemFile {
     }
 }
 
+/// Read-only file backed by a slice of initrd memory — zero heap copies.
+pub struct RoFile {
+    data: &'static [u8],
+    uid:  u32,
+    gid:  u32,
+    mode: u32,
+}
+
+impl RoFile {
+    pub fn new(data: &'static [u8], uid: u32, gid: u32, mode: u32) -> Self {
+        Self { data, uid, gid, mode }
+    }
+}
+
+impl crate::vfs::Vnode for RoFile {
+    fn stat(&self) -> crate::vfs::Stat {
+        crate::vfs::Stat {
+            mode:  self.mode,
+            uid:   self.uid,
+            gid:   self.gid,
+            size:  self.data.len(),
+            vtype: crate::vfs::VnodeType::File,
+        }
+    }
+
+    fn read(&self, offset: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+        if offset >= self.data.len() {
+            return Ok(0);
+        }
+        let available = &self.data[offset..];
+        let to_copy = min(available.len(), buf.len());
+        buf[..to_copy].copy_from_slice(&available[..to_copy]);
+        Ok(to_copy)
+    }
+}
+
 impl Vnode for MemFile {
     fn stat(&self) -> Stat {
         Stat {
@@ -117,5 +153,26 @@ impl Vnode for MemDir {
             children.insert(String::from(name), node.clone());
             Ok(node)
         }
+    }
+
+    fn mkdir(&self, name: &str) -> Result<Arc<dyn Vnode>, &'static str> {
+        let mut children = self.children.lock();
+        if children.contains_key(name) {
+            return Err("Already exists");
+        }
+        let dir: Arc<dyn Vnode> = Arc::new(MemDir::new(self.uid, self.gid, 0o755));
+        children.insert(String::from(name), dir.clone());
+        Ok(dir)
+    }
+
+    fn unlink(&self, name: &str) -> Result<(), &'static str> {
+        self.children.lock().remove(name).map(|_| ()).ok_or("Not found")
+    }
+
+    fn rename(&self, old_name: &str, new_name: &str) -> Result<(), &'static str> {
+        let mut children = self.children.lock();
+        let node = children.remove(old_name).ok_or("Not found")?;
+        children.insert(String::from(new_name), node);
+        Ok(())
     }
 }

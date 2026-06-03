@@ -9,22 +9,22 @@ unsafe extern "C" {
 
 static mut NEXT_FREE_PAGE: usize = 0;
 static mut RAM_END: usize = 0;
+static mut RAM_START: usize = 0;
 
-// Fixed-size page refcount table to avoid using the global heap during early boot.
-const MAX_PAGE_REFS: usize = 32768; // up to 128MB / 4KB
+// O(1) refcount table: one u16 per 4KB page, indexed by (pa - ram_start) / PAGE_SIZE.
+// Covers up to 1 GB of RAM (262144 pages × 4 KB). 512 KB BSS vs the prior 4 MB.
+const MAX_PAGES: usize = 262144;
+static PAGE_REF_COUNTS: Mutex<[u16; MAX_PAGES]> = Mutex::new([0u16; MAX_PAGES]);
 
-#[repr(C)]
-struct PageRefTable {
-    pas: [usize; MAX_PAGE_REFS],
-    cnts: [usize; MAX_PAGE_REFS],
-    len: usize,
+#[inline]
+fn page_index(pa: usize) -> usize {
+    let base = unsafe { RAM_START };
+    if pa < base {
+        return MAX_PAGES; // sentinel: out of RAM range
+    }
+    let idx = (pa - base) / PAGE_SIZE;
+    if idx < MAX_PAGES { idx } else { MAX_PAGES }
 }
-
-static PAGE_REFS_TABLE: Mutex<PageRefTable> = Mutex::new(PageRefTable {
-    pas: [0; MAX_PAGE_REFS],
-    cnts: [0; MAX_PAGE_REFS],
-    len: 0,
-});
 
 pub fn init(dtb_ptr: usize) {
     let fdt = unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8).unwrap() };
@@ -36,6 +36,7 @@ pub fn init(dtb_ptr: usize) {
     let ram_start = region.starting_address as usize;
     let ram_size = region.size.unwrap_or(0);
     unsafe {
+        RAM_START = ram_start;
         RAM_END = ram_start + ram_size;
     }
     
@@ -97,35 +98,18 @@ pub fn init(dtb_ptr: usize) {
 pub fn alloc_page() -> Option<usize> {
     unsafe {
         if NEXT_FREE_PAGE == 0 {
-            None
-        } else {
-            let page = NEXT_FREE_PAGE;
-            NEXT_FREE_PAGE = (page as *const usize).read_volatile();
-            // Zero out the page
-            core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
-
-                    // Initialize refcount to 1 in fixed table
-            {
-                let mut table = PAGE_REFS_TABLE.lock();
-                // Try to find existing
-                for i in 0..table.len {
-                    if table.pas[i] == page {
-                        table.cnts[i] = 1;
-                        break;
-                    }
-                }
-                if table.len < MAX_PAGE_REFS {
-                    let idx = table.len;
-                    table.pas[idx] = page;
-                    table.cnts[idx] = 1;
-                    table.len += 1;
-                } else {
-                    // Table full — best effort: ignore tracking
-                }
-            }
-
-            Some(page)
+            return None;
         }
+        let page = NEXT_FREE_PAGE;
+        NEXT_FREE_PAGE = (page as *const usize).read_volatile();
+        core::ptr::write_bytes(page as *mut u8, 0, PAGE_SIZE);
+
+        let idx = page_index(page);
+        if idx < MAX_PAGES {
+            PAGE_REF_COUNTS.lock()[idx] = 1;
+        }
+
+        Some(page)
     }
 }
 
@@ -139,44 +123,26 @@ pub fn free_page(page: usize) {
 
 /// Increment reference count for the given physical page.
 pub fn incr_ref(page: usize) {
-    let mut table = PAGE_REFS_TABLE.lock();
-    for i in 0..table.len {
-        if table.pas[i] == page {
-            table.cnts[i] += 1;
-            return;
-        }
-    }
-    if table.len < MAX_PAGE_REFS {
-        let idx = table.len;
-        table.pas[idx] = page;
-        table.cnts[idx] = 1;
-        table.len += 1;
-    } else {
-        // Table full; ignore
+    let idx = page_index(page);
+    if idx < MAX_PAGES {
+        let mut counts = PAGE_REF_COUNTS.lock();
+        counts[idx] = counts[idx].saturating_add(1);
     }
 }
 
-/// Decrement reference count and return the new count. If page wasn't tracked, returns 0.
+/// Decrement reference count and return the new count. Returns 0 if untracked.
 pub fn decr_ref(page: usize) -> usize {
-    let mut table = PAGE_REFS_TABLE.lock();
-    for i in 0..table.len {
-        if table.pas[i] == page {
-            if table.cnts[i] > 1 {
-                table.cnts[i] -= 1;
-                return table.cnts[i];
-            } else {
-                // remove entry by swapping with last
-                if table.len > 0 {
-                    let last = table.len - 1;
-                    table.pas[i] = table.pas[last];
-                    table.cnts[i] = table.cnts[last];
-                    table.pas[last] = 0;
-                    table.cnts[last] = 0;
-                    table.len -= 1;
-                }
-                return 0;
-            }
+    let idx = page_index(page);
+    if idx < MAX_PAGES {
+        let mut counts = PAGE_REF_COUNTS.lock();
+        if counts[idx] > 1 {
+            counts[idx] -= 1;
+            counts[idx] as usize
+        } else {
+            counts[idx] = 0;
+            0
         }
+    } else {
+        0
     }
-    0
 }

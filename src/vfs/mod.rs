@@ -1,7 +1,10 @@
 pub mod memfs;
 pub mod tar;
+pub mod procfs;
+pub mod devfs;
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 use spin::Mutex;
 use crate::posix::process::Process;
 
@@ -31,7 +34,7 @@ pub struct DirEntry {
     pub vtype: VnodeType,
 }
 
-/// Abstract representation of a file or directory
+/// Abstract representation of a file or directory.
 pub trait Vnode: Send + Sync {
     fn stat(&self) -> Stat;
 
@@ -59,35 +62,54 @@ pub trait Vnode: Send + Sync {
     fn create(&self, _name: &str) -> Result<Arc<dyn Vnode>, &'static str> {
         Err("Not a directory")
     }
+
+    /// Create a subdirectory with the given name.
+    fn mkdir(&self, _name: &str) -> Result<Arc<dyn Vnode>, &'static str> {
+        Err("Not a directory")
+    }
+
+    /// Remove a child entry (file or directory) by name.
+    fn unlink(&self, _name: &str) -> Result<(), &'static str> {
+        Err("Not supported")
+    }
+
+    /// Rename a child entry within this directory.
+    fn rename(&self, _old_name: &str, _new_name: &str) -> Result<(), &'static str> {
+        Err("Not supported")
+    }
 }
 
-/// Checks if a process has the requested access to a vnode.
+/// Check whether a process has the requested access to a vnode.
 pub fn check_access(proc: &Process, node: &dyn Vnode, requested: AccessMask) -> bool {
-    if proc.euid == 0 {
-        return true; // Root bypass
+    let euid = proc.euid.load(Ordering::Relaxed);
+    if euid == 0 {
+        return true; // root bypass
     }
 
     let stat = node.stat();
-    let mut mode = stat.mode;
-
-    // Shift mode bits to align with requested (R=4, W=2, X=1)
-    let granted = if proc.euid == stat.uid {
-        (mode >> 6) & 7
-    } else if proc.egid == stat.gid {
-        (mode >> 3) & 7
+    let granted = if euid == stat.uid {
+        (stat.mode >> 6) & 7
+    } else if proc.egid.load(Ordering::Relaxed) == stat.gid {
+        (stat.mode >> 3) & 7
     } else {
-        mode & 7
+        stat.mode & 7
     };
 
     (granted & requested) == requested
 }
 
-/// The global Mount Table mapping root namespace
+/// Global mount table: one root FS plus optional prefix-mount points.
 pub struct MountTable {
-    pub root: Option<Arc<dyn Vnode>>,
+    pub root:   Option<Arc<dyn Vnode>>,
+    /// Additional mounts as (absolute_path_prefix, vnode_root).
+    /// Checked before falling through to root FS; longest prefix wins.
+    pub mounts: alloc::vec::Vec<(alloc::string::String, Arc<dyn Vnode>)>,
 }
 
-pub static MOUNT_TABLE: Mutex<MountTable> = Mutex::new(MountTable { root: None });
+pub static MOUNT_TABLE: Mutex<MountTable> = Mutex::new(MountTable {
+    root:   None,
+    mounts: alloc::vec::Vec::new(),
+});
 
 /// Returns (parent_dir_vnode, filename) for the given path.
 pub fn lookup_parent(path: &str) -> Result<(Arc<dyn Vnode>, alloc::string::String), &'static str> {
@@ -96,7 +118,8 @@ pub fn lookup_parent(path: &str) -> Result<(Arc<dyn Vnode>, alloc::string::Strin
         mt.root.as_ref().ok_or("No root filesystem mounted")?.clone()
     };
 
-    let parts: alloc::vec::Vec<&str> = path.split('/')
+    let parts: alloc::vec::Vec<&str> = path
+        .split('/')
         .filter(|c| !c.is_empty() && *c != ".")
         .collect();
 
@@ -112,22 +135,50 @@ pub fn lookup_parent(path: &str) -> Result<(Arc<dyn Vnode>, alloc::string::Strin
     Ok((current, filename))
 }
 
-/// Traverses a path from the root mount.
+/// Traverse a path, honouring mount points (longest prefix match first).
 pub fn lookup_path(path: &str) -> Result<Arc<dyn Vnode>, &'static str> {
-    let mt = MOUNT_TABLE.lock();
-    let root = mt.root.as_ref().ok_or("No root filesystem mounted")?.clone();
-    
-    if path == "/" {
-        return Ok(root);
+    // Collect mounts and root while holding the lock, then release.
+    let (root, mounts) = {
+        let mt = MOUNT_TABLE.lock();
+        let root = mt.root.as_ref().ok_or("No root filesystem mounted")?.clone();
+        let mounts = mt.mounts.clone();
+        (root, mounts)
+    };
+
+    // Check all mount prefixes; pick the longest that is a prefix of `path`.
+    let mut best_prefix_len = 0usize;
+    let mut best_vnode: Option<Arc<dyn Vnode>> = None;
+    let mut best_remainder = path;
+
+    for (prefix, vnode) in &mounts {
+        // Normalise: strip trailing slash from prefix for comparison.
+        let pfx = prefix.trim_end_matches('/');
+        if path == pfx || (path.starts_with(pfx) && path.as_bytes().get(pfx.len()) == Some(&b'/')) {
+            if pfx.len() >= best_prefix_len {
+                best_prefix_len = pfx.len();
+                let remainder = &path[pfx.len()..];
+                best_remainder = remainder;
+                best_vnode = Some(vnode.clone());
+            }
+        }
     }
-    
-    let mut current = root;
-    for component in path.split('/') {
+
+    let (mut current, start_path) = if let Some(vnode) = best_vnode {
+        (vnode, best_remainder)
+    } else {
+        (root, path)
+    };
+
+    if start_path == "/" || start_path.is_empty() {
+        return Ok(current);
+    }
+
+    for component in start_path.split('/') {
         if component.is_empty() || component == "." {
             continue;
         }
         current = current.lookup(component)?;
     }
-    
+
     Ok(current)
 }

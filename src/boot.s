@@ -32,10 +32,26 @@ _start:
     # Restore arguments for kmain
     mv a0, s0
     mv a1, s1
+    # Set tp = hartid (used by kernel to identify current HART in S-mode)
+    mv tp, s0
 
     # Call the Rust kernel entry point
     call kmain
 
 park:
-    wfi
+    # Spin until the primary HART sets SMP_GO_FLAG
+    la t0, SMP_GO_FLAG
+1:
+    lb t1, (t0)
+    beqz t1, 1b
+    # Compute stack top: SECONDARY_STACKS[hartid * 16384 .. +16384]
+    la   t0, SECONDARY_STACKS
+    li   t1, 16384
+    mul  t2, s0, t1          # hartid * 16384 bytes
+    add  t0, t0, t2          # base of this hart's stack area
+    add  sp, t0, t1          # stack top = base + 16384
+    mv   tp, s0              # tp = hartid (S-mode per-hart ID)
+    mv   a0, s0              # a0 = hartid
+    mv   a1, s1              # a1 = dtb_ptr
+    call secondary_kmain
     j park

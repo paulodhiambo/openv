@@ -51,6 +51,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "forktest"
+version = "0.1.0"
+dependencies = [
+ "libos",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

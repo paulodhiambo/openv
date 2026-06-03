@@ -3,7 +3,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use libos::{write, read, open, close, getdents, spawn, exit, sys_yield, create, set_raw, waitpid};
+use libos::{write, read, open, close, getdents, spawn, exit, sys_yield, create, set_raw, waitpid, mkdir, unlink};
 
 // ── ANSI helpers ──────────────────────────────────────────────────────────────
 const RESET:  &[u8] = b"\x1b[0m";
@@ -244,6 +244,8 @@ impl Shell {
             b"cat"                   => self.cmd_cat(&args[1..]),
             b"pwd"                   => { wrt(&self.cwd); wrt_nl(); }
             b"cd"                    => self.cmd_cd(&args[1..]),
+            b"mkdir"                 => self.cmd_mkdir(&args[1..]),
+            b"rm"                    => self.cmd_rm(&args[1..]),
             b"help" | b"?"           => self.cmd_help(),
             b"clear"                 => wrt(CLR),
             b"history" | b".history" => self.cmd_history(),
@@ -335,6 +337,26 @@ impl Shell {
         }
     }
 
+    fn cmd_mkdir(&self, args: &[Vec<u8>]) {
+        if args.is_empty() { wrt(b"mkdir: missing operand\n"); return; }
+        for arg in args {
+            let path = self.resolve(arg);
+            if mkdir(&path) != 0 {
+                wrt(b"mkdir: cannot create directory '"); wrt(&path); wrt(b"'\n");
+            }
+        }
+    }
+
+    fn cmd_rm(&self, args: &[Vec<u8>]) {
+        if args.is_empty() { wrt(b"rm: missing operand\n"); return; }
+        for arg in args {
+            let path = self.resolve(arg);
+            if unlink(&path) != 0 {
+                wrt(b"rm: cannot remove '"); wrt(&path); wrt(b"': No such file or directory\n");
+            }
+        }
+    }
+
     fn cmd_history(&self) {
         if self.history.is_empty() {
             wrt(b"(no history)\n");
@@ -361,6 +383,8 @@ impl Shell {
             ("cat <file>",    "Print file to stdout"),
             ("pwd",           "Print working directory"),
             ("cd [path]",     "Change directory (default /)"),
+            ("mkdir <dir>",   "Create directory"),
+            ("rm <file>",     "Remove file or directory"),
             ("nano <file>",   "Text editor (^O save, ^X exit)"),
             ("history",       "Show command history"),
             ("clear",         "Clear the screen"),

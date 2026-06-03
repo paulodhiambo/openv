@@ -16,9 +16,12 @@ cp user/target/riscv64gc-unknown-none-elf/debug/ls test_root/ls
 cp user/target/riscv64gc-unknown-none-elf/debug/cat test_root/cat
 cp user/target/riscv64gc-unknown-none-elf/debug/producer test_root/producer
 cp user/target/riscv64gc-unknown-none-elf/debug/consumer test_root/consumer
+cp user/target/riscv64gc-unknown-none-elf/debug/forktest test_root/forktest
+cp user/target/riscv64gc-unknown-none-elf/debug/hello test_root/hello
+cp user/target/riscv64gc-unknown-none-elf/debug/doexec test_root/doexec
 echo "Hello from initrd TAR!" > test_root/dummy.txt
 cd test_root
-tar -cf ../test_root.tar dummy.txt init sh ls cat producer consumer
+tar -cf ../test_root.tar dummy.txt init sh ls cat producer consumer forktest hello doexec
 cd ..
 
 # Run kernel

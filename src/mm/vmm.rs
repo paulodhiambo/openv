@@ -20,21 +20,16 @@ impl PageTable {
     }
 
     pub fn new_process_table() -> Result<usize, &'static str> {
-        crate::println!("new_process_table: allocating root page");
         let root_page = alloc_page().ok_or("Out of memory")?;
-        crate::println!("new_process_table: allocated root page at {:#x}", root_page);
         let root = unsafe { &mut *(root_page as *mut PageTable) };
-        
-        crate::println!("new_process_table: mapping kernel 1GB pages");
-        // Identity map kernel using 1GB mega-pages (0 to 4GB)
+
+        // Identity map kernel using 1GB mega-pages (0 to 4GB); NOT PTE_U
         for i in 0..4 {
             let pa = i * 0x40000000;
             let ppn = pa >> 12;
-            // Kernel mappings are NOT PTE_U
             root.entries[i] = (ppn << 10) | PTE_V | PTE_R | PTE_W | PTE_X;
         }
-        
-        crate::println!("new_process_table: returning");
+
         Ok(root_page)
     }
 
@@ -75,11 +70,18 @@ impl PageTable {
 pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(), &'static str> {
     use crate::mm::pmm;
 
+    // Safety: raw pointer dereferences are safe because we are given valid physical
+    // addresses of page tables that we own (or are currently in use by the parent).
     unsafe fn clone_level(parent_pa: usize, child_pa: usize, level: usize) -> Result<(), &'static str> {
-        let parent_pt = &mut *(parent_pa as *mut PageTable);
-        let child_pt = &mut *(child_pa as *mut PageTable);
+        let parent_pt = unsafe { &mut *(parent_pa as *mut PageTable) };
+        let child_pt = unsafe { &mut *(child_pa as *mut PageTable) };
 
-        for idx in 0..512 {
+        // At root level (2), skip kernel identity entries (indices 0-3).
+        // They are 1GB superpages already set up by new_process_table and
+        // should not be COW'd or refcounted.
+        let range = if level == 2 { 4..512 } else { 0..512 };
+
+        for idx in range {
             let entry = parent_pt.entries[idx];
             if entry == 0 {
                 child_pt.entries[idx] = 0;
@@ -90,7 +92,7 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
             let is_leaf = (entry & (PTE_R | PTE_X)) != 0;
             if !is_leaf {
                 // Allocate a new page for child's next level
-                let new_page = crate::mm::pmm::alloc_page().ok_or("OOM cloning page table")?;
+                let new_page = pmm::alloc_page().ok_or("OOM cloning page table")?;
                 let ppn = new_page >> 12;
                 child_pt.entries[idx] = (ppn << 10) | PTE_V;
 
@@ -98,7 +100,7 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
                 let next_child_pa = new_page;
 
                 // Recurse into next level
-                clone_level(next_parent_pa, next_child_pa, level - 1)?;
+                unsafe { clone_level(next_parent_pa, next_child_pa, level - 1)? };
             } else {
                 // Leaf mapping
                 let pa = (entry >> 10) << 12;
@@ -108,7 +110,7 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
                     // User page: make read-only in both parent and child (COW)
                     if (flags & PTE_W) != 0 {
                         // Clear write in parent
-                        let mut new_parent_entry = (pa >> 12) << 10 | (flags & !PTE_W);
+                        let new_parent_entry = (pa >> 12) << 10 | (flags & !PTE_W);
                         parent_pt.entries[idx] = new_parent_entry;
                         flags &= !PTE_W;
                     }
@@ -133,7 +135,8 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
     use riscv::register::satp;
 
     let satp_val = unsafe { satp::read().bits() } as usize;
-    let root_pa = satp_val & 0xFFFFFFFFFFF;
+    let ppn = satp_val & 0xFFFFFFFFFFF;
+    let root_pa = ppn << 12;
 
     // Walk to find the leaf PTE
     let vpn = [
@@ -151,8 +154,7 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
         }
         let is_leaf = (entry & (PTE_R | PTE_X)) != 0;
         if is_leaf {
-            // Unexpected leaf above final level
-            break;
+            return Err("huge page (1GB/2MB) not supported for COW");
         }
         pt_pa = ((entry >> 10) << 12) as usize;
     }
@@ -197,7 +199,7 @@ static mut ROOT_PAGE_TABLE: usize = 0;
 
 unsafe fn destroy_level(pt_pa: usize, level: usize) {
     // pt_pa is physical address of a page table
-    let pt = &mut *(pt_pa as *mut PageTable);
+    let pt = unsafe { &mut *(pt_pa as *mut PageTable) };
     for idx in 0..512 {
         let entry = pt.entries[idx];
         if entry == 0 { continue; }
@@ -217,7 +219,7 @@ unsafe fn destroy_level(pt_pa: usize, level: usize) {
             // pointer to next-level page table
             let next_pa = (entry >> 10) << 12;
             if level > 0 {
-                destroy_level(next_pa, level - 1);
+                unsafe { destroy_level(next_pa, level - 1) };
             }
             // free the page table page itself
             crate::mm::pmm::free_page(next_pa);
@@ -231,15 +233,15 @@ pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
     unsafe {
         // root is level 2
         let root = &mut *(root_pa as *mut PageTable);
-        // For entries that correspond to kernel identity mapping (first few), skip if they map kernel
+        // For entries that correspond to kernel identity mapping (first 4), skip
         for i in 0..512 {
             let entry = root.entries[i];
             if entry == 0 { continue; }
-            // If entry maps kernel (we detect by checking if PA < 0x100000000), skip
-            let pa = (entry >> 10) << 12;
-            if pa < 0x40000000 { // kernel region for identity mapping
+            // Indices 0-3 at root level are kernel 1GB identity mappings — never free them.
+            if i < 4 {
                 continue;
             }
+            let pa = (entry >> 10) << 12;
             let is_leaf = (entry & (PTE_R | PTE_X)) != 0;
             if is_leaf {
                 let flags = entry & 0x3FF;
@@ -259,7 +261,47 @@ pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
                 root.entries[i] = 0;
             }
         }
+        // Free the root page table page itself.
+        crate::mm::pmm::free_page(root_pa);
         Ok(())
+    }
+}
+
+/// Handle an instruction or load page fault in user space by lazily allocating a zero page.
+pub fn handle_user_page_fault(fault_va: usize) -> Result<(), &'static str> {
+    use crate::mm::pmm::PAGE_SIZE;
+    // Reject anything in the upper canonical half (kernel space in Sv39)
+    if fault_va >= 0x0000_8000_0000_0000 {
+        return Err("kernel-space fault");
+    }
+    // Reject addresses in the 0-4GB range: those are covered by the kernel
+    // identity 1GB superpages at root indices 0-3.  Attempting to map there
+    // would cause map_page to misinterpret a 1GB leaf as a page-table pointer.
+    if fault_va < 0x1_0000_0000 {
+        return Err("address in kernel identity map region");
+    }
+    let page_va = fault_va & !(PAGE_SIZE - 1);
+
+    let satp_val = unsafe { riscv::register::satp::read().bits() } as usize;
+    let ppn = satp_val & 0xFFFFFFFFFFF;
+    let root_pa = ppn << 12;
+    let pt = unsafe { &mut *(root_pa as *mut PageTable) };
+
+    let pa = crate::mm::pmm::alloc_page().ok_or("OOM in demand paging")?;
+    // Zero the new page
+    unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
+
+    match pt.map_page(page_va, pa, PTE_R | PTE_W | PTE_U) {
+        Ok(()) => {
+            unsafe { core::arch::asm!("sfence.vma") };
+            Ok(())
+        }
+        Err(_) => {
+            // Page was already mapped (e.g., a concurrent fault race) — free the new page.
+            crate::mm::pmm::free_page(pa);
+            unsafe { core::arch::asm!("sfence.vma") };
+            Ok(())
+        }
     }
 }
 

@@ -24,12 +24,13 @@ pub fn device() -> Option<&'static dyn NetDevice> {
     slot.clone()
 }
 
-/// Initialize networking: try virtio-mmio probe; fallback to loopback.
-pub fn init() {
-    if virtio_mmio::probe_and_init() {
-        crate::println!("net: virtio-mmio detected and initialized");
+/// Initialize networking via the driver framework; fall back to loopback if nothing claims a device.
+pub fn init(dtb_ptr: usize) {
+    crate::drivers::probe_all(dtb_ptr);
+    if device().is_some() {
+        crate::println!("net: device registered via driver framework");
     } else {
-        crate::println!("net: no virtio-mmio found; using loopback");
+        crate::println!("net: no device found; using loopback");
         virtio_net::LoopbackNet::init();
     }
 }

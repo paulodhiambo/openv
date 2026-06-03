@@ -1,7 +1,12 @@
 use riscv::register::{stvec, scause, sstatus, sepc, sscratch};
 use core::arch::global_asm;
+use core::sync::atomic::Ordering;
 use crate::println;
 use alloc::vec::Vec;
+
+unsafe extern "C" {
+    fn __halt_cpu() -> !;
+}
 use spin::Mutex;
 
 static LINE_DISC_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
@@ -151,13 +156,38 @@ unsafe extern "C" {
 pub fn init() {
     unsafe {
         stvec::write(trap_vector as usize, stvec::TrapMode::Direct);
+        // Enable supervisor software interrupts (for TLB shootdown).
+        // Timer interrupts are NOT enabled here — they are enabled right
+        // before the first call to schedule() to avoid firing while
+        // sscratch is still 0 (which would corrupt address zero in the
+        // trap vector's csrrw sp, sscratch, sp).
+        riscv::register::sie::set_ssoft();
     }
     println!("Trap handler initialized.");
+}
+
+/// Called by secondary HARTs from secondary_kmain — same as init() without the print.
+pub fn init_hart() {
+    unsafe {
+        stvec::write(trap_vector as usize, stvec::TrapMode::Direct);
+        riscv::register::sie::set_ssoft();
+    }
+}
+
+/// Enable timer interrupts and arm the first timer.
+/// Must be called right before the first schedule(), after sscratch has
+/// been initialised by a prior return_to_user or kernel-mode scratch page.
+pub fn enable_timer() {
+    unsafe { riscv::register::sie::set_stimer(); }
+    crate::timer::set_next_timer();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
     let cause = scause::read().cause();
+    let sepc = sepc::read();
+    let stval = riscv::register::stval::read();
+    
     
     match cause {
         scause::Trap::Exception(8) => {
@@ -172,11 +202,13 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     tf.sepc += 4;
                     crate::posix::process::RUN_QUEUE.lock().push_back(crate::posix::process::current_pid());
                     crate::posix::process::schedule();
+                    unsafe { __halt_cpu() }
                 }
                 1 => { // sys_exit
                     crate::println!("Process {} exited with code {}", crate::posix::process::current_pid(), arg0);
                     crate::posix::spawn::exit(crate::posix::process::current_pid(), arg0 as i32);
                     crate::posix::process::schedule();
+                    unsafe { __halt_cpu() }
                 }
                 2 => { // sys_write
                     // arg0 = fd, arg1 = buf ptr, arg2 = len
@@ -257,6 +289,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                         crate::posix::process::RUN_QUEUE.lock()
                                             .push_back(crate::posix::process::current_pid());
                                         crate::posix::process::schedule();
+                                        unsafe { __halt_cpu() }
                                     }
                                 } else {
 
@@ -327,6 +360,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                         tf.sepc -= 4;
                                         crate::posix::process::RUN_QUEUE.lock().push_back(crate::posix::process::current_pid());
                                         crate::posix::process::schedule();
+                                        unsafe { __halt_cpu() }
                                     }
                                 }
                                 } // end cooked-mode else
@@ -343,6 +377,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                     tf.sepc -= 4; // Rewind to ecall
                                     crate::posix::process::RUN_QUEUE.lock().push_back(crate::posix::process::current_pid());
                                     crate::posix::process::schedule();
+                                    unsafe { __halt_cpu() }
                                 }
                             }
                             crate::ipc::handle::KernelObject::File(fd_desc) => {
@@ -367,21 +402,17 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     }
                 }
                 6 => { // sys_spawn
-                    crate::println!("sys_spawn: requested path at {:#x}, len {}", arg0, arg1);
-                    // arg0 = path_ptr, arg1 = path_len
                     let path_bytes = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
                     if let Ok(path) = core::str::from_utf8(path_bytes) {
-                        crate::println!("sys_spawn: path string is '{}'", path);
-                        if let Ok(child_pid) = crate::posix::spawn::posix_spawn(path, crate::posix::process::current_pid()) {
-                            crate::println!("sys_spawn: successfully spawned pid {}", child_pid);
-                            tf.regs[10] = child_pid as usize;
-                        } else {
-                            crate::println!("sys_spawn: posix_spawn failed");
-                            tf.regs[10] = usize::MAX; // Error
+                        match crate::posix::spawn::posix_spawn(path, crate::posix::process::current_pid()) {
+                            Ok(child_pid) => tf.regs[10] = child_pid as usize,
+                            Err(e) => {
+                                crate::println!("sys_spawn: {}: {}", path, e);
+                                tf.regs[10] = usize::MAX;
+                            }
                         }
                     } else {
-                        crate::println!("sys_spawn: utf8 parse failed");
-                        tf.regs[10] = usize::MAX; // Error
+                        tf.regs[10] = usize::MAX;
                     }
                 }
                 8 => { // sys_open
@@ -544,6 +575,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                             tf.sepc -= 4; // rewind ecall
                             crate::posix::process::RUN_QUEUE.lock().push_back(crate::posix::process::current_pid());
                             crate::posix::process::schedule();
+                            unsafe { __halt_cpu() }
                         }
                     } else {
                         tf.regs[10] = usize::MAX;
@@ -660,6 +692,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                     tf.sepc -= 4;
                                     crate::posix::process::RUN_QUEUE.lock().push_back(crate::posix::process::current_pid());
                                     crate::posix::process::schedule();
+                                    unsafe { __halt_cpu() }
                                 }
                             }
                             _ => tf.regs[10] = usize::MAX,
@@ -668,20 +701,15 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 23 => { // sys_setuid
                     let proc = crate::posix::process::PROCESS_TABLE.lock().get(&crate::posix::process::current_pid()).cloned().unwrap();
-                    if proc.euid == 0 {
+                    if proc.euid.load(Ordering::Relaxed) == 0 {
                         // Root can set UID to anything
-                        unsafe {
-                            let p_ptr = alloc::sync::Arc::as_ptr(&proc) as *mut crate::posix::process::Process;
-                            (*p_ptr).uid = arg0 as u32;
-                            (*p_ptr).euid = arg0 as u32;
-                        }
+                        let val = arg0 as u32;
+                        proc.uid.store(val, Ordering::Relaxed);
+                        proc.euid.store(val, Ordering::Relaxed);
                         tf.regs[10] = 0;
-                    } else if arg0 as u32 == proc.uid {
+                    } else if arg0 as u32 == proc.uid.load(Ordering::Relaxed) {
                         // Non-root can set euid back to real uid
-                        unsafe {
-                            let p_ptr = alloc::sync::Arc::as_ptr(&proc) as *mut crate::posix::process::Process;
-                            (*p_ptr).euid = arg0 as u32;
-                        }
+                        proc.euid.store(arg0 as u32, Ordering::Relaxed);
                         tf.regs[10] = 0;
                     } else {
                         tf.regs[10] = usize::MAX - 1; // EPERM
@@ -689,18 +717,13 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 24 => { // sys_setgid
                     let proc = crate::posix::process::PROCESS_TABLE.lock().get(&crate::posix::process::current_pid()).cloned().unwrap();
-                    if proc.euid == 0 {
-                        unsafe {
-                            let p_ptr = alloc::sync::Arc::as_ptr(&proc) as *mut crate::posix::process::Process;
-                            (*p_ptr).gid = arg0 as u32;
-                            (*p_ptr).egid = arg0 as u32;
-                        }
+                    if proc.euid.load(Ordering::Relaxed) == 0 {
+                        let val = arg0 as u32;
+                        proc.gid.store(val, Ordering::Relaxed);
+                        proc.egid.store(val, Ordering::Relaxed);
                         tf.regs[10] = 0;
-                    } else if arg0 as u32 == proc.gid {
-                        unsafe {
-                            let p_ptr = alloc::sync::Arc::as_ptr(&proc) as *mut crate::posix::process::Process;
-                            (*p_ptr).egid = arg0 as u32;
-                        }
+                    } else if arg0 as u32 == proc.gid.load(Ordering::Relaxed) {
+                        proc.egid.store(arg0 as u32, Ordering::Relaxed);
                         tf.regs[10] = 0;
                     } else {
                         tf.regs[10] = usize::MAX - 1; // EPERM
@@ -737,19 +760,19 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 30 => { // sys_getuid
                     let proc = crate::posix::process::PROCESS_TABLE.lock().get(&crate::posix::process::current_pid()).cloned().unwrap();
-                    tf.regs[10] = proc.uid as usize;
+                    tf.regs[10] = proc.uid.load(Ordering::Relaxed) as usize;
                 }
                 31 => { // sys_geteuid
                     let proc = crate::posix::process::PROCESS_TABLE.lock().get(&crate::posix::process::current_pid()).cloned().unwrap();
-                    tf.regs[10] = proc.euid as usize;
+                    tf.regs[10] = proc.euid.load(Ordering::Relaxed) as usize;
                 }
                 32 => { // sys_getgid
                     let proc = crate::posix::process::PROCESS_TABLE.lock().get(&crate::posix::process::current_pid()).cloned().unwrap();
-                    tf.regs[10] = proc.gid as usize;
+                    tf.regs[10] = proc.gid.load(Ordering::Relaxed) as usize;
                 }
                 33 => { // sys_getegid
                     let proc = crate::posix::process::PROCESS_TABLE.lock().get(&crate::posix::process::current_pid()).cloned().unwrap();
-                    tf.regs[10] = proc.egid as usize;
+                    tf.regs[10] = proc.egid.load(Ordering::Relaxed) as usize;
                 }
                 34 => { // sys_authenticate
                     // arg0=user_ptr, arg1=user_len, arg2=pass_ptr, a3=pass_len
@@ -769,7 +792,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     // arg0 = uid to check (or 0 = use current process uid)
                     let uid = if arg0 == 0 {
                         let proc = crate::posix::process::PROCESS_TABLE.lock().get(&crate::posix::process::current_pid()).cloned().unwrap();
-                        proc.uid
+                        proc.uid.load(Ordering::Relaxed)
                     } else {
                         arg0 as u32
                     };
@@ -805,112 +828,221 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 52 => { // sys_waitpid(target_pid, status_ptr, options)
                     let target = arg0 as i32; // pid or -1 for any
                     let status_ptr = arg1 as *mut i32;
-
-                    // First, if the current process already has a delivered wait_result, consume it
                     let ppid = crate::posix::process::current_pid();
-                    if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&ppid) {
-                        if let Some((zpid, zstatus)) = proc.wait_result.lock().take() {
-                            // Reap the child (remove from process table and parent children list)
+
+                    // Step 1: consume a pre-delivered wait_result (lock/take/release).
+                    let delivered = {
+                        let table = crate::posix::process::PROCESS_TABLE.lock();
+                        table.get(&ppid)
+                            .and_then(|p| p.wait_result.lock().take())
+                    }; // PROCESS_TABLE lock dropped here
+
+                    if let Some((zpid, zstatus)) = delivered {
+                        // Reap the zombie.
+                        {
                             let mut table = crate::posix::process::PROCESS_TABLE.lock();
                             table.remove(&zpid);
                             if let Some(parent) = table.get(&ppid) {
                                 parent.children.lock().retain(|&p| p != zpid);
                             }
-
-                            // Write status to user pointer if provided
-                            if !status_ptr.is_null() {
-                                unsafe { *(status_ptr) = zstatus as i32; }
-                            }
-                            tf.regs[10] = zpid as usize;
-                            // proceed to return below
-                        } else {
-                            // No delivered result yet: check for existing zombies among children
-                            let mut found_zombie = None;
-                            {
-                                let table = crate::posix::process::PROCESS_TABLE.lock();
-                                if let Some(parent) = table.get(&ppid) {
-                                    let children = parent.children.lock();
-                                    for &child_pid in children.iter() {
-                                        if target == -1 || target == child_pid {
-                                            if let Some(child) = table.get(&child_pid) {
-                                                let state = child.state.lock();
-                                                if let crate::posix::process::ProcState::Zombie(status) = *state {
-                                                    found_zombie = Some((child_pid, status));
-                                                    break;
-                                                }
+                        }
+                        if !status_ptr.is_null() {
+                            unsafe { *status_ptr = zstatus; }
+                        }
+                        tf.regs[10] = zpid as usize;
+                    } else {
+                        // Step 2: scan children for an existing zombie.
+                        let found_zombie = {
+                            let table = crate::posix::process::PROCESS_TABLE.lock();
+                            let mut found = None;
+                            if let Some(parent) = table.get(&ppid) {
+                                let children: alloc::vec::Vec<_> = parent.children.lock().clone();
+                                for child_pid in children {
+                                    if target == -1 || target == child_pid {
+                                        if let Some(child) = table.get(&child_pid) {
+                                            if let crate::posix::process::ProcState::Zombie(st) = *child.state.lock() {
+                                                found = Some((child_pid, st));
+                                                break;
                                             }
                                         }
                                     }
                                 }
                             }
+                            found
+                        }; // PROCESS_TABLE lock dropped here
 
-                            if let Some((zpid, zstatus)) = found_zombie {
-                                // Reap immediately
+                        if let Some((zpid, zstatus)) = found_zombie {
+                            // Reap immediately.
+                            {
                                 let mut table = crate::posix::process::PROCESS_TABLE.lock();
                                 table.remove(&zpid);
                                 if let Some(parent) = table.get(&ppid) {
                                     parent.children.lock().retain(|&p| p != zpid);
                                 }
-                                if !status_ptr.is_null() {
-                                    unsafe { *(status_ptr) = zstatus as i32; }
-                                }
-                                tf.regs[10] = zpid as usize;
+                            }
+                            if !status_ptr.is_null() {
+                                unsafe { *status_ptr = zstatus; }
+                            }
+                            tf.regs[10] = zpid as usize;
+                        } else {
+                            // Step 3: block — acquire the process Arc, release PT lock,
+                            // then update state and yield.
+                            let proc_arc = crate::posix::process::PROCESS_TABLE.lock()
+                                .get(&ppid).cloned();
+                            if let Some(proc) = proc_arc {
+                                // PROCESS_TABLE lock is already released (cloned Arc).
+                                *proc.wait_target.lock() = Some(target);
+                                *proc.wait_status_ptr.lock() = Some(status_ptr as usize);
+                                tf.sepc -= 4; // restart waitpid when resumed
+                                *proc.state.lock() = crate::posix::process::ProcState::Stopped;
+                                crate::posix::process::RUN_QUEUE.lock().push_back(ppid);
+                                crate::posix::process::schedule();
+                                unsafe { __halt_cpu() }
                             } else {
-                                // Block: register interest and schedule away
-                                if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&ppid) {
-                                    *proc.wait_target.lock() = Some(target);
-                                    *proc.wait_status_ptr.lock() = Some(status_ptr as usize);
-                                    // Rewind ecall so syscall restarts when woken
-                                    tf.sepc -= 4;
-                                    // Mark this process as not runnable and yield
-                                    *proc.state.lock() = crate::posix::process::ProcState::Stopped;
-                                    crate::posix::process::RUN_QUEUE.lock().push_back(ppid);
-                                    crate::posix::process::schedule();
-                                } else {
-                                    tf.regs[10] = usize::MAX; // parent not found
-                                }
+                                tf.regs[10] = usize::MAX; // parent not found
                             }
                         }
+                    }
+                }
+                27 => { // sys_mkdir(path_ptr, path_len)
+                    let path_bytes = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
+                    if let Ok(path) = core::str::from_utf8(path_bytes) {
+                        match crate::vfs::lookup_parent(path) {
+                            Ok((parent, name)) => {
+                                match parent.mkdir(&name) {
+                                    Ok(_) => tf.regs[10] = 0,
+                                    Err(_) => tf.regs[10] = usize::MAX,
+                                }
+                            }
+                            Err(_) => tf.regs[10] = usize::MAX,
+                        }
                     } else {
-                        tf.regs[10] = usize::MAX; // current proc not found
+                        tf.regs[10] = usize::MAX;
+                    }
+                }
+                28 => { // sys_unlink(path_ptr, path_len)
+                    let path_bytes = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
+                    if let Ok(path) = core::str::from_utf8(path_bytes) {
+                        match crate::vfs::lookup_parent(path) {
+                            Ok((parent, name)) => {
+                                match parent.unlink(&name) {
+                                    Ok(()) => tf.regs[10] = 0,
+                                    Err(_) => tf.regs[10] = usize::MAX,
+                                }
+                            }
+                            Err(_) => tf.regs[10] = usize::MAX,
+                        }
+                    } else {
+                        tf.regs[10] = usize::MAX;
+                    }
+                }
+                29 => { // sys_rename(old_ptr, old_len, new_ptr, new_len)
+                    let new_ptr = arg2;
+                    let new_len = tf.regs[13]; // a3
+                    let old_bytes = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
+                    let new_bytes = unsafe { core::slice::from_raw_parts(new_ptr as *const u8, new_len) };
+                    if let (Ok(old_path), Ok(new_path)) = (
+                        core::str::from_utf8(old_bytes),
+                        core::str::from_utf8(new_bytes),
+                    ) {
+                        match crate::vfs::lookup_parent(old_path) {
+                            Ok((old_parent, old_name)) => {
+                                match crate::vfs::lookup_parent(new_path) {
+                                    Ok((new_parent, new_name)) => {
+                                        if alloc::sync::Arc::ptr_eq(&old_parent, &new_parent) {
+                                            match old_parent.rename(&old_name, &new_name) {
+                                                Ok(()) => tf.regs[10] = 0,
+                                                Err(_) => tf.regs[10] = usize::MAX,
+                                            }
+                                        } else {
+                                            // Cross-directory rename not yet supported
+                                            // by the Vnode trait.
+                                            tf.regs[10] = usize::MAX;
+                                        }
+                                    }
+                                    Err(_) => tf.regs[10] = usize::MAX,
+                                }
+                            }
+                            Err(_) => tf.regs[10] = usize::MAX,
+                        }
+                    } else {
+                        tf.regs[10] = usize::MAX;
                     }
                 }
                 _ => {
                     panic!("Unknown syscall {}", syscall_num);
                 }
             }
-            
+
             // Advance sepc to next instruction after ecall
             tf.sepc += 4;
             tf as *mut _
         }
-        // Handle store/AMO page fault for copy-on-write
+        // Instruction or load page fault — demand paging
+        scause::Trap::Exception(12) | scause::Trap::Exception(13) => {
+            use riscv::register::stval;
+            let fault_va = stval::read();
+            match crate::mm::vmm::handle_user_page_fault(fault_va) {
+                Ok(()) => tf as *mut _,
+                Err(e) => {
+                    let pid = crate::posix::process::current_pid();
+                    crate::println!("Segfault pid {}: {} at va={:#x}", pid, e, fault_va);
+                    crate::posix::spawn::exit(pid, -11);
+                    crate::posix::process::schedule();
+                    unsafe { __halt_cpu() }
+                }
+            }
+        }
+        // Store/AMO page fault — copy-on-write
         scause::Trap::Exception(15) => {
             use riscv::register::stval;
             let fault_va = stval::read();
-            crate::println!("Store page fault at {:#x}, attempting COW", fault_va);
             match crate::mm::vmm::handle_store_page_fault(fault_va) {
-                Ok(()) => {
-                    // Resume execution; do not advance sepc here since faulting instruction must retry
-                    tf as *mut _
-                }
+                Ok(()) => tf as *mut _,
                 Err(e) => {
                     panic!("Unhandled store page fault: {}", e);
                 }
             }
         }
-        scause::Trap::Interrupt(_) => {
-            // External interrupt: claim from PLIC and dispatch
-            let hart = riscv::register::mhartid::read();
+        // Supervisor timer interrupt — preempt current process.
+        // We ONLY re-queue the current process and return; we do NOT
+        // call schedule() here because the interrupted code may hold
+        // kernel locks (e.g. PROCESS_TABLE) that schedule() would try
+        // to acquire, causing a deadlock with spin::Mutex.
+        scause::Trap::Interrupt(5) => {
+            crate::timer::set_next_timer();
+            let pid = crate::posix::process::current_pid();
+            if pid != 0 {
+                crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+            }
+            tf as *mut _
+        }
+        // Supervisor software interrupt — TLB shootdown IPI
+        scause::Trap::Interrupt(1) => {
+            unsafe {
+                core::arch::asm!("sfence.vma");
+                core::arch::asm!("csrci sip, 2"); // clear SSIP
+            }
+            tf as *mut _
+        }
+        // External interrupts — PLIC claim/complete
+        scause::Trap::Interrupt(9) | scause::Trap::Interrupt(11) => {
+            let hart = crate::posix::process::current_hart();
             let irq = crate::plic::claim(hart as usize);
             if irq != 0 {
-                crate::net::virtio_mmio::handle_interrupt(irq);
+                crate::drivers::dispatch_interrupt(irq as usize);
                 crate::plic::complete(hart as usize, irq);
             }
             tf as *mut _
         }
+        scause::Trap::Interrupt(n) => {
+            crate::println!("Unhandled interrupt: {}", n);
+            tf as *mut _
+        }
         _ => {
-            panic!("Unhandled trap: {:?}, sepc: {:#x}", cause, tf.sepc);
+            use riscv::register::stval;
+            panic!("Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}, sstatus: {:#x}",
+                   cause, tf.sepc, stval::read(), tf.sstatus);
         }
     }
 }

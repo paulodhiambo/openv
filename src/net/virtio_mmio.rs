@@ -258,6 +258,47 @@ pub fn handle_interrupt(irq: u32) {
     }
 }
 
+impl crate::drivers::Driver for VirtioDriver {
+    fn on_interrupt(&self, irq: usize) {
+        handle_interrupt(irq as u32);
+    }
+}
+
+/// Driver framework entry-point: called by `drivers::probe_all` when a virtio,mmio node is found.
+pub fn probe_driver(base: usize, irq: usize) -> Option<alloc::boxed::Box<dyn crate::drivers::Driver>> {
+    if base == 0 {
+        return None;
+    }
+    let magic = mmio_read32(base, OFF_MAGIC);
+    if magic != VIRTIO_MAGIC {
+        return None;
+    }
+    let q_pa = crate::mm::pmm::alloc_page()?;
+    let qnum  = mmio_read32(base, OFF_QUEUE_NUM_MAX);
+    let qsize = if qnum == 0 { 256 } else { core::cmp::min(qnum, 256) };
+    let drv = VirtioDriver::new(base, q_pa, qsize as usize, irq as u32);
+    drv.reset();
+    drv.negotiate_features();
+    drv.setup_queue0();
+    let leaked: &'static VirtioDriver = alloc::boxed::Box::leak(alloc::boxed::Box::new(drv));
+    unsafe {
+        *DRIVER_GLOBAL.lock() = Some(leaked);
+        crate::net::register_device(leaked);
+    }
+    // Return a thin wrapper so ACTIVE_DRIVERS holds this driver for interrupt dispatch.
+    Some(alloc::boxed::Box::new(VirtioDriverRef(leaked)))
+}
+
+struct VirtioDriverRef(&'static VirtioDriver);
+unsafe impl Send for VirtioDriverRef {}
+unsafe impl Sync for VirtioDriverRef {}
+
+impl crate::drivers::Driver for VirtioDriverRef {
+    fn on_interrupt(&self, irq: usize) {
+        self.0.on_interrupt(irq);
+    }
+}
+
 /// API used by kernel sys_net_recv to retrieve a pending received buffer if any.
 pub fn try_dequeue_rx(buf: &mut [u8]) -> Option<usize> {
     let mut rx = RX_QUEUE.lock();

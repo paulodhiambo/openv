@@ -4,9 +4,6 @@ set -e
 # Always run from the project root regardless of where the script is invoked from
 cd "$(dirname "$0")/.."
 
-TOOLCHAIN_BIN="$HOME/.rustup/toolchains/nightly-aarch64-apple-darwin/bin"
-export PATH="$TOOLCHAIN_BIN:$PATH"
-
 # ── Userspace ─────────────────────────────────────────────────────────────────
 echo "[1/3] Building userspace..."
 (cd user && cargo build)

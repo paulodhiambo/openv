@@ -110,6 +110,21 @@ pub fn create(path: &[u8]) -> i32 {
     syscall(26, path.as_ptr() as usize, path.len(), 0) as i32
 }
 
+/// Create a directory at `path`. Returns 0 on success, -1 on error.
+pub fn mkdir(path: &[u8]) -> i32 {
+    syscall(27, path.as_ptr() as usize, path.len(), 0) as i32
+}
+
+/// Remove a file or directory at `path`. Returns 0 on success, -1 on error.
+pub fn unlink(path: &[u8]) -> i32 {
+    syscall(28, path.as_ptr() as usize, path.len(), 0) as i32
+}
+
+/// Rename `old` to `new`. Returns 0 on success, -1 on error.
+pub fn rename(old: &[u8], new: &[u8]) -> i32 {
+    syscall4(29, old.as_ptr() as usize, old.len(), new.as_ptr() as usize, new.len()) as i32
+}
+
 /// Enter (1) or leave (0) raw terminal mode (character-by-character input).
 pub fn set_raw(enabled: u32) -> i32 {
     syscall(38, enabled as usize, 0, 0) as i32

@@ -23,10 +23,12 @@ pub extern "C" fn main() -> ! {
     ok_line(b"Mounting virtual filesystem");
     ok_line(b"Starting UART console");
 
-    // Networking daemon
-    let net_pid = spawn(b"/net-smoltcp".as_ptr(), 12);
-    if net_pid > 0 { ok_line(b"Starting network daemon"); }
-    else           { fail_line(b"Starting network daemon"); }
+    // Run fork test
+    let ft_pid = spawn(b"/forktest".as_ptr(), 9);
+    if ft_pid > 0 {
+        let mut status: i32 = 0;
+        waitpid(ft_pid, &mut status as *mut i32);
+    }
 
     wrt(b"\n");
 

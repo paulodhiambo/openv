@@ -1,38 +1,22 @@
-use ::core::fmt;
-
 const UART_BASE: usize = 0x1000_0000;
 
 pub struct Uart;
 
 impl Uart {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Uart
     }
 
     pub fn init(&mut self) {
         let ptr = UART_BASE as *mut u8;
         unsafe {
-            // Disable interrupts
             ptr.add(1).write_volatile(0x00);
-            
-            // Enable DLAB (set baud rate divisor)
             ptr.add(3).write_volatile(0x80);
-            
-            // Set divisor to 3 (lo byte) 38400 baud
             ptr.add(0).write_volatile(0x03);
             ptr.add(1).write_volatile(0x00);
-            
-            // 8 bits, no parity, one stop bit
             ptr.add(3).write_volatile(0x03);
-            
-            // Enable FIFO, clear them, with 14-byte threshold
             ptr.add(2).write_volatile(0xC7);
-            
-            // Mark data terminal ready, signal request to send
-            // and enable auxilliary output 2 (used as interrupt line for CPU)
             ptr.add(4).write_volatile(0x0B);
-            
-            // Enable interrupts
             ptr.add(1).write_volatile(0x01);
         }
     }
@@ -40,7 +24,6 @@ impl Uart {
     pub fn put_char(&mut self, c: u8) {
         let ptr = UART_BASE as *mut u8;
         unsafe {
-            // Wait until the transmitter is empty
             while (ptr.add(5).read_volatile() & (1 << 5)) == 0 {}
             ptr.add(0).write_volatile(c);
         }
@@ -58,27 +41,97 @@ impl Uart {
     }
 }
 
-impl fmt::Write for Uart {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
+/// Write a single byte to the UART.
+pub fn write_char(c: u8) {
+    let mut u = Uart;
+    u.put_char(c);
+}
+
+/// Write a string slice to the UART.
+pub fn write_str(s: &str) {
+    let mut u = Uart;
+    for &b in s.as_bytes() {
+        u.put_char(b);
+    }
+}
+
+/// Write a decimal representation of `v`.
+pub fn write_dec(mut v: usize) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    write_str(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+/// Write a hexadecimal representation of `v` (lower-case, no prefix).
+pub fn write_hex(mut v: usize) {
+    let mut buf = [0u8; 16];
+    let mut i = buf.len();
+    let hex = b"0123456789abcdef";
+    loop {
+        i -= 1;
+        buf[i] = hex[v & 0xf];
+        v >>= 4;
+        if v == 0 {
+            break;
+        }
+    }
+    write_str(unsafe { core::str::from_utf8_unchecked(&buf[i..]) });
+}
+
+impl core::fmt::Write for Uart {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if b == b'\n' {
+                self.put_char(b'\r');
+            }
             self.put_char(b);
         }
         Ok(())
     }
 }
 
+/// Backing function for `print!` — avoids `use` imports inside macro bodies.
+pub fn print_impl(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    let _ = Uart::new().write_fmt(args);
+}
+
+/// Backing function for `println!`.
+pub fn println_impl(args: core::fmt::Arguments) {
+    use core::fmt::Write;
+    let mut u = Uart::new();
+    let _ = u.write_fmt(args);
+    u.put_char(b'\r');
+    u.put_char(b'\n');
+}
+
+/// Raw print a string literal (no formatting).
+#[macro_export]
+macro_rules! raw_print {
+    ($s:expr) => {
+        $crate::uart::write_str($s)
+    };
+}
+
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => ({
-        use ::core::fmt::Write;
-        let mut uart = $crate::uart::Uart::new();
-        let _ = uart.write_fmt(format_args!($($arg)*));
-    });
+    ($($arg:tt)*) => {
+        $crate::uart::print_impl(format_args!($($arg)*))
+    };
 }
 
 #[macro_export]
 macro_rules! println {
-    () => ($crate::print!("\n"));
-    ($fmt:expr) => ($crate::print!(concat!($fmt, "\n")));
-    ($fmt:expr, $($arg:tt)*) => ($crate::print!(concat!($fmt, "\n"), $($arg)*));
+    () => { $crate::uart::write_str("\r\n") };
+    ($($arg:tt)*) => {
+        $crate::uart::println_impl(format_args!($($arg)*))
+    };
 }
