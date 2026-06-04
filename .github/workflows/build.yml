@@ -114,7 +114,7 @@ jobs:
       - name: Package debug initrd
         run: |
           mkdir -p test_root/proc test_root/dev
-          for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp spin; do
+          for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server; do
             src="user/target/riscv64gc-unknown-none-elf/debug/$bin"
             if [ -f "$src" ]; then
               cp "$src" "test_root/$bin"
@@ -131,7 +131,7 @@ jobs:
       - name: Package release initrd
         run: |
           mkdir -p test_root_rel/proc test_root_rel/dev
-          for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp spin; do
+          for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server; do
             src="user/target/riscv64gc-unknown-none-elf/release/$bin"
             if [ -f "$src" ]; then
               cp "$src" "test_root_rel/$bin"

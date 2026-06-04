@@ -1,5 +1,5 @@
 use crate::ipc::handle::HandleTable;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -41,6 +41,10 @@ pub struct Process {
     pub wait_target: Mutex<Option<Pid>>,
     pub wait_status_ptr: Mutex<Option<usize>>,
     pub wait_result: Mutex<Option<(Pid, i32)>>,
+    /// Per-process IPC mailbox: (sender_pid, message_bytes).
+    pub mailbox: Mutex<VecDeque<(Pid, Vec<u8>)>>,
+    /// PID stored here (== this process's pid) when blocked in sys_ipc_recv (0 = not waiting).
+    pub mailbox_waiter: AtomicI32,
 }
 
 static NEXT_PID: AtomicI32 = AtomicI32::new(1);
@@ -219,6 +223,8 @@ impl Process {
             wait_target: Mutex::new(None),
             wait_status_ptr: Mutex::new(None),
             wait_result: Mutex::new(None),
+            mailbox: Mutex::new(VecDeque::new()),
+            mailbox_waiter: AtomicI32::new(0),
         });
 
         PROCESS_TABLE.lock().insert(pid, proc.clone());
