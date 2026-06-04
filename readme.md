@@ -4,20 +4,20 @@
 
 [![CI](https://github.com/paulodhiambo/openv/actions/workflows/build.yml/badge.svg)](https://github.com/paulodhiambo/openv/actions/workflows/build.yml)
 [![Rust nightly](https://img.shields.io/badge/rust-nightly-orange)](rust-toolchain.toml)
-[![Architecture](https://img.shields.io/badge/arch-RISC--V%2064-blue)](docs/architecture.md)
+[![Architecture](https://img.shields.io/badge/arch-RISC--V%2064-blue)](#architecture)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-openv is a **RISC-V 64-bit microkernel** written in Rust. It boots under QEMU via OpenSBI, provides an interactive multi-user Unix-like environment, and implements a comprehensive POSIX-compatible kernel from scratch:
+openv is a **RISC-V 64-bit microkernel** written in Rust. It boots under QEMU via OpenSBI, provides an interactive Unix-like environment, and implements a comprehensive POSIX-compatible kernel from scratch:
 
-- **Preemptive multitasking** — round-robin scheduler, 10 ms timer slices
-- **Virtual memory** — Sv39 paging, COW fork, demand paging
-- **VFS** — MemFS, ProcFS, DevFS, persistent block filesystem, mount points
-- **POSIX process model** — fork, exec, waitpid, pipes, signals (Ctrl-C)
+- **Preemptive multitasking** — round-robin scheduler, 10 ms SBI timer slices
+- **Virtual memory** — Sv39 paging, COW fork, demand paging (zero-fill on access)
+- **VFS** — MemFS, ProcFS, DevFS, persistent block filesystem (OFS), mount points
+- **POSIX process model** — fork, exec, waitpid, pipes, SIGINT (Ctrl-C)
 - **IPC** — capability-style handles, bidirectional channels, Unix pipes
 - **Multi-user security** — Unix DAC (rwxr-xr-x), setuid/setgid, sudo group
-- **Networking** — virtio-mmio driver + userspace smoltcp TCP/IP stack
-- **Interactive shell** — line editing, history, pipelines, redirection, nano editor
-- **SMP** — up to 4 harts, per-hart stacks, TLB shootdown IPI
+- **Networking** — virtio-mmio NIC driver + userspace smoltcp TCP/IP stack
+- **Interactive shell** — line editing, history, pipelines, I/O redirection
+- **SMP** — up to 4 harts, per-hart stacks, TLB shootdown via SBI IPI
 
 ---
 
@@ -25,15 +25,18 @@ openv is a **RISC-V 64-bit microkernel** written in Rust. It boots under QEMU vi
 
 ```console
 # Prerequisites: Rust nightly + QEMU
-rustup toolchain install nightly --component rust-src --target riscv64gc-unknown-none-elf
-brew install qemu          # macOS
-# apt install qemu-system  # Ubuntu/Debian
+rustup toolchain install nightly \
+  --component rust-src,llvm-tools-preview,rustfmt,clippy \
+  --target riscv64gc-unknown-none-elf
 
-# Build and run
+brew install qemu          # macOS
+# apt install qemu-system-riscv64  # Ubuntu/Debian
+
+# Build userspace, package initrd, build kernel, and launch
 make
 ```
 
-You'll land in an interactive shell. Try:
+You'll land in a login prompt. Default credentials: **guest / guest** or **root / root**.
 
 ```
 $ ls /
@@ -42,6 +45,7 @@ $ ls /proc
 $ ls /dev
 $ echo hello world
 $ cat /proc/1/status
+$ mkdir /tmp && ls /
 ```
 
 ---
@@ -56,19 +60,6 @@ $ cat /proc/1/status
 | `qemu-system-riscv64` | 7+ | Running the OS |
 | `riscv64-unknown-elf-gdb` | any | Optional: GDB debugging |
 
-Install everything in one shot:
-
-```console
-rustup toolchain install nightly \
-  --component rust-src,llvm-tools-preview,rustfmt,clippy \
-  --target riscv64gc-unknown-none-elf
-
-# macOS
-brew install qemu
-# Ubuntu/Debian
-sudo apt install qemu-system-riscv64
-```
-
 ---
 
 ## Build System
@@ -77,14 +68,13 @@ sudo apt install qemu-system-riscv64
 
 | Target | Description |
 |--------|-------------|
-| `make` | `build` + `run` |
+| `make` / `make all` | Build everything then run in QEMU (default) |
 | `make build` | Userspace → initrd → kernel (debug) |
 | `make build-release` | Full release build |
 | `make build-kernel` | Kernel only |
 | `make build-user` | Userspace binaries only |
 | `make initrd` | Package initrd from existing bins |
-| `make run` | Boot in QEMU |
-| `make run-release` | Boot release kernel in QEMU |
+| `make run` | Boot in QEMU (assumes already built) |
 | `make debug` | Boot with GDB server on `:1234` |
 | `make image` | Build `openv.img` disk image |
 | `make fmt` | Format all Rust source |
@@ -100,7 +90,7 @@ make BINS="init sh" QEMU_MEM=512M QEMU_CPUS=2 run
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BINS` | `init sh ls cat hello producer consumer doexec forktest net-smoltcp` | Userspace binaries copied into the initrd |
+| `BINS` | `init sh ls cat hello producer consumer doexec forktest net-smoltcp spin` | Userspace binaries copied into the initrd |
 | `QEMU_MEM` | `128M` | QEMU guest memory |
 | `QEMU_CPUS` | `1` | Number of RISC-V harts |
 
@@ -130,6 +120,8 @@ openv/
 │   ├── timer.rs               # SBI timer, 10 ms tick
 │   ├── plic.rs                # PLIC claim/complete
 │   ├── smp.rs                 # SMP startup, per-hart stacks, IPI
+│   ├── sync.rs                # Deadlock-detecting Mutex wrapper
+│   ├── errno.rs               # POSIX errno constants
 │   │
 │   ├── mm/                    ── Memory Management ────────────────────
 │   │   ├── pmm.rs             # Physical allocator: DTB detection, free-list, refcounts
@@ -158,17 +150,26 @@ openv/
 │   │
 │   ├── net/                   ── Networking ───────────────────────────
 │   │   ├── mod.rs             # NetDevice trait, probe/init
-│   │   ├── virtio_mmio.rs     # Virtio-mmio NIC driver
+│   │   ├── virtio_mmio.rs     # Virtio-mmio NIC driver (legacy, device-id=1)
+│   │   ├── virtio_net.rs      # Loopback fallback device
 │   │   ├── socket.rs          # Socket registry, pending accepts
-│   │   └── ...                # smoltcp integration, packet buffers
+│   │   ├── virtqueue.rs       # Virtio split virtqueue implementation
+│   │   └── pktbuf.rs          # Packet buffer pool
 │   │
-│   └── drivers/               # FDT probe, interrupt dispatch
+│   ├── block/                 ── Block Devices ────────────────────────
+│   │   ├── mod.rs             # Block device registry
+│   │   └── virtio_blk.rs      # Virtio-blk driver (device-id=2)
+│   │
+│   └── drivers/               # FDT probe, interrupt dispatch table
 │
 └── user/                      ── Userspace ────────────────────────────
     ├── libos/                 # POSIX syscall shim + 2 MB heap + _start
     ├── init/                  # PID 1: login prompt, shell respawn
     ├── sh/                    # Shell: editing, history, pipes, redirection
-    ├── ls/ cat/ hello/        # Coreutils
+    ├── ls/                    # Directory listing
+    ├── cat/                   # File / stdin concatenation
+    ├── hello/                 # Smoke-test binary
+    ├── spin/                  # CPU spin test (preemption verification)
     ├── producer/ consumer/    # IPC pipe test programs
     ├── doexec/ forktest/      # exec/fork test programs
     └── net-smoltcp/           # Userspace TCP/IP daemon (smoltcp)
@@ -180,44 +181,47 @@ openv/
 
 ```
 ╔══════════════════════════════════════════════════════════════════╗
-║  User processes (ring 3)                                         ║
-║   init │ sh │ ls │ cat │ net-smoltcp │ ...                       ║
-║   └── libos (ecall wrappers, 2 MB heap, _start)                  ║
+║  User processes (S-mode, U-bit PTEs)                             ║
+║   init │ sh │ ls │ cat │ net-smoltcp │ spin │ ...                ║
+║   └── libos (ecall wrappers, 2 MB bump heap, _start)             ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Kernel trap handler  src/trap.rs                                ║
 ║   ├─ Syscall dispatch (~60 syscalls, a7 = number)                ║
 ║   ├─ Demand paging  (Exception 12/13 → alloc zero page)         ║
 ║   ├─ COW fault      (Exception 15   → copy physical page)       ║
-║   ├─ Timer IRQ      (Interrupt 5    → re-queue, rearm)          ║
+║   ├─ Timer IRQ      (Interrupt 5    → re-queue, rearm SBI)      ║
 ║   ├─ TLB shootdown  (Interrupt 1    → sfence.vma)               ║
-║   └─ External IRQ   (Interrupt 9/11 → PLIC → drivers)           ║
+║   └─ External IRQ   (Interrupt 9/11 → PLIC → driver dispatch)   ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  Kernel subsystems                                               ║
-║   PMM  ── physical pages, refcounts (free-list + [u16;262144])   ║
+║   PMM  ── physical pages, refcounts (free-list + u16 array)      ║
 ║   VMM  ── Sv39 page tables, clone_user_space, destroy_user_space ║
 ║   VFS  ── Vnode trait, MemFS/ProcFS/DevFS/OFS, mount table      ║
 ║   POSIX── Process table, FIFO scheduler, ELF loader, waitpid    ║
 ║   IPC  ── Channels, HandleTable, pipes, FileDescriptions        ║
-║   NET  ── Virtio-mmio driver, socket registry                    ║
+║   NET  ── Virtio-mmio NIC driver, socket registry               ║
+║   BLK  ── Virtio-blk driver, OFS persistent filesystem          ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  RISC-V hardware (QEMU virt)                                     ║
-║   NS16550 UART │ SBI timer │ PLIC │ Virtio-MMIO NIC              ║
+║  RISC-V hardware (QEMU virt machine)                             ║
+║   NS16550 UART │ SBI timer │ PLIC │ Virtio-MMIO NIC/Blk          ║
 ╚══════════════════════════════════════════════════════════════════╝
 ```
 
 ### Key Design Decisions
 
-**Pragmatic microkernel.** The kernel provides memory management, IPC, and trap dispatch. POSIX semantics (process lifecycle, VFS, scheduling) live in the kernel for v1 pragmatism. A strict Fuchsia-style split — with VFS and process servers in userspace — is feasible and intended for v2.
+**Pragmatic microkernel.** The kernel provides memory management, IPC, and trap dispatch. POSIX semantics (process lifecycle, VFS, scheduling) live in the kernel for v1 pragmatism. A strict Fuchsia-style split — with VFS and process servers in userspace — is the intended v2 direction.
 
-**Non-reentrant spinlocks.** Kernel locks use `spin::Mutex`. Timer interrupts therefore only *re-queue* the current process — they never call `schedule()` from interrupt context to avoid deadlocks on process table locks. Preemption happens at the next syscall boundary.
+**Non-reentrant spinlocks.** `crate::sync::Mutex` is a deadlock-detecting wrapper around `spin::Mutex` that tracks the owning hart and panics on recursive acquisition. Timer IRQs therefore only *re-queue* the current process — they never call `schedule()` from interrupt context.
 
-**Capability-style handles.** File descriptors are `HandleTable` entries storing `KernelObject` variants (`Console`, `Channel`, `File`, `PipeRead`, `PipeWrite`, `Vmo`). `dup`/`dup2` clone the handle. Drop closes and frees the resource. Pipes detect EOF via a `Weak` reference on the write-end sentinel `Arc<()>`.
+**Capability-style handles.** File descriptors are `HandleTable` entries storing `KernelObject` variants (`Console`, `Channel`, `File`, `PipeRead`, `PipeWrite`, `Vmo`). `dup`/`dup2` clone the handle slot. Drop closes and frees the resource. Pipe EOF is detected via a `Weak` reference on the write-end sentinel `Arc<()>`.
 
 **COW fork + demand paging.** `sys_fork` marks all writable user pages in both parent and child as read-only and increments their refcounts. The first write to a shared page traps to `handle_store_page_fault`, which allocates a private copy, copies content, installs a writable PTE, and decrements the old refcount. Unmapped pages are zero-filled on first access.
 
-**Initrd-based root filesystem.** A UStar tar archive (`test_root.tar`) is passed to the kernel via the DTB `chosen` node. The kernel parses it into a MemFS tree at boot. `/proc` (ProcFS) and `/dev` (DevFS) are mounted on top. An optional persistent OFS filesystem is mounted at `/mnt` if a virtio-blk device is detected.
+**UART line discipline.** The kernel drains the full UART FIFO on every timer tick (`poll_uart_into_linedisc`). Reads from the console syscall pull exclusively from `LINE_DISC_BUFFER`, eliminating any race between the timer ISR and `sys_read`. Raw mode (used by the shell for arrow-key history) delivers bytes immediately; cooked mode buffers until `\n`.
 
-**Userspace TCP/IP.** The kernel provides only raw Ethernet send/receive via two syscalls and a socket registry. The full TCP/IP stack (smoltcp) runs in the `net-smoltcp` userspace daemon, with connections proxied to user processes via kernel IPC channels. This keeps the kernel thin and the network stack easily replaceable.
+**Initrd-based root filesystem.** A UStar tar archive (`test_root.tar`) is passed via the DTB `chosen` node. The kernel parses it into a MemFS tree at boot. `/proc` (ProcFS) and `/dev` (DevFS) are layered on top via the mount table. An optional OFS filesystem mounts at `/mnt` if a virtio-blk device is detected.
+
+**Userspace TCP/IP.** The kernel provides only raw Ethernet send/receive via two syscalls. The full TCP/IP stack (smoltcp) runs in the `net-smoltcp` userspace daemon, with connections proxied to user processes via kernel IPC channels.
 
 ---
 
@@ -241,7 +245,7 @@ openv/
 | 26 | `create` | `(path, len) → i32` | Create/truncate file, return writable fd |
 | 27 | `mkdir` | `(path, len) → i32` | Create directory |
 | 28 | `unlink` | `(path, len) → i32` | Remove file |
-| 29 | `rename` | `(old, olen, new, nlen) → i32` | Rename file (same directory) |
+| 29 | `rename` | `(old, olen, new, nlen) → i32` | Rename file |
 | 30 | `getuid` | `() → u32` | Real UID |
 | 31 | `geteuid` | `() → u32` | Effective UID |
 | 32 | `getgid` | `() → u32` | Real GID |
@@ -250,23 +254,24 @@ openv/
 | 35 | `can_sudo` | `(uid) → i32` | 1 if uid can sudo |
 | 37 | `set_echo` | `(enabled) → i32` | Toggle terminal echo |
 | 38 | `set_raw` | `(enabled) → i32` | Toggle raw mode (char-by-char) |
+| 39 | `set_fg_pid` | `(pid) → i32` | Set foreground process for SIGINT delivery |
 | 40 | `socket` | `() → i32` | Create proxied socket fd |
 | 41 | `daemon_next_socket` | `() → usize` | Net daemon: pop next socket |
-| 42 | `daemon_create_conn` | `(listen_sid) → i32` | Net daemon: create accepted conn |
+| 42 | `daemon_create_conn` | `(listen_sid) → i32` | Net daemon: create accepted connection |
 | 43 | `accept` | `(listen_fd) → i32` | Accept incoming connection (blocks) |
 | 44 | `bind` | `(fd, addr, alen) → i32` | Bind socket to address |
 | 45 | `listen` | `(fd, backlog) → i32` | Mark socket as listening |
 | 46 | `connect` | `(fd, addr, alen) → i32` | Connect to remote address |
 | 47 | `sock_send` | `(fd, buf, len) → isize` | Send data on socket |
 | 48 | `sock_recv` | `(fd, buf, max) → isize` | Receive data on socket (blocks) |
-| 50 | `fork` | `() → i32` | COW fork, 0 in child / child PID in parent |
+| 50 | `fork` | `() → i32` | COW fork; 0 in child, child PID in parent |
 | 51 | `exec` | `(path, len) → i32` | Replace process image with ELF |
 | 52 | `waitpid` | `(pid, status_ptr, opts) → i32` | Wait for child exit, reap zombie |
 | 53 | `getpid` | `() → i32` | Current process PID |
 | 54 | `getppid` | `() → i32` | Parent process PID |
 | 55 | `chdir` | `(path, len) → i32` | Change working directory |
 | 56 | `getcwd` | `(buf, max) → isize` | Copy cwd to user buffer |
-| 57 | `dup` | `(oldfd) → i32` | Duplicate fd to lowest free |
+| 57 | `dup` | `(oldfd) → i32` | Duplicate fd to lowest free slot |
 | 58 | `dup2` | `(oldfd, newfd) → i32` | Duplicate fd to specific slot |
 
 ---
@@ -296,8 +301,8 @@ pub trait Vnode: Send + Sync {
 |---------|-------------|-------------|
 | **MemFS** | `/` | Root filesystem from initrd TAR. `RoFile` = zero-copy slice into initrd; `MemFile` = writable `Vec<u8>`; `MemDir` = `BTreeMap<String, Arc<dyn Vnode>>` |
 | **ProcFS** | `/proc` | Enumerates running PIDs; each exposes `/proc/<pid>/status` |
-| **DevFS** | `/dev` | `/dev/null` (discards), `/dev/zero` (zero bytes), `/dev/tty` (UART alias) |
-| **OFS** | `/mnt` | Optional persistent on-disk filesystem on virtio-blk |
+| **DevFS** | `/dev` | `/dev/null` (discards reads/writes), `/dev/zero` (zero-filled reads), `/dev/tty` (UART alias) |
+| **OFS** | `/mnt` | Optional persistent on-disk filesystem on virtio-blk. Formatted automatically if the disk is blank. |
 
 ---
 
@@ -314,9 +319,9 @@ pub trait Vnode: Send + Sync {
 
 **Lifecycle states:** `Running → Stopped (waitpid block) → Zombie(status) → reaped`
 
-**Scheduler:** simple FIFO `VecDeque<Pid>`. `schedule()` pops the front, checks state is `Running`, switches SATP, calls `return_to_user`. Idles with `wfi` when empty.
+**Scheduler:** simple FIFO `VecDeque<Pid>`. `schedule()` pops the front, checks state is `Running`, switches SATP, calls `return_to_user`. Idles with `wfi` (interrupts enabled so the timer fires during idle).
 
-**Preemption:** The SBI timer fires every 10 ms. The handler re-queues the current PID into `RUN_QUEUE` and returns immediately (no `schedule()` call). The process is preempted at its next syscall or voluntarily via `sys_yield`.
+**Preemption:** The SBI timer fires every 10 ms. The ISR drains the UART FIFO (so characters are never dropped regardless of what the current process is doing), then re-queues the current PID into `RUN_QUEUE`. The next call to `schedule()` (on the next syscall or the next timer tick if the CPU is in the scheduler) switches to the next runnable process.
 
 **COW Fork:**
 
@@ -356,10 +361,10 @@ The UART terminal supports two modes controlled by `sys_set_raw`:
 **Cooked mode (default)** — Characters are buffered in `LINE_DISC_BUFFER` until Enter:
 - Regular characters → echo + append to buffer
 - `BS` / `DEL` → visual erase + pop from buffer
-- `Ctrl-C` (`0x03`) → print `^C`, kill current process with exit code 130
+- `Ctrl-C` (`0x03`) → kill foreground process (or deliver EOF to blocked read if no fg process)
 - `Enter` (`\r`/`\n`) → echo `\n`, deliver full line to `read()` caller
 
-**Raw mode** — Every character returned immediately without buffering or echo. Used by the shell for arrow-key history navigation.
+**Raw mode** — Every character returned immediately without buffering or echo. Used by the shell for arrow-key history navigation. Characters are accumulated in `LINE_DISC_BUFFER` and consumed one-at-a-time by `sys_read`.
 
 ---
 
@@ -406,19 +411,18 @@ riscv64-unknown-elf-gdb target/riscv64gc-unknown-none-elf/debug/openv
 **Raw UART prints** (work before heap/VMM init):
 
 ```rust
-// In kernel code — bypasses format_args!, always safe
 use crate::uart::Uart;
 let mut u = Uart::new();
 u.put_char(b'!');
 ```
 
-**Panic handler** prints file + line via UART and halts.
+**Panic handler** prints file + line via UART and halts all harts.
 
 ---
 
 ## CI / CD
 
-GitHub Actions runs on every push and pull request:
+GitHub Actions runs on every push and pull request to `main`/`master`:
 
 ```
 lint (kernel) ──┐
@@ -426,78 +430,59 @@ lint (kernel) ──┐
 lint (user)  ──┘
 ```
 
-**`lint` job** (parallel, matrix — kernel + userspace):
-- `cargo check` — catches type errors and UB patterns
-- `cargo clippy -D warnings` — all warnings are errors
+**`lint` job** (parallel matrix — kernel + userspace):
+- `cargo check` — type errors, missing modules
+- `cargo clippy -D warnings` — all warnings are errors (style lints selectively suppressed via `-A`)
 
 **`build` job** (depends on lint):
-- Builds debug + release kernel
-- Builds all userspace binaries
+- Builds debug + release kernel and all userspace binaries
 - Packages `test_root.tar` initrd
-- Verifies ELF with `file` + `size`
-- Reports binary sizes in the GitHub Step Summary
+- Reports binary sizes in the GitHub Step Summary via `llvm-size`
 - Uploads artifacts: `openv-kernel-debug`, `openv-kernel-release`, `initrd`
 
 **Release bundle** (push to `main`/`master` only):
-- `openv-<branch>-<sha>/` — kernel + initrd + `BUILD_INFO.txt`
-- Retained for 90 days
-
----
-
-## Documentation
-
-| Document | Description |
-|----------|-------------|
-| [`readme.md`](readme.md) | This file — quickstart and overview |
-| [`docs/architecture.md`](docs/architecture.md) | Deep-dive: boot, MM, traps, syscalls, VFS, IPC, net, SMP |
+- `openv-<branch>-<sha>/` — kernel + initrd + `BUILD_INFO.txt`, retained 90 days
 
 ---
 
 ## Current Status
 
-### ✅ Working
-- Boot on QEMU `virt` (single-hart and multi-hart)
-- UART output, `println!`/`print!` macros, raw pre-heap prints
+### Working
+- Boot on QEMU `virt` (single-hart and multi-hart `-smp N`)
+- UART output, `println!`/`print!` macros
 - Physical memory management (free-list + per-page u16 refcounts)
-- Sv39 page tables, kernel identity map (1 GB superpages)
+- Sv39 page tables, kernel identity map
 - Demand paging (zero-fill on first access)
-- COW fork + `handle_store_page_fault`
-- Timer interrupts (10 ms), preemptive re-queuing
-- Process creation, ELF loading, spawning
-- Round-robin scheduler with idle WFI
-- Initrd (tar) → MemFS; ProcFS; DevFS
-- VFS: create, mkdir, unlink, rename, readdir
-- Optional persistent OFS filesystem on virtio-blk
-- File descriptors, dup/dup2
-- IPC channels, bidirectional messaging
-- Byte-stream pipes with EOF detection
-- UART line discipline (canonical + raw, echo, Ctrl-C)
-- Interactive shell: line editing, history, pipelines, redirection
-- User/group database, authentication, sudo
-- Virtio-net driver + userspace smoltcp TCP/IP
-- SMP startup (secondary harts park → wake → run)
-- fork, exec, waitpid with zombie reaping
-- setuid/setgid bits, Unix DAC permissions
+- COW fork + store-fault page copy
+- Timer interrupts (10 ms), preemptive re-queuing, idle WFI
+- Process creation, ELF loading, exec, fork, waitpid, zombie reaping
+- Round-robin scheduler
+- Initrd (UStar tar) → MemFS; ProcFS at `/proc`; DevFS at `/dev`
+- VFS: create, mkdir, unlink, rename, readdir, mount table
+- Optional persistent OFS filesystem on virtio-blk (auto-format on blank disk)
+- File descriptors, dup/dup2, pipes with EOF detection
+- IPC channels and bidirectional messaging
+- UART line discipline: cooked + raw mode, echo, Ctrl-C SIGINT
+- Interactive shell: line editing, arrow-key history, pipelines, I/O redirection
+- User/group database, password authentication, sudo
+- Virtio-net driver + userspace smoltcp TCP/IP (net-smoltcp daemon)
+- SMP startup (secondary harts park on `SMP_GO` flag → wake → scheduler)
+- setuid/setgid bits, Unix DAC permission checks
+- `set_fg_pid` syscall for correct Ctrl-C delivery to foreground child processes
 
-### 🚧 In Progress
-- True preemptive context switching (currently re-queues at timer; switch at next syscall)
-- Signals (SIGINT via Ctrl-C is ad-hoc; no general delivery)
-
-### 📋 Planned
+### Planned
 - Full signal subsystem (sigaction, sigprocmask, sigreturn trampoline)
 - Job control (process groups, foreground/background, tcsetpgrp)
 - `mmap` / `munmap`
-- Persistent userspace (write-through to OFS across reboot)
+- Hard preemption (context switch inside the timer ISR, not at next syscall)
 - Porting a real C toolchain (musl libc)
 
 ---
 
-## Known Issues (from Code Review)
+## Known Limitations
 
-See [`code_review.md`](.gemini/antigravity/brain/396251fc-a285-4625-bdcb-881a844ac700/code_review.md) for the full review. Top items:
-
-1. `ppid` and `satp_val` in `Process` are mutated via raw pointers — data race on SMP. Fix: make them `AtomicI32`/`AtomicUsize`.
-2. PMM free-list in unlocked `static mut` — SMP-unsafe. Fix: wrap in a `Mutex`.
-3. `trap.rs` is 1,464 lines — split into `syscall/fs.rs`, `syscall/proc.rs`, etc.
-4. `LINE_DISC_BUFFER` is global, not per-TTY-session.
-5. Error returns use `usize::MAX` — works (becomes `-1` as `i32`) but should use named constants.
+1. **Preemption is soft** — the timer ISR re-queues the current process and sets a flag; the actual context switch happens at the next syscall boundary. A tight `loop {}` (no syscalls) will not be preempted mid-instruction; use `sys_yield` or the `spin` binary to test.
+2. **Single TTY** — `LINE_DISC_BUFFER` is global, not per-session. Multiple concurrent login sessions on separate virtual TTYs are not supported.
+3. **No signal delivery** — Ctrl-C delivers either EOF to a blocked `read` or kills the foreground PID directly. There is no `sigaction`/`kill`/`sigprocmask` ABI.
+4. **Password hashing** — FNV-1a 64-bit is used for demo purposes. Do not expose the network interface without replacing it with Argon2 or bcrypt.
+5. **OFS has no fsync** — writes to the virtio-blk OFS filesystem are immediately issued but there is no explicit flush/sync syscall.
