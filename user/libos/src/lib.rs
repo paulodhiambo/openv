@@ -166,7 +166,7 @@ pub extern "C" fn write(fd: usize, buf: *const u8, len: usize) -> isize {
             let chunk = data.len().min(vfs_proto::MAX_MSG - HDR);
             let mut req = [0u8; vfs_proto::MAX_MSG];
             let n = vfs_proto::build_write(&mut req, vfs_fd, offset, &data[..chunk]);
-            ipc_send(server, &req[..n]);
+            if ipc_send(server, &req[..n]) != 0 { return -1; }
             let mut reply = [0u8; 8];
             let mut from = 0i32;
             let rlen = ipc_recv(&mut reply, &mut from);
@@ -195,7 +195,7 @@ pub extern "C" fn read(fd: usize, buf: *mut u8, len: usize) -> isize {
             let want = (len as u32).min((vfs_proto::MAX_MSG - 1) as u32);
             let mut req = [0u8; 17]; // 1+4+8+4
             let n = vfs_proto::build_read(&mut req, vfs_fd, offset, want);
-            ipc_send(server, &req[..n]);
+            if ipc_send(server, &req[..n]) != 0 { return 0; }
             let mut reply = [0u8; vfs_proto::MAX_MSG];
             let mut from = 0i32;
             let rlen = ipc_recv(&mut reply, &mut from);
@@ -221,7 +221,7 @@ pub extern "C" fn open(path_ptr: *const u8, path_len: usize, flags: u32) -> i32 
         let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
         let mut req = [0u8; vfs_proto::MAX_MSG];
         let n = vfs_proto::build_open(&mut req, flags, path);
-        ipc_send(server, &req[..n]);
+        if ipc_send(server, &req[..n]) != 0 { return syscall(8, path_ptr as usize, path_len, flags as usize) as i32; }
         let mut reply = [0u8; vfs_proto::MAX_MSG];
         let mut from = 0i32;
         let rlen = ipc_recv(&mut reply, &mut from);
@@ -245,7 +245,7 @@ pub extern "C" fn getdents(
         let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
         let mut req = [0u8; vfs_proto::MAX_MSG];
         let n = vfs_proto::build_getdents(&mut req, path);
-        ipc_send(server, &req[..n]);
+        if ipc_send(server, &req[..n]) != 0 { return syscall4(12, path_ptr as usize, path_len, buf as usize, len) as isize; }
         let mut reply = [0u8; vfs_proto::MAX_MSG];
         let mut from = 0i32;
         let rlen = ipc_recv(&mut reply, &mut from);
@@ -264,7 +264,7 @@ pub fn create(path: &[u8]) -> i32 {
     if let Some(server) = vfs_pid() {
         let mut req = [0u8; vfs_proto::MAX_MSG];
         let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_CREATE, path);
-        ipc_send(server, &req[..n]);
+        if ipc_send(server, &req[..n]) != 0 { return syscall(26, path.as_ptr() as usize, path.len(), 0) as i32; }
         let mut reply = [0u8; vfs_proto::MAX_MSG];
         let mut from = 0i32;
         let rlen = ipc_recv(&mut reply, &mut from);
@@ -281,7 +281,7 @@ pub fn mkdir(path: &[u8]) -> i32 {
     if let Some(server) = vfs_pid() {
         let mut req = [0u8; vfs_proto::MAX_MSG];
         let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_MKDIR, path);
-        ipc_send(server, &req[..n]);
+        if ipc_send(server, &req[..n]) != 0 { return syscall(27, path.as_ptr() as usize, path.len(), 0) as i32; }
         let mut reply = [0u8; 4];
         let mut from = 0i32;
         let rlen = ipc_recv(&mut reply, &mut from);
@@ -296,7 +296,7 @@ pub fn unlink(path: &[u8]) -> i32 {
     if let Some(server) = vfs_pid() {
         let mut req = [0u8; vfs_proto::MAX_MSG];
         let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_UNLINK, path);
-        ipc_send(server, &req[..n]);
+        if ipc_send(server, &req[..n]) != 0 { return syscall(28, path.as_ptr() as usize, path.len(), 0) as i32; }
         let mut reply = [0u8; 4];
         let mut from = 0i32;
         let rlen = ipc_recv(&mut reply, &mut from);
@@ -311,7 +311,7 @@ pub fn rename(old: &[u8], new: &[u8]) -> i32 {
     if let Some(server) = vfs_pid() {
         let mut req = [0u8; vfs_proto::MAX_MSG];
         let n = vfs_proto::build_rename(&mut req, old, new);
-        ipc_send(server, &req[..n]);
+        if ipc_send(server, &req[..n]) != 0 { return -1; }
         let mut reply = [0u8; 4];
         let mut from = 0i32;
         let rlen = ipc_recv(&mut reply, &mut from);
@@ -338,10 +338,11 @@ pub extern "C" fn close(fd: i32) -> i32 {
         if let Some(server) = vfs_pid() {
             let mut req = [0u8; 5];
             let n = vfs_proto::build_close(&mut req, vfs_fd);
-            ipc_send(server, &req[..n]);
-            let mut reply = [0u8; 4];
-            let mut from = 0i32;
-            ipc_recv(&mut reply, &mut from);
+            if ipc_send(server, &req[..n]) == 0 {
+                let mut reply = [0u8; 4];
+                let mut from = 0i32;
+                ipc_recv(&mut reply, &mut from);
+            }
         }
         vfs_fd_free(fd);
         return 0;
@@ -541,7 +542,7 @@ fn vfs_pid() -> Option<i32> {
 
 fn vfs_call(req: &[u8], reply: &mut [u8]) -> usize {
     let server = match vfs_pid() { Some(p) => p, None => return 0 };
-    ipc_send(server, req);
+    if ipc_send(server, req) != 0 { return 0; }
     let mut from = 0i32;
     ipc_recv(reply, &mut from)
 }

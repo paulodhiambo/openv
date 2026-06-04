@@ -12,8 +12,13 @@ use vfs_proto::*;
 // ── In-memory filesystem ──────────────────────────────────────────────────────
 
 enum FsNode {
-    File(Vec<u8>),
-    Dir(Vec<String>), // child names
+    /// Read-only file backed by the initrd TAR; data is never copied into memory.
+    /// `tar_offset` = byte offset of the first data byte inside the TAR image.
+    TarFile { tar_offset: usize, size: usize },
+    /// Writable in-memory file (user-created or written-to files).
+    MemFile(Vec<u8>),
+    /// Directory: ordered list of child names (no leading slash).
+    Dir(Vec<String>),
 }
 
 struct Vfs {
@@ -27,9 +32,7 @@ impl Vfs {
         Self { nodes }
     }
 
-    fn exists(&self, path: &str) -> bool {
-        self.nodes.contains_key(path)
-    }
+    fn exists(&self, path: &str) -> bool { self.nodes.contains_key(path) }
 
     fn parent_and_name(path: &str) -> Option<(String, String)> {
         let path = path.trim_end_matches('/');
@@ -40,7 +43,6 @@ impl Vfs {
         Some((String::from(parent), String::from(name)))
     }
 
-    /// Create directory and all ancestors silently.
     fn mkdir_all(&mut self, path: &str) {
         if path == "/" || self.exists(path) { return; }
         if let Some(slash) = path.rfind('/') && slash > 0 {
@@ -61,24 +63,22 @@ impl Vfs {
         false
     }
 
+    fn insert_tar_file(&mut self, path: &str, tar_offset: usize, size: usize) {
+        if let Some((parent, name)) = Self::parent_and_name(path) {
+            let already_exists = self.nodes.contains_key(path);
+            if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
+                if !already_exists { children.push(name); }
+                self.nodes.insert(String::from(path), FsNode::TarFile { tar_offset, size });
+            }
+        }
+    }
+
     fn create(&mut self, path: &str) -> bool {
         if let Some((parent, name)) = Self::parent_and_name(path) {
             let already_exists = self.nodes.contains_key(path);
             if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
                 if !already_exists { children.push(name); }
-                self.nodes.insert(String::from(path), FsNode::File(Vec::new()));
-                return true;
-            }
-        }
-        false
-    }
-
-    fn create_with_data(&mut self, path: &str, data: Vec<u8>) -> bool {
-        if let Some((parent, name)) = Self::parent_and_name(path) {
-            let already_exists = self.nodes.contains_key(path);
-            if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
-                if !already_exists { children.push(name); }
-                self.nodes.insert(String::from(path), FsNode::File(data));
+                self.nodes.insert(String::from(path), FsNode::MemFile(Vec::new()));
                 return true;
             }
         }
@@ -98,11 +98,19 @@ impl Vfs {
 
     fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Option<usize> {
         match self.nodes.get(path)? {
-            FsNode::File(data) => {
+            FsNode::TarFile { tar_offset, size } => {
+                let file_off = offset as usize;
+                if file_off >= *size { return Some(0); }
+                let avail = size - file_off;
+                let take = buf.len().min(avail);
+                // Fetch data on-demand from the initrd TAR (no copy kept in VFS).
+                let n = initrd_read(&mut buf[..take], tar_offset + file_off);
+                Some(n)
+            }
+            FsNode::MemFile(data) => {
                 let start = (offset as usize).min(data.len());
-                let end = (start + buf.len()).min(data.len());
-                let n = end - start;
-                buf[..n].copy_from_slice(&data[start..end]);
+                let n = (data.len() - start).min(buf.len());
+                buf[..n].copy_from_slice(&data[start..start + n]);
                 Some(n)
             }
             FsNode::Dir(_) => None,
@@ -111,12 +119,29 @@ impl Vfs {
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Option<usize> {
         match self.nodes.get_mut(path)? {
-            FsNode::File(buf) => {
+            FsNode::MemFile(buf) => {
                 let start = offset as usize;
                 let end = start + data.len();
                 if buf.len() < end { buf.resize(end, 0); }
                 buf[start..end].copy_from_slice(data);
                 Some(data.len())
+            }
+            // TAR-backed files are read-only; promote to MemFile on first write.
+            FsNode::TarFile { tar_offset, size } => {
+                let (tar_offset, size) = (*tar_offset, *size);
+                let mut mem: Vec<u8> = Vec::new();
+                // Copy existing content into memory first.
+                if size > 0 {
+                    mem.resize(size, 0);
+                    initrd_read(&mut mem, tar_offset);
+                }
+                let start = offset as usize;
+                let end = start + data.len();
+                if mem.len() < end { mem.resize(end, 0); }
+                mem[start..end].copy_from_slice(data);
+                let n = data.len();
+                *self.nodes.get_mut(path).unwrap() = FsNode::MemFile(mem);
+                Some(n)
             }
             FsNode::Dir(_) => None,
         }
@@ -125,19 +150,27 @@ impl Vfs {
     fn readdir(&self, path: &str) -> Option<Vec<String>> {
         match self.nodes.get(path)? {
             FsNode::Dir(children) => Some(children.clone()),
-            FsNode::File(_) => None,
+            _ => None,
         }
     }
 
     fn stat(&self, path: &str) -> Option<(bool, u64)> {
         match self.nodes.get(path)? {
-            FsNode::File(data) => Some((false, data.len() as u64)),
-            FsNode::Dir(_) => Some((true, 0)),
+            FsNode::TarFile { size, .. } => Some((false, *size as u64)),
+            FsNode::MemFile(data)        => Some((false, data.len() as u64)),
+            FsNode::Dir(_)               => Some((true, 0)),
         }
     }
 }
 
-// ── TAR parser ───────────────────────────────────────────────────────────────
+// ── TAR scanner ───────────────────────────────────────────────────────────────
+//
+// Reads the initrd TAR header-by-header using syscall 65 without buffering any
+// file data.  Only directory structure and per-file metadata are stored.
+
+fn initrd_read(buf: &mut [u8], offset: usize) -> usize {
+    libos::syscall(65, buf.as_mut_ptr() as usize, offset, buf.len())
+}
 
 fn octal_to_usize(bytes: &[u8]) -> usize {
     let mut v = 0usize;
@@ -148,12 +181,34 @@ fn octal_to_usize(bytes: &[u8]) -> usize {
     v
 }
 
-fn populate_from_tar(vfs: &mut Vfs, tar: &[u8]) {
+/// Canonicalize a TAR entry name to an absolute VFS path, e.g.:
+///   `./init`  → `/init`
+///   `./proc/` → `/proc`
+///   `./`      → `/`
+fn tar_name_to_path(name: &str) -> String {
+    let name = name.trim_end_matches('/');
+    // Strip leading "./" or lone "."
+    let name = name.strip_prefix("./").unwrap_or(name);
+    let name = if name == "." { "" } else { name };
+    if name.is_empty() {
+        return String::from("/");
+    }
+    if name.starts_with('/') {
+        return String::from(name);
+    }
+    let mut path = String::with_capacity(name.len() + 1);
+    path.push('/');
+    path.push_str(name);
+    path
+}
+
+fn scan_initrd(vfs: &mut Vfs) {
     let mut offset = 0usize;
+    let mut header = [0u8; 512];
     let mut consecutive_empty = 0u32;
 
-    while offset + 512 <= tar.len() {
-        let header = &tar[offset..offset + 512];
+    loop {
+        if initrd_read(&mut header, offset) < 512 { break; }
 
         // Two consecutive zero blocks = end of archive.
         if header.iter().all(|&b| b == 0) {
@@ -164,7 +219,6 @@ fn populate_from_tar(vfs: &mut Vfs, tar: &[u8]) {
         }
         consecutive_empty = 0;
 
-        // Name (null-terminated, up to 100 bytes; UStar prefix at 345..500 ignored).
         let name_end = header[..100].iter().position(|&b| b == 0).unwrap_or(100);
         let name = match core::str::from_utf8(&header[..name_end]) {
             Ok(s) => s,
@@ -175,33 +229,22 @@ fn populate_from_tar(vfs: &mut Vfs, tar: &[u8]) {
         let type_flag = header[156];
         let size = octal_to_usize(&header[124..136]);
 
-        // Canonicalize to absolute path, strip trailing slash.
-        let mut path = if name.starts_with('/') {
-            String::from(name)
-        } else {
-            let mut s = String::from("/");
-            s.push_str(name);
-            s
-        };
-        if path.len() > 1 && path.ends_with('/') {
-            path.pop();
-        }
+        let path = tar_name_to_path(name);
+        if path == "/" { offset += 512; continue; } // skip root entry itself
+
+        let data_start = offset + 512; // byte offset of first data byte in TAR
 
         let is_dir = type_flag == b'5'
-            || (type_flag == 0 && size == 0 && name.ends_with('/'));
+            || (matches!(type_flag, 0 | b'0') && size == 0 && name.ends_with('/'));
 
         if is_dir {
             vfs.mkdir_all(&path);
-        } else if type_flag == b'0' || type_flag == 0 || type_flag == b'\0' {
-            // Regular file.  Ensure all parents exist first.
+        } else if matches!(type_flag, 0 | b'0') && !name.ends_with('/') {
             if let Some(slash) = path.rfind('/') {
                 let parent = if slash == 0 { "/" } else { &path[..slash] };
                 vfs.mkdir_all(parent);
             }
-            let data_start = offset + 512;
-            let data_end = (data_start + size).min(tar.len());
-            let data = tar[data_start..data_end].to_vec();
-            vfs.create_with_data(&path, data);
+            vfs.insert_tar_file(&path, data_start, size);
         }
 
         let data_blocks = size.div_ceil(512);
@@ -211,26 +254,17 @@ fn populate_from_tar(vfs: &mut Vfs, tar: &[u8]) {
 
 // ── Open-file table ───────────────────────────────────────────────────────────
 
-struct OpenFile {
-    path: String,
-    offset: u64,
-}
+struct OpenFile { path: String, offset: u64 }
 
-struct OpenTable {
-    files: BTreeMap<u32, OpenFile>,
-    next_fd: u32,
-}
+struct OpenTable { files: BTreeMap<u32, OpenFile>, next_fd: u32 }
 
 impl OpenTable {
     fn new() -> Self { Self { files: BTreeMap::new(), next_fd: 1 } }
-
     fn open(&mut self, path: &str) -> u32 {
-        let fd = self.next_fd;
-        self.next_fd += 1;
+        let fd = self.next_fd; self.next_fd += 1;
         self.files.insert(fd, OpenFile { path: String::from(path), offset: 0 });
         fd
     }
-
     fn get(&self, fd: u32) -> Option<&OpenFile> { self.files.get(&fd) }
     fn get_mut(&mut self, fd: u32) -> Option<&mut OpenFile> { self.files.get_mut(&fd) }
     fn close(&mut self, fd: u32) { self.files.remove(&fd); }
@@ -247,20 +281,6 @@ fn ipc_recv(buf: &mut [u8], from: &mut i32) -> usize {
 }
 
 fn vfs_register() { libos::syscall(63, 0, 0, 0); }
-
-/// Fetch the full initrd TAR from the kernel (syscall 65).
-fn fetch_initrd() -> Vec<u8> {
-    let mut buf = Vec::new();
-    let mut offset = 0usize;
-    let mut chunk = [0u8; 4096];
-    loop {
-        let n = libos::syscall(65, chunk.as_mut_ptr() as usize, offset, chunk.len());
-        if n == 0 { break; }
-        buf.extend_from_slice(&chunk[..n]);
-        offset += n;
-    }
-    buf
-}
 
 // ── Reply helpers ─────────────────────────────────────────────────────────────
 
@@ -286,10 +306,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             if body.len() < 4 { reply_err(client); return; }
             let mut off = 0;
             let _flags = get_u32(body, &mut off);
-            let path = match core::str::from_utf8(&body[off..]) {
-                Ok(s) => s,
-                Err(_) => { reply_err(client); return; }
-            };
+            let path = match core::str::from_utf8(&body[off..]) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
             if vfs.exists(path) {
                 let fd = open_table.open(path);
                 let mut p = [0u8; 4];
@@ -302,13 +319,12 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
         OP_READ => {
             if body.len() < 13 { reply_err(client); return; }
             let mut off = 0;
-            let fd     = get_u32(body, &mut off);
-            let offset = get_u64(body, &mut off);
+            let fd      = get_u32(body, &mut off);
+            let offset  = get_u64(body, &mut off);
             let len_req = get_u32(body, &mut off) as usize;
 
             let (path, read_off) = match open_table.get(fd) {
-                Some(f) => (f.path.clone(),
-                             if offset == u64::MAX { f.offset } else { offset }),
+                Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }),
                 None => { reply_err(client); return; }
             };
 
@@ -316,9 +332,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             let take = len_req.min(data_buf.len());
             match vfs.read(&path, read_off, &mut data_buf[..take]) {
                 Some(n) => {
-                    if let Some(f) = open_table.get_mut(fd) {
-                        f.offset = read_off + n as u64;
-                    }
+                    if let Some(f) = open_table.get_mut(fd) { f.offset = read_off + n as u64; }
                     reply_ok(client, &data_buf[..n]);
                 }
                 None => reply_err(client),
@@ -332,16 +346,13 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             let data   = &body[off..];
 
             let (path, write_off) = match open_table.get(fd) {
-                Some(f) => (f.path.clone(),
-                             if offset == u64::MAX { f.offset } else { offset }),
+                Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }),
                 None => { reply_err(client); return; }
             };
 
             match vfs.write(&path, write_off, data) {
                 Some(n) => {
-                    if let Some(f) = open_table.get_mut(fd) {
-                        f.offset = write_off + n as u64;
-                    }
+                    if let Some(f) = open_table.get_mut(fd) { f.offset = write_off + n as u64; }
                     let mut p = [0u8; 4];
                     put_u32(&mut p, &mut 0, n as u32);
                     reply_ok(client, &p);
@@ -357,10 +368,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             reply_ok(client, &[]);
         }
         OP_GETDENTS => {
-            let path = match core::str::from_utf8(body) {
-                Ok(s) => s,
-                Err(_) => { reply_err(client); return; }
-            };
+            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
             match vfs.readdir(path) {
                 Some(children) => {
                     let mut buf = [0u8; MAX_MSG - 1];
@@ -442,20 +450,10 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: usize, _argv: usize) -> i32 {
-    // Register as the VFS server before touching the filesystem.
     vfs_register();
 
     let mut vfs = Vfs::new();
-
-    // Populate from the kernel's initrd TAR (fetch in 4 KB chunks via syscall 65).
-    {
-        let tar = fetch_initrd();
-        if !tar.is_empty() {
-            populate_from_tar(&mut vfs, &tar);
-        }
-    }
-
-    // Ensure standard writable directories exist even if absent from initrd.
+    scan_initrd(&mut vfs);      // O(entries) time, O(metadata) memory
     vfs.mkdir_all("/tmp");
     vfs.mkdir_all("/home/guest");
 
