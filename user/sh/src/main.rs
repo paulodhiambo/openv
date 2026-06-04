@@ -15,7 +15,7 @@ const REV: &[u8] = b"\x1b[7m";
 const GREEN: &[u8] = b"\x1b[32m";
 const CYAN: &[u8] = b"\x1b[36m";
 const YELLOW: &[u8] = b"\x1b[33m";
-const CLR: &[u8] = b"\x1b[2J\x1b[H";
+const CLR: &[u8] = b"\x1b[0m\x1b[3J\x1b[2J\x1b[H";
 
 fn wrt(s: &[u8]) {
     write(1, s.as_ptr(), s.len());
