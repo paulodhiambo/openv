@@ -5,5 +5,5 @@ edition = "2021"
 
 [dependencies]
 libos = { path = "../libos" }
-smoltcp = { version = "0.13.1", default-features = false, features = ["proto-ipv4","socket","socket-tcp","medium-ethernet"] }
+smoltcp = { version = "0.13.1", default-features = false, features = ["proto-ipv4","socket","socket-tcp","medium-ethernet","alloc","auto-icmp-echo-reply"] }
 heapless = "0.9.3"

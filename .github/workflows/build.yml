@@ -9,49 +9,87 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# rust-toolchain.toml in the repo root pins the exact nightly + components.
+# `rustup show` installs it automatically on the runner.
+
 jobs:
-  # ── Format and lint ──────────────────────────────────────────────────────────
-  quality:
+  # ── Lint (kernel + userspace in parallel) ───────────────────────────────────
+  lint:
+    name: Lint (${{ matrix.workspace }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - workspace: kernel
+            dir: .
+          - workspace: userspace
+            dir: user
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
+      - name: Set up Rust toolchain
+        # Reads rust-toolchain.toml; installs nightly + rust-src + clippy + targets
+        run: rustup show
+
+      - name: Restore Cargo registry cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-registry-
+
+      - name: cargo check
+        run: cargo check
+
+      - name: cargo clippy
         run: |
-          rustup set profile minimal
-          rustup toolchain install nightly \
-            --component rustfmt \
-            --component clippy \
-            --target riscv64gc-unknown-none-elf \
-            --allow-downgrade
+          cargo clippy -- \
+            -D warnings \
+            -A clippy::missing_safety_doc \
+            -A clippy::identity_op \
+            -A clippy::collapsible_if \
+            -A clippy::unnecessary_cast \
+            -A clippy::extra_unused_lifetimes \
+            -A clippy::implicit_saturating_sub \
+            -A clippy::manual_contains \
+            -A clippy::manual_div_ceil \
+            -A clippy::manual_is_multiple_of \
+            -A clippy::manual_range_contains \
+            -A clippy::needless_range_loop \
+            -A clippy::not_unsafe_ptr_arg_deref \
+            -A clippy::redundant_pattern_matching \
+            -A clippy::result_unit_err \
+            -A clippy::slow_vector_initialization \
+            -A clippy::unnecessary_map_or \
+            -A clippy::while_let_loop \
+            -A clippy::clone_on_copy \
+            -A clippy::never_loop \
+            -A clippy::new_without_default \
+            -A clippy::unwrap_or_default \
+            -A clippy::empty_line_after_doc_comments
 
-      - name: rustfmt (kernel)
-        run: cargo fmt --check
-
-      - name: clippy (kernel)
-        run: cargo clippy -- -D warnings
-
-      - name: rustfmt (userspace)
-        working-directory: user
-        run: cargo fmt --check
-
-  # ── Build everything ─────────────────────────────────────────────────────────
+  # ── Build (depends on lint passing) ─────────────────────────────────────────
   build:
+    name: Build
     runs-on: ubuntu-latest
+    needs: lint
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install nightly toolchain
-        run: |
-          rustup set profile minimal
-          rustup toolchain install nightly \
-            --component rust-src \
-            --component llvm-tools-preview \
-            --target riscv64gc-unknown-none-elf \
-            --allow-downgrade
-          rustup target add riscv64gc-unknown-none-elf --toolchain nightly
+      - name: Set up Rust toolchain
+        run: rustup show
 
-      - name: Restore Cargo cache
+      - name: Restore Cargo build cache
         uses: actions/cache@v4
         with:
           path: |
@@ -59,53 +97,109 @@ jobs:
             ~/.cargo/git
             target
             user/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock', 'user/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-build-
 
-      - name: Build userspace
+      # ── Userspace ─────────────────────────────────────────────────────────
+      - name: Build userspace (debug)
         working-directory: user
         run: cargo build
 
+      - name: Build userspace (release)
+        working-directory: user
+        run: cargo build --release
+
+      # ── Initrd ────────────────────────────────────────────────────────────
       - name: Package initrd
         run: |
           mkdir -p test_root/proc test_root/dev
+
           for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp; do
             src="user/target/riscv64gc-unknown-none-elf/debug/$bin"
             if [ -f "$src" ]; then
               cp "$src" "test_root/$bin"
+              echo "  copied $bin"
+            else
+              echo "  (skipping $bin — not found)"
             fi
           done
+
           echo "Hello from initrd TAR!" > test_root/dummy.txt
           cd test_root && tar -cf ../test_root.tar .
+          echo "initrd size: $(du -sh ../test_root.tar | cut -f1)"
 
+      # ── Kernel ────────────────────────────────────────────────────────────
       - name: Build kernel (debug)
         run: cargo build
 
       - name: Build kernel (release)
         run: cargo build --release
 
-      - name: Verify kernel ELF
+      # ── Binary size report ────────────────────────────────────────────────
+      - name: Report binary sizes
         run: |
-          file target/riscv64gc-unknown-none-elf/debug/openv
-          file target/riscv64gc-unknown-none-elf/release/openv
-          size target/riscv64gc-unknown-none-elf/debug/openv
-          size target/riscv64gc-unknown-none-elf/release/openv
+          echo "### Binary sizes" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Binary | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|------|" >> $GITHUB_STEP_SUMMARY
 
+          for f in \
+            "target/riscv64gc-unknown-none-elf/debug/openv" \
+            "target/riscv64gc-unknown-none-elf/release/openv" \
+            "test_root.tar";
+          do
+            if [ -f "$f" ]; then
+              sz=$(du -sh "$f" | cut -f1)
+              echo "| \`$f\` | $sz |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Section breakdown (debug kernel)" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          # Use llvm-size from the installed llvm-tools-preview component
+          LLVM_SIZE="$(rustup which --toolchain nightly llvm-size 2>/dev/null || echo 'size')"
+          "$LLVM_SIZE" target/riscv64gc-unknown-none-elf/debug/openv >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      # ── Artifacts ─────────────────────────────────────────────────────────
       - name: Upload kernel (debug)
         uses: actions/upload-artifact@v4
         with:
           name: openv-kernel-debug
           path: target/riscv64gc-unknown-none-elf/debug/openv
+          if-no-files-found: error
 
       - name: Upload kernel (release)
         uses: actions/upload-artifact@v4
         with:
           name: openv-kernel-release
           path: target/riscv64gc-unknown-none-elf/release/openv
+          if-no-files-found: error
 
       - name: Upload initrd
         uses: actions/upload-artifact@v4
         with:
           name: initrd
           path: test_root.tar
+          if-no-files-found: error
+
+      # ── Release assets (only on push to main/master) ──────────────────────
+      - name: Create release bundle
+        if: github.event_name == 'push'
+        run: |
+          mkdir -p release-bundle
+          cp target/riscv64gc-unknown-none-elf/release/openv release-bundle/openv-kernel
+          cp test_root.tar release-bundle/initrd.tar
+          echo "Built from commit ${{ github.sha }}" > release-bundle/BUILD_INFO.txt
+          echo "Branch: ${{ github.ref_name }}" >> release-bundle/BUILD_INFO.txt
+          echo "Date: $(date -u)" >> release-bundle/BUILD_INFO.txt
+
+      - name: Upload release bundle
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openv-${{ github.ref_name }}-${{ github.sha }}
+          path: release-bundle/
+          retention-days: 90

@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use libos::{exit, getdents, write};
+use libos::{getdents, write};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {

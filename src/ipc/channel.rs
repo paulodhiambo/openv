@@ -3,7 +3,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::task::{Poll, Waker};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// A message sent over a channel.
 pub struct Message {
@@ -20,6 +20,7 @@ pub struct EndpointState {
 
 /// A ChannelEndpoint represents one side of a bidirectional channel.
 pub struct ChannelEndpoint {
+    #[allow(dead_code)]
     koid: Koid,
     state: Mutex<EndpointState>,
     peer: Mutex<Weak<ChannelEndpoint>>,

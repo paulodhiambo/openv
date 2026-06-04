@@ -1,43 +1,87 @@
-# OpenV Development Roadmap
+# openv — Development Roadmap
 
-This document outlines the strategic path to achieving a functional, "Linux-level" OS with GUI capabilities.
+This document tracks what has been implemented, what is in progress, and what is planned.
 
-See docs/syscall.md for the current syscall ABI and conventions.
+## ✅ Phase 1 — Foundation (Complete)
 
-## Milestones
+*POSIX-compatible kernel foundation and interactive shell.*
 
-### Phase 1: Foundation (POSIX & Syscalls)
-*Goal: Create a stable API for userland applications.*
-- [ ] Stabilize Syscall ABI.
-- [ ] Implement `fork` (with Copy-on-Write memory).
-- [ ] Implement `exec` and robust `wait` system.
-- [ ] Port/Implement minimal `no_std` compatible C library (e.g., musl subset).
-- [ ] Implement PID 1 (Init system).
+- [x] Stable syscall ABI (`ecall`, `a7` = number, `a0`–`a3` args)
+- [x] `fork` with Copy-on-Write memory semantics
+- [x] `exec` (replaces process image in-place)
+- [x] `waitpid` with zombie reaping
+- [x] PID 1 (`init`) — login prompt, shell respawn loop
+- [x] libos POSIX shim — 60+ syscall wrappers, 2 MB user heap, `_start`
+- [x] Interactive shell (`sh`) — pipelines, redirection, history, builtins, nano editor
+- [x] Coreutils: `ls`, `cat`, `hello`, `producer`, `consumer`, `doexec`, `forktest`
 
-### Phase 2: Kernel Architecture Maturity
-*Goal: Build a production-grade, preemptive multitasking kernel.*
-- [ ] Support Symmetric Multiprocessing (SMP).
-- [ ] Implement Demand Paging and robust memory management.
-- [ ] Implement a unified Virtual File System (VFS) abstraction.
-- [ ] Define a device driver framework (dynamic loading/discovery).
+## ✅ Phase 2 — Kernel Architecture (Complete)
 
-### Phase 3: GUI & Input Hardware
-*Goal: Enable interactive graphical user interface.*
-- [ ] Framebuffer Driver (VirtIO).
-- [ ] Input Driver (Keyboard/Mouse via VirtIO).
-- [ ] Integration of `embedded-graphics` for drawing primitives.
-- [ ] Basic Window Manager/Compositor.
+*Production-grade memory management and multi-process kernel.*
 
-### Phase 4: System Services
-*Goal: Provide a complete runtime environment.*
-- [ ] Networking stack (POSIX Sockets via `smoltcp` port).
-- [ ] Dynamic Linker (loading shared libraries).
+- [x] Preemptive multitasking — 10 ms SBI timer, round-robin FIFO scheduler
+- [x] SMP support — up to 4 HARTs, per-hart stacks, TLB shootdown IPI
+- [x] Sv39 demand paging — lazy zero-fill page allocation
+- [x] Copy-on-Write fork — page-level refcounting, store-fault resolution
+- [x] Virtual File System (VFS) — `Vnode` trait + mount table
+- [x] MemFS — initrd-backed root filesystem (tar parser)
+- [x] ProcFS — `/proc/<pid>/status`
+- [x] DevFS — `/dev/null`, `/dev/zero`, `/dev/tty`
+- [x] Persistent filesystem (OFS) on virtio-blk → mounted at `/mnt`
+- [x] File descriptors, `dup`/`dup2`, pipes with EOF detection
+- [x] IPC channels — bidirectional message queues
+- [x] Multi-user security — Unix DAC, setuid/setgid bits, sudo group
+- [x] UART TTY line discipline — cooked + raw mode, echo, Ctrl-C
+- [x] Device driver framework — FDT probe, PLIC claim/complete
+
+## ✅ Phase 3 — Networking (Complete, in userspace)
+
+*TCP/IP networking via userspace smoltcp daemon.*
+
+- [x] Virtio-mmio network driver (legacy virtqueue interface)
+- [x] Raw Ethernet send/receive syscalls (`net_send`, `net_recv`)
+- [x] Socket registry in kernel (`sys_socket`, `sys_accept`, etc.)
+- [x] `net-smoltcp` daemon — full TCP/IP stack running in userspace
+- [x] Socket lifecycle: `bind`, `listen`, `connect`, `accept`, `send`, `recv`
+
+## 🚧 Phase 4 — Robustness (In Progress)
+
+*Fix known correctness issues and prepare for multi-user workloads.*
+
+- [ ] Fix data races: `ppid` and `satp_val` via atomic types (see CONTRIBUTING §11)
+- [ ] Fix PMM `static mut` free-list — wrap in `Mutex`
+- [ ] Split `trap.rs` God File into `syscall/` subsystem modules
+- [ ] Per-session TTY line discipline buffer (not global)
+- [ ] Named errno constants for all error returns
+- [ ] Full preemptive context switch at timer interrupt (not just re-queue)
+- [ ] Signal subsystem — `sigaction`, `sigprocmask`, `kill`, `sigreturn` trampoline
+- [ ] Job control — process groups, sessions, `tcsetpgrp`, `SIGTSTP`/`SIGCONT`
+- [ ] `sys_fstat` — stat an already-open fd, not just a path
+- [ ] `sys_getdents` — accept directory fd instead of path
+
+## 📋 Phase 5 — Extended POSIX (Planned)
+
+*Broader compatibility to run more existing software.*
+
+- [ ] `mmap` / `munmap` — map files and anonymous memory regions
+- [ ] `poll` / `select` — multiplexed I/O wait
+- [ ] `fcntl` — file descriptor flags and locking
+- [ ] `lseek` with `SEEK_SET`/`SEEK_CUR`/`SEEK_END`
+- [ ] Symlinks in VFS
+- [ ] Shared libraries and a dynamic linker (`ld.so`)
+- [ ] Port musl libc subset for broader application compatibility
+
+## 💡 Phase 6 — GUI (Future)
+
+*Graphics and interactive desktop environment.*
+
+- [ ] Virtio-GPU framebuffer driver
+- [ ] Virtio-input keyboard/mouse driver
+- [ ] Basic compositing window manager
+- [ ] `embedded-graphics` integration for drawing primitives
 
 ---
 
-## Actionable Next Steps
+## Contributing
 
-1.  **Research:** Analyze `scripts/run.sh` to determine how your emulator (QEMU) exposes hardware devices (display/input).
-2.  **Research:** Study `xv6-riscv` architecture for established patterns in syscall/process management.
-3.  **Task:** Define the stable Syscall ABI to ensure user-space programs can interact with the kernel consistently.
-4.  **Task:** Prototype a minimal framebuffer driver to get basic pixel data on the screen.
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for how to help, especially the **Known Issues to Fix** table which lists good first contributions.

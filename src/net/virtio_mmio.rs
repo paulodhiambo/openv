@@ -1,288 +1,225 @@
-//! Virtio-mmio helper: register layout, feature negotiation, and basic queue setup.
+//! VirtIO MMIO network driver (legacy, device-id=1).
 //!
-//! This file implements a conservative legacy-style virtio-mmio setup that:
-//!  - probes the FDT for a "virtio,mmio" node
-//!  - reads basic MMIO registers
-//!  - negotiates zero features (safe)
-//!  - allocates a page for a virtqueue and writes the PFN
-//!  - registers a simple runtime NetDevice that will later be wired to the queue
+//! Queue layout (QUEUE_ALIGN=4 so everything fits in one 4 KB page per queue):
+//!   queue 0 = RX (device writes received frames here)
+//!   queue 1 = TX (driver writes outgoing frames here)
+//!
+//! Each RX descriptor is a single 4 KB page (10-byte virtio-net header + ≤1514 B packet).
+//! Each TX submission is a single 4 KB page (10-byte virtio-net header + packet data).
 
 use crate::net::NetDevice;
 use crate::net::virtqueue::VirtQueue;
 use crate::println;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use crate::sync::Mutex;
 
-use spin::Mutex;
 static DRIVER_GLOBAL: Mutex<Option<&'static VirtioDriver>> = Mutex::new(None);
-// Store tuples of (pa, len)
-static RX_QUEUE: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
 
-// Important legacy MMIO offsets (conservative subset)
-const OFF_MAGIC: usize = 0x000;
-const OFF_VERSION: usize = 0x004;
-const OFF_DEVICE_ID: usize = 0x008;
-const OFF_VENDOR_ID: usize = 0x00c;
+// ── MMIO register offsets (legacy spec) ──────────────────────────────────────
+
+#[allow(dead_code)]
+const OFF_MAGIC: usize          = 0x000;
+#[allow(dead_code)]
+const OFF_VERSION: usize        = 0x004;
+const OFF_DEVICE_ID: usize      = 0x008;
 const OFF_DEVICE_FEATURES: usize = 0x010;
 const OFF_DRIVER_FEATURES: usize = 0x020;
-const OFF_QUEUE_SEL: usize = 0x030;
-const OFF_QUEUE_NUM_MAX: usize = 0x034;
-const OFF_QUEUE_NUM: usize = 0x038;
-const OFF_QUEUE_ALIGN: usize = 0x03c;
-const OFF_QUEUE_PFN: usize = 0x040;
-const OFF_QUEUE_NOTIFY: usize = 0x050;
-const OFF_ISR: usize = 0x060; // legacy ISR
-const OFF_STATUS: usize = 0x070;
+const OFF_GUEST_PAGE_SIZE: usize = 0x028; // legacy: must be written before QUEUE_PFN
+const OFF_QUEUE_SEL: usize      = 0x030;
+const OFF_QUEUE_NUM_MAX: usize  = 0x034;
+const OFF_QUEUE_NUM: usize      = 0x038;
+const OFF_QUEUE_ALIGN: usize    = 0x03c;
+const OFF_QUEUE_PFN: usize      = 0x040;
+const OFF_QUEUE_NOTIFY: usize   = 0x050;
+const OFF_ISR: usize            = 0x060;
+const OFF_STATUS: usize         = 0x070;
 
-const VIRTIO_MAGIC: u32 = 0x7472_6976; // "virt"
+const VIRTIO_MAGIC: u32               = 0x7472_6976; // "virt"
+const VIRTIO_DEVICE_NET: u32          = 1;
+const VIRTIO_STATUS_ACKNOWLEDGE: u32  = 1;
+const VIRTIO_STATUS_DRIVER: u32       = 2;
+const VIRTIO_STATUS_DRIVER_OK: u32    = 4;
+
+// virtio-net header (legacy, no VIRTIO_NET_F_MRG_RXBUF)
+const VNET_HDR_LEN: usize = 10;
+
+// RX queue: pre-allocated write-descriptors; 8 is sufficient for bursts
+const RX_BUF_COUNT: usize = 8;
+// Descriptor ring size per queue (power-of-two, fits with QUEUE_ALIGN=4 in one page)
+const QUEUE_SIZE: usize = 64;
+
+// ── Driver struct ──────────────────────────────────────────────────────────────
+
+struct VirtioDriver {
+    base:   usize,
+    rx_vq:  Mutex<VirtQueue>,
+    tx_vq:  Mutex<VirtQueue>,
+    irq:    u32,
+}
+
+unsafe impl Send for VirtioDriver {}
+unsafe impl Sync for VirtioDriver {}
+
+// ── MMIO helpers ──────────────────────────────────────────────────────────────
 
 fn mmio_read32(base: usize, offset: usize) -> u32 {
+    // SAFETY: `base` is a MMIO physical address obtained from the DTB and
+    // identity-mapped by the kernel. read_volatile prevents the compiler
+    // from eliding or reordering the hardware register read.
     unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
 }
 
 fn mmio_write32(base: usize, offset: usize, v: u32) {
+    // SAFETY: `base` is a MMIO physical address obtained from the DTB and
+    // identity-mapped by the kernel. write_volatile prevents the compiler
+    // from eliding or reordering the hardware register write.
     unsafe { core::ptr::write_volatile((base + offset) as *mut u32, v) }
 }
 
-fn mmio_write64(base: usize, offset: usize, v: u64) {
-    mmio_write32(base, offset, v as u32);
-    mmio_write32(base, offset + 4, (v >> 32) as u32);
-}
-
-struct VirtioDriver {
-    base: usize,
-    q_pa: usize,
-    vq: Mutex<VirtQueue>,
-    irq: u32,
-}
+// ── Initialization ────────────────────────────────────────────────────────────
 
 impl VirtioDriver {
-    fn new(base: usize, q_pa: usize, qsize: usize, irq: u32) -> Self {
-        let vq = VirtQueue::new(q_pa, qsize);
+    fn new(base: usize, rx_pa: usize, tx_pa: usize, qsize: usize, irq: u32) -> Self {
         VirtioDriver {
             base,
-            q_pa,
-            vq: Mutex::new(vq),
+            rx_vq: Mutex::new(VirtQueue::new(rx_pa, qsize)),
+            tx_vq: Mutex::new(VirtQueue::new(tx_pa, qsize)),
             irq,
         }
     }
 
-    fn reset(&self) {
+    fn setup_queue_mmio(&self, sel: u32, pa: usize, size: usize) {
+        mmio_write32(self.base, OFF_QUEUE_SEL, sel);
+        // Ensure device supports the requested size
+        let max = mmio_read32(self.base, OFF_QUEUE_NUM_MAX);
+        let actual = if max == 0 { size } else { core::cmp::min(max as usize, size) } as u32;
+        mmio_write32(self.base, OFF_QUEUE_NUM, actual);
+        // QUEUE_ALIGN=4 matches VirtQueue's internal layout (used ring aligned to 4 bytes)
+        mmio_write32(self.base, OFF_QUEUE_ALIGN, 4);
+        mmio_write32(self.base, OFF_QUEUE_PFN, (pa >> 12) as u32);
+    }
+
+    fn init_device(&self, rx_pa: usize, tx_pa: usize, qsize: usize) {
+        // Reset
         mmio_write32(self.base, OFF_STATUS, 0);
-    }
-
-    fn negotiate_features(&self) {
-        let _features = mmio_read32(self.base, OFF_DEVICE_FEATURES);
+        // ACKNOWLEDGE + DRIVER status bits
+        mmio_write32(self.base, OFF_STATUS, VIRTIO_STATUS_ACKNOWLEDGE);
+        mmio_write32(self.base, OFF_STATUS, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER);
+        // Negotiate zero optional features
+        let _ = mmio_read32(self.base, OFF_DEVICE_FEATURES);
         mmio_write32(self.base, OFF_DRIVER_FEATURES, 0);
-    }
-
-    fn setup_queue0(&self) {
-        mmio_write32(self.base, OFF_QUEUE_SEL, 0);
-        // Use vq size if available
-        let qsize = self.vq.lock().size as u32;
-        mmio_write32(self.base, OFF_QUEUE_NUM, qsize);
-        mmio_write32(self.base, OFF_QUEUE_ALIGN, 4096);
-        let pfn = (self.q_pa >> 12) as u32;
-        mmio_write32(self.base, OFF_QUEUE_PFN, pfn);
+        // Must set GuestPageSize before writing QueuePFN in legacy mode
+        mmio_write32(self.base, OFF_GUEST_PAGE_SIZE, 4096);
+        // Queue 0 = RX, queue 1 = TX
+        self.setup_queue_mmio(0, rx_pa, qsize);
+        self.setup_queue_mmio(1, tx_pa, qsize);
+        // Signal DRIVER_OK to make the device live
+        mmio_write32(self.base, OFF_STATUS,
+            VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_DRIVER_OK);
+        // Pre-fill the RX queue so the device has buffers to write into
+        for _ in 0..RX_BUF_COUNT {
+            if let Some(pa) = crate::mm::pmm::alloc_page() {
+                let _ = self.rx_vq.lock().enqueue_chain(&[(pa as u64, 4096, true)]);
+            }
+        }
+        // Tell the device new RX buffers are available
+        mmio_write32(self.base, OFF_QUEUE_NOTIFY, 0);
     }
 }
 
+// ── NetDevice impl ────────────────────────────────────────────────────────────
+
 impl NetDevice for VirtioDriver {
     fn send(&self, packet: &[u8]) {
-        // Split packet into PAGE-sized chunks and create descriptor chain
-        let mut chunks: Vec<(u64, u32, bool)> = Vec::new();
-        let mut offset = 0usize;
-        while offset < packet.len() {
-            if let Some(pa) = crate::mm::pmm::alloc_page() {
-                let copy_len = core::cmp::min(packet.len() - offset, crate::mm::pmm::PAGE_SIZE);
-                unsafe {
-                    let dst = pa as *mut u8;
-                    core::ptr::copy_nonoverlapping(packet[offset..].as_ptr(), dst, copy_len);
+        // Free any TX buffers completed by the device since last call
+        let done_pages: Vec<usize> = {
+            let mut tx = self.tx_vq.lock();
+            let done = tx.pop_used();
+            let mut pages = Vec::new();
+            for (id, _) in done {
+                let parts = tx.read_chain(id);
+                tx.free_chain(id);
+                for (pa, _) in parts {
+                    pages.push(pa as usize);
                 }
-                chunks.push((pa as u64, copy_len as u32, false));
-                offset += copy_len;
-            } else {
-                // allocation failure: free already allocated pages
-                for (pa, _len, _w) in chunks.iter() {
-                    crate::mm::pmm::free_page(*pa as usize);
-                }
-                return;
             }
-        }
-
-        if chunks.is_empty() {
-            return;
-        }
-
-        let ok = {
-            let vq = self.vq.lock();
-            vq.enqueue_chain(&chunks).is_ok()
+            pages
         };
+        for pa in done_pages {
+            crate::mm::pmm::free_page(pa);
+        }
 
+        // Allocate one page: virtio-net header (10 B) + packet data
+        let total = VNET_HDR_LEN + packet.len();
+        if total > crate::mm::pmm::PAGE_SIZE {
+            return; // oversized
+        }
+        let pa = match crate::mm::pmm::alloc_page() {
+            Some(p) => p,
+            None => return,
+        };
+        // SAFETY: `pa` is a freshly allocated PMM page exclusively owned
+        // by this TX submission. `ptr` is valid for VNET_HDR_LEN + packet.len()
+        // bytes, both of which fit within one 4 KiB page (checked above).
+        unsafe {
+            let ptr = pa as *mut u8;
+            // Zero-filled virtio-net header (no checksum offload, no GSO)
+            core::ptr::write_bytes(ptr, 0, VNET_HDR_LEN);
+            // Packet data follows immediately
+            core::ptr::copy_nonoverlapping(packet.as_ptr(), ptr.add(VNET_HDR_LEN), packet.len());
+        }
+        let ok = self.tx_vq.lock()
+            .enqueue_chain(&[(pa as u64, total as u32, false)])
+            .is_ok();
         if ok {
-            // Notify device that queue 0 has new buffer(s)
-            mmio_write32(self.base, OFF_QUEUE_NOTIFY, 0);
+            mmio_write32(self.base, OFF_QUEUE_NOTIFY, 1); // notify TX queue (index 1)
         } else {
-            // Queue full: free pages
-            for (pa, _len, _w) in chunks.iter() {
-                crate::mm::pmm::free_page(*pa as usize);
-            }
+            crate::mm::pmm::free_page(pa);
         }
     }
 
     fn recv(&self, buf: &mut [u8]) -> usize {
-        // First, try the interrupt-populated RX queue
-        if let Some(n) = try_dequeue_rx(buf) {
-            return n;
-        }
+        // Poll RX used ring for a completed receive
+        let (rx_pa, rx_len) = {
+            let mut rx = self.rx_vq.lock();
+            let done = rx.pop_used();
+            if done.is_empty() {
+                return 0;
+            }
+            let (id, pkt_len) = done[0];
+            // Recover physical address from the descriptor before freeing it
+            let pa = rx.desc_addr(id) as usize;
+            // Return descriptor to free list and immediately re-enqueue for next receive
+            rx.free_chain(id);
+            let _ = rx.enqueue_chain(&[(pa as u64, 4096, true)]);
+            (pa, pkt_len as usize)
+        };
+        // Inform device that a fresh RX buffer is available
+        mmio_write32(self.base, OFF_QUEUE_NOTIFY, 0);
 
-        // Fallback: poll the virtqueue directly
-        let mut vq = self.vq.lock();
-        let completed = vq.pop_used();
-        if completed.is_empty() {
-            return 0;
-        }
-        let (id, _len) = completed[0];
-        // Read descriptor chain for this id
-        let parts = vq.read_chain(id);
-        let mut copied = 0usize;
-        for (pa, len) in parts.iter() {
-            let to_copy = core::cmp::min(*len as usize, buf.len() - copied);
+        // Copy Ethernet frame, skipping the 10-byte virtio-net header
+        let data_len = rx_len.saturating_sub(VNET_HDR_LEN);
+        let to_copy = core::cmp::min(data_len, buf.len());
+        if to_copy > 0 {
+            // SAFETY: `rx_pa` is a PMM-allocated page that the device DMA'd
+            // into. After pop_used() the device no longer owns this buffer;
+            // we re-enqueue a fresh descriptor above, so this read does not
+            // race with the device. `buf` is a caller-provided mutable slice
+            // of at least `to_copy` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    *pa as *const u8,
-                    buf[copied..].as_mut_ptr(),
+                    (rx_pa + VNET_HDR_LEN) as *const u8,
+                    buf.as_mut_ptr(),
                     to_copy,
                 );
             }
-            copied += to_copy;
-            // Free page
-            crate::mm::pmm::free_page(*pa as usize);
-            if copied >= buf.len() {
-                break;
-            }
         }
-        // Return descriptors to free list
-        vq.free_chain(id);
-        copied
+        to_copy
     }
 }
 
-/// Probe DTB for virtio,mmio and initialize a minimal stub device.
-pub fn probe_and_init() -> bool {
-    let dtb_ptr = boot_dtb_ptr();
-    if dtb_ptr == 0 {
-        return false;
-    }
-
-    let fdt = match unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) } {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-
-    for node in fdt.all_nodes() {
-        if let Some(comp) = node.property("compatible") {
-            if let Some(s) = comp.as_str() {
-                if s.contains("virtio,mmio") {
-                    // try to read reg property
-                    let mut base = node.property("reg").and_then(|p| p.as_usize()).unwrap_or(0);
-                    // Fallback: parse base from node name like 'virtio_mmio@10008000'
-                    if base == 0 {
-                        if let Some(idx) = node.name.rfind('@') {
-                            if let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16) {
-                                base = x;
-                            }
-                        }
-                    }
-                    println!(
-                        "virtio-mmio: node '{}' compat contains virtio,mmio; base={:#x}",
-                        node.name, base
-                    );
-
-                    if base != 0 {
-                        // Read magic to verify MMIO presence (best-effort)
-                        let magic = mmio_read32(base, OFF_MAGIC);
-                        if magic == VIRTIO_MAGIC {
-                            println!("virtio-mmio: magic OK at {:#x}", base);
-                        } else {
-                            println!("virtio-mmio: magic mismatch (read {:#x})", magic);
-                        }
-
-                        // Allocate a page for virtqueue metadata (guest physical page)
-                        let q_pa = crate::mm::pmm::alloc_page().expect("failed to alloc vq page");
-                        let qnum = mmio_read32(base, OFF_QUEUE_NUM_MAX);
-                        let qsize = if qnum == 0 {
-                            256
-                        } else {
-                            core::cmp::min(qnum, 256)
-                        };
-                        println!(
-                            "virtio-mmio: allocated virtqueue page at PA {:#x}, qnum_max={}, using qsize={}",
-                            q_pa, qnum, qsize
-                        );
-
-                        // Try to read an interrupt spec from DTB (best-effort). If unavailable, irq=0
-                        let irq = node
-                            .property("interrupts")
-                            .and_then(|p| p.as_usize())
-                            .unwrap_or(0) as u32;
-
-                        let drv = VirtioDriver::new(base, q_pa, qsize as usize, irq);
-                        drv.reset();
-                        drv.negotiate_features();
-                        drv.setup_queue0();
-
-                        unsafe {
-                            // Leak to 'static by leaking a Box; this is acceptable for kernel lifetime
-                            let leaked: &'static VirtioDriver = Box::leak(Box::new(drv));
-                            *DRIVER_GLOBAL.lock() = Some(leaked);
-                            crate::net::register_device(leaked);
-                        }
-
-                        println!("virtio-mmio: driver registered (stub), irq={}", irq);
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-
-    false
-}
-
-fn boot_dtb_ptr() -> usize {
-    crate::boot_dtb_ptr()
-}
-
-/// Interrupt handler invoked by trap handler when virtio IRQ is received.
-pub fn handle_interrupt(irq: u32) {
-    let guard = DRIVER_GLOBAL.lock();
-    if let Some(drv) = *guard {
-        // If driver knows its IRQ, only handle matching IRQs. If drv.irq == 0,
-        // fall back to legacy ISR read.
-        if drv.irq != 0 && drv.irq != irq {
-            return;
-        }
-
-        // If legacy ISR is present, read it to clear device-side status (best-effort)
-        let _ = mmio_read32(drv.base, OFF_ISR);
-
-        let mut vq = drv.vq.lock();
-        let completed = vq.pop_used();
-        if !completed.is_empty() {
-            let mut rx = RX_QUEUE.lock();
-            for (id, _len) in completed {
-                // read descriptor chain and enqueue physical pages into RX queue
-                let parts = vq.read_chain(id);
-                for (pa, len) in parts.iter() {
-                    rx.push((*pa as usize, *len));
-                }
-                // free descriptor indices
-                vq.free_chain(id);
-            }
-        }
-    }
-}
+// ── Driver framework integration ──────────────────────────────────────────────
 
 impl crate::drivers::Driver for VirtioDriver {
     fn on_interrupt(&self, irq: usize) {
@@ -290,62 +227,130 @@ impl crate::drivers::Driver for VirtioDriver {
     }
 }
 
-/// Driver framework entry-point: called by `drivers::probe_all` when a virtio,mmio node is found.
-pub fn probe_driver(
-    base: usize,
-    irq: usize,
-) -> Option<alloc::boxed::Box<dyn crate::drivers::Driver>> {
-    if base == 0 {
-        return None;
+pub fn handle_interrupt(irq: u32) {
+    let guard = DRIVER_GLOBAL.lock();
+    if let Some(drv) = *guard {
+        if drv.irq != 0 && drv.irq != irq {
+            return;
+        }
+        // Acknowledge ISR to clear device-side interrupt status
+        let _ = mmio_read32(drv.base, OFF_ISR);
+        // Actual packet processing happens in the next recv() / send() call.
     }
-    let magic = mmio_read32(base, OFF_MAGIC);
-    if magic != VIRTIO_MAGIC {
-        return None;
+}
+
+// ── Public probe entry-points ─────────────────────────────────────────────────
+
+/// Called from `net::init()` via direct FDT scan (used before driver framework is wired).
+pub fn probe_and_init() -> bool {
+    let dtb_ptr = boot_dtb_ptr();
+    if dtb_ptr == 0 {
+        return false;
     }
-    let q_pa = crate::mm::pmm::alloc_page()?;
-    let qnum = mmio_read32(base, OFF_QUEUE_NUM_MAX);
-    let qsize = if qnum == 0 {
-        256
-    } else {
-        core::cmp::min(qnum, 256)
+    // SAFETY: `dtb_ptr` is the physical address of the DTB passed by OpenSBI
+    // in register a1. It is valid for the entire kernel lifetime and correctly
+    // aligned. The FDT crate only reads from it.
+    let fdt = match unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) } {
+        Ok(f) => f,
+        Err(_) => return false,
     };
-    let drv = VirtioDriver::new(base, q_pa, qsize as usize, irq as u32);
-    drv.reset();
-    drv.negotiate_features();
-    drv.setup_queue0();
-    let leaked: &'static VirtioDriver = alloc::boxed::Box::leak(alloc::boxed::Box::new(drv));
-    unsafe {
-        *DRIVER_GLOBAL.lock() = Some(leaked);
-        crate::net::register_device(leaked);
+
+    for node in fdt.all_nodes() {
+        let Some(comp) = node.property("compatible") else { continue };
+        let Some(s) = comp.as_str() else { continue };
+        if !s.contains("virtio,mmio") {
+            continue;
+        }
+
+        // Parse base address
+        let mut base = node.property("reg").and_then(|p| p.as_usize()).unwrap_or(0);
+        if base == 0 {
+            if let Some(idx) = node.name.rfind('@') {
+                if let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16) {
+                    base = x;
+                }
+            }
+        }
+        if base == 0 {
+            continue;
+        }
+
+        // Validate magic and device type
+        if mmio_read32(base, OFF_MAGIC) != VIRTIO_MAGIC {
+            continue;
+        }
+        if mmio_read32(base, OFF_DEVICE_ID) != VIRTIO_DEVICE_NET {
+            continue;
+        }
+
+        let irq = node.property("interrupts")
+            .and_then(|p| p.as_usize())
+            .unwrap_or(0) as u32;
+
+        if let Some(drv) = init_net_device(base, irq) {
+            println!("virtio-net: initialized at {:#x}, irq={}", base, irq);
+            *DRIVER_GLOBAL.lock() = Some(drv);
+            crate::net::register_device(drv);
+            return true;
+        }
     }
-    // Return a thin wrapper so ACTIVE_DRIVERS holds this driver for interrupt dispatch.
-    Some(alloc::boxed::Box::new(VirtioDriverRef(leaked)))
+    false
+}
+
+/// Called by the driver framework when it finds a virtio,mmio node in the FDT.
+pub fn probe_driver(base: usize, irq: usize) -> Option<Box<dyn crate::drivers::Driver>> {
+    if base == 0 { return None; }
+    if mmio_read32(base, OFF_MAGIC) != VIRTIO_MAGIC { return None; }
+    if mmio_read32(base, OFF_DEVICE_ID) != VIRTIO_DEVICE_NET { return None; }
+
+    let drv = init_net_device(base, irq as u32)?;
+    println!("virtio-net: initialized (driver framework) at {:#x}, irq={}", base, irq);
+    *DRIVER_GLOBAL.lock() = Some(drv);
+    crate::net::register_device(drv);
+    Some(Box::new(VirtioDriverRef(drv)))
+}
+
+// ── Internal helper ───────────────────────────────────────────────────────────
+
+fn init_net_device(base: usize, irq: u32) -> Option<&'static VirtioDriver> {
+    let qsize = {
+        // Read supported queue size; use the smaller of QUEUE_SIZE and device max
+        mmio_write32(base, OFF_QUEUE_SEL, 0);
+        let max0 = mmio_read32(base, OFF_QUEUE_NUM_MAX);
+        if max0 == 0 { QUEUE_SIZE } else { core::cmp::min(max0 as usize, QUEUE_SIZE) }
+    };
+
+    let rx_pa = crate::mm::pmm::alloc_page()?;
+    let tx_pa = crate::mm::pmm::alloc_page()?;
+
+    // SAFETY: `rx_pa` and `tx_pa` are freshly allocated PMM pages exclusively
+    // owned here. PAGE_SIZE bytes are within each allocation.
+    unsafe {
+        core::ptr::write_bytes(rx_pa as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+        core::ptr::write_bytes(tx_pa as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+    }
+
+    let drv = VirtioDriver::new(base, rx_pa, tx_pa, qsize, irq);
+    drv.init_device(rx_pa, tx_pa, qsize);
+
+    Some(Box::leak(Box::new(drv)))
 }
 
 struct VirtioDriverRef(&'static VirtioDriver);
 unsafe impl Send for VirtioDriverRef {}
 unsafe impl Sync for VirtioDriverRef {}
-
 impl crate::drivers::Driver for VirtioDriverRef {
-    fn on_interrupt(&self, irq: usize) {
-        self.0.on_interrupt(irq);
-    }
+    fn on_interrupt(&self, irq: usize) { self.0.on_interrupt(irq); }
 }
 
-/// API used by kernel sys_net_recv to retrieve a pending received buffer if any.
+fn boot_dtb_ptr() -> usize {
+    crate::boot_dtb_ptr()
+}
+
+/// Kernel API: dequeue one raw received frame (called by sys_net_recv).
 pub fn try_dequeue_rx(buf: &mut [u8]) -> Option<usize> {
-    let mut rx = RX_QUEUE.lock();
-    if rx.is_empty() {
-        return None;
-    }
-    let (pa, len) = rx.remove(0);
-    // Copy from PA into buf
-    let src = pa as *const u8;
-    let to_copy = core::cmp::min(buf.len(), len as usize);
-    unsafe {
-        core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), to_copy);
-    }
-    // Free the physical page back to PMM
-    crate::mm::pmm::free_page(pa);
-    Some(to_copy)
+    let guard = DRIVER_GLOBAL.lock();
+    let drv = (*guard)?;
+    let n = drv.recv(buf);
+    if n > 0 { Some(n) } else { None }
 }

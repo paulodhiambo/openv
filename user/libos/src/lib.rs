@@ -29,7 +29,11 @@ global_asm!(
     .section .text._start
     .global _start
     _start:
+        mv s0, a0
+        mv s1, a1
         call libos_init
+        mv a0, s0
+        mv a1, s1
         call main
         mv a0, zero
         call exit
@@ -77,6 +81,7 @@ pub extern "C" fn sys_yield() {
 #[unsafe(no_mangle)]
 pub extern "C" fn exit(status: i32) -> ! {
     syscall(1, status as usize, 0, 0);
+    #[allow(clippy::empty_loop)]
     loop {}
 }
 
@@ -246,6 +251,11 @@ pub extern "C" fn recv(fd: i32, buf: *mut u8, len: usize, _flags: i32) -> isize 
     syscall(48, fd as usize, buf as usize, len) as isize
 }
 
+/// Non-blocking channel read. Returns bytes read, or 0 if no message is pending. Never sleeps.
+pub fn try_recv(fd: usize, buf: *mut u8, len: usize) -> isize {
+    syscall(49, fd, buf as usize, len) as isize
+}
+
 /// Return the PID of the calling process.
 pub fn getpid() -> i32 {
     syscall(53, 0, 0, 0) as i32
@@ -274,6 +284,12 @@ pub fn dup(fd: i32) -> i32 {
 /// Duplicate `oldfd` to `newfd`, closing `newfd` first.  Returns `newfd` or -1.
 pub fn dup2(oldfd: i32, newfd: i32) -> i32 {
     syscall(58, oldfd as usize, newfd as usize, 0) as i32
+}
+
+/// Register `pid` as the current foreground process for Ctrl+C delivery.
+/// Pass -1 to clear (no foreground process).
+pub fn set_fg_pid(pid: i32) {
+    syscall(60, pid as usize, 0, 0);
 }
 
 #[panic_handler]
@@ -349,7 +365,20 @@ pub fn fork() -> i32 {
 /// Replace the current process image with the binary at `path`.
 /// Returns -1 on error (does not return on success).
 pub fn exec(path: &[u8]) -> i32 {
-    syscall(51, path.as_ptr() as usize, path.len(), 0) as i32
+    syscall4(51, path.as_ptr() as usize, path.len(), 0, 0) as i32
+}
+
+/// Replace the current process image, passing `argv_buf` (packed null-terminated strings)
+/// as the argument vector.  `argv_buf` format: `"arg0\0arg1\0...argN\0"`.
+/// Returns -1 on error (does not return on success).
+pub fn exec_args(path: &[u8], argv_buf: &[u8]) -> i32 {
+    syscall4(
+        51,
+        path.as_ptr() as usize,
+        path.len(),
+        argv_buf.as_ptr() as usize,
+        argv_buf.len(),
+    ) as i32
 }
 
 /// Wait for a child process to change state. If target_pid == -1, waits for any child.

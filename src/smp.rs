@@ -25,6 +25,7 @@ pub fn start_secondaries() {
 }
 
 #[unsafe(no_mangle)]
+#[allow(unreachable_code)]
 pub extern "C" fn secondary_kmain(hartid: usize, _dtb_ptr: usize) -> ! {
     crate::println!("HART {} online", hartid);
     crate::trap::init_hart();
@@ -33,12 +34,16 @@ pub extern "C" fn secondary_kmain(hartid: usize, _dtb_ptr: usize) -> ! {
     unsafe { __halt_cpu() }
 }
 
-pub fn send_ipi_all_except_self() {
-    let self_hart: usize;
+pub fn current_hartid() -> usize {
+    let tp: usize;
     unsafe {
-        core::arch::asm!("mv {}, tp", out(reg) self_hart, options(nomem, nostack));
+        core::arch::asm!("mv {}, tp", out(reg) tp, options(nomem, nostack));
     }
-    let self_hart = self_hart.min(MAX_HARTS - 1);
+    tp.min(MAX_HARTS - 1)
+}
+
+pub fn send_ipi_all_except_self() {
+    let self_hart = current_hartid();
     let mut mask: usize = 0;
     for i in 0..MAX_HARTS {
         if i != self_hart {

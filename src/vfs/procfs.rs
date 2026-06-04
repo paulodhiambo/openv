@@ -124,7 +124,7 @@ impl ProcPidStatus {
             append_u32(&mut s, self.pid as u32);
             s.push('\n');
             s.push_str("PPid:\t");
-            append_u32(&mut s, proc.ppid as u32);
+            append_u32(&mut s, proc.ppid.load(core::sync::atomic::Ordering::Relaxed) as u32);
             s.push('\n');
             s.push_str("State:\t");
             s.push_str(state_str);

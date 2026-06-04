@@ -4,7 +4,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cmp::min;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 pub struct MemFile {
     data: Mutex<Vec<u8>>,

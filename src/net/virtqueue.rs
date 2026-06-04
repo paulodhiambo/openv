@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -22,14 +22,16 @@ pub struct UsedElem {
     pub len: u32,
 }
 
+#[allow(dead_code)]
 pub struct VirtQueue {
     pub size: usize,
     desc: *mut Descriptor,
     avail_flags: *mut u16,
     avail_idx: *mut u16,
     avail_ring: *mut u16,
-    used_flags: *mut u32,
-    used_idx: *mut u32,
+    // Used ring: flags and idx are u16 (not u32) per the virtio spec.
+    used_flags: *mut u16,
+    used_idx: *mut u16,
     used_ring: *mut UsedElem,
     free_list: Mutex<Vec<u16>>,
     last_used_idx: u32,
@@ -56,13 +58,16 @@ impl VirtQueue {
         let avail_ptr = (page_pa + avail_offset) as *mut u16;
 
         // avail header: flags(at avail_ptr[0]), idx(at avail_ptr[1])
+        // SAFETY: `avail_ptr` is aligned to 2 bytes (avail_offset is 2-aligned).
+        // Adding 2 u16 elements (flags + idx) stays within the allocated page.
         let avail_ring_ptr = unsafe { avail_ptr.add(2) };
         let avail_ring_bytes = size * core::mem::size_of::<u16>();
         let used_offset = avail_offset + 2 * 2 + avail_ring_bytes; // flags+idx (2*2 bytes) + ring
         // align used_offset to 4
         let used_offset = (used_offset + 3) & !3;
-        let used_ptr = (page_pa + used_offset) as *mut u32; // flags and idx are u32 each
-        let used_ring_ptr = unsafe { (page_pa + used_offset + 8) as *mut UsedElem };
+        // used ring: u16 flags + u16 idx (4 bytes total header), then UsedElem array
+        let used_ptr = (page_pa + used_offset) as *mut u16;
+        let used_ring_ptr = (page_pa + used_offset + 4) as *mut UsedElem;
 
         // Initialize free list
         let mut free = Vec::new();
@@ -74,10 +79,14 @@ impl VirtQueue {
             size,
             desc: desc_ptr,
             avail_flags: avail_ptr,
+            // SAFETY: `avail_ptr` points into a PMM-allocated page; adding 1
+            // u16 (2 bytes) gives the `avail_idx` field, still within the page.
             avail_idx: unsafe { avail_ptr.add(1) },
             avail_ring: avail_ring_ptr,
             used_flags: used_ptr,
-            used_idx: unsafe { used_ptr.add(1) },
+            // SAFETY: `used_ptr` points into the same PMM page; adding 1 u16
+            // (2 bytes) gives the `used_idx` field, still within the page.
+            used_idx: unsafe { used_ptr.add(1) }, // offset +2 (one u16)
             used_ring: used_ring_ptr,
             free_list: Mutex::new(free),
             last_used_idx: 0,
@@ -86,6 +95,8 @@ impl VirtQueue {
 
     /// Return the descriptor's physical address for a given descriptor index.
     pub fn desc_addr(&self, idx: u16) -> u64 {
+        // SAFETY: `self.desc` points to the descriptor table of a PMM-allocated
+        // virtqueue page. `idx` is always a valid free-list index (0..size).
         unsafe { (*self.desc.add(idx as usize)).addr }
     }
 
@@ -97,15 +108,17 @@ impl VirtQueue {
             return Err(());
         }
 
-        // Allocate descriptor indices
-        let mut ids: Vec<u16> = Vec::new();
+        let mut ids = alloc::vec::Vec::with_capacity(buffers.len());
         for _ in 0..buffers.len() {
-            ids.push(free.pop().unwrap());
+            // INVARIANT: we already verified free.len() >= buffers.len() above.
+            ids.push(free.pop().unwrap_or(0));
         }
 
         // Populate descriptors
         for (i, &(pa, len, write)) in buffers.iter().enumerate() {
             let idx = ids[i] as usize;
+            // SAFETY: `idx` was just popped from the free-list and is within
+            // [0, size), so `self.desc.add(idx)` is a valid Descriptor slot.
             unsafe {
                 let d = &mut *self.desc.add(idx);
                 d.addr = pa;
@@ -121,6 +134,9 @@ impl VirtQueue {
         }
 
         // Place head index into avail ring
+        // SAFETY: `self.avail_idx` and `self.avail_ring` point into the
+        // virtqueue page. All accesses are volatile so the device's DMA view
+        // stays consistent. ring_pos is always < self.size.
         let avail_i = unsafe { read_volatile(self.avail_idx) } as usize;
         let ring_pos = avail_i % self.size;
         unsafe {
@@ -146,9 +162,14 @@ impl VirtQueue {
         // Ensure we observe device writes
         fence(Ordering::Acquire);
         let mut out = Vec::new();
+        // used_idx is u16; compare as u16 to handle wrapping at 65536.
+        // SAFETY: `self.used_idx` points into the virtqueue page; volatile read
+        // ensures we observe the device's DMA write of the completion index.
         let used_i = unsafe { read_volatile(self.used_idx) };
-        while self.last_used_idx as u32 != used_i {
+        while self.last_used_idx as u16 != used_i {
             let idx = (self.last_used_idx as usize) % self.size;
+            // SAFETY: `idx` is within [0, size), and used_ring points to the
+            // used-element array in the virtqueue page.
             let ue = unsafe { &*self.used_ring.add(idx) };
             out.push((ue.id as u16, ue.len));
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
@@ -162,6 +183,8 @@ impl VirtQueue {
         let mut out = Vec::new();
         let mut cur = start;
         loop {
+            // SAFETY: `cur` is a valid descriptor index within [0, size);
+            // read_volatile ensures we see the device's last DMA write.
             let d = unsafe { read_volatile(self.desc.add(cur as usize)) };
             out.push((d.addr, d.len));
             if (d.flags & VIRTQ_DESC_F_NEXT) == 0 {
@@ -178,6 +201,8 @@ impl VirtQueue {
         let mut freed = Vec::new();
         let mut cur = start;
         loop {
+            // SAFETY: `cur` is a valid descriptor index within [0, size);
+            // read_volatile ensures we see the device's last DMA write.
             let d = unsafe { read_volatile(self.desc.add(cur as usize)) };
             freed.push(cur);
             if (d.flags & VIRTQ_DESC_F_NEXT) == 0 {

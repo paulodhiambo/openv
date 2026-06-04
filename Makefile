@@ -1,18 +1,26 @@
 TARGET      := riscv64gc-unknown-none-elf
+NIGHTLY     := $(shell rustup which cargo --toolchain nightly | sed 's|/cargo$$||')
+CARGO       ?= $(NIGHTLY)/cargo
+RUSTC       ?= $(NIGHTLY)/rustc
+export RUSTC
 KERNEL_DIR  := target/$(TARGET)/debug
 KERNEL      := $(KERNEL_DIR)/openv
 KERNEL_REL  := target/$(TARGET)/release/openv
 INITRD      := test_root.tar
 IMG         := openv.img
+DISK_IMG    := disk.img
+DISK_SIZE_MB := 8
 
 # Overridable via env or make args
-BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp
+BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp spin
 QEMU_MEM   ?= 128M
 QEMU_CPUS  ?= 1
 QEMU_FLAGS  = -machine virt -bios default -nographic -m $(QEMU_MEM) -smp $(QEMU_CPUS)
+QEMU_NET    = -netdev user,id=net0 -device virtio-net-device,netdev=net0
+QEMU_DISK   = -drive id=disk0,file=$(DISK_IMG),format=raw,if=none -device virtio-blk-device,drive=disk0
 
 .PHONY: help build build-kernel build-user build-release initrd              \
-        run all debug image image-release                                     \
+        run all debug image image-release disk                                \
         clean clean-user check clippy fmt                                     \
         $(BINS:%=test_root/%)
 
@@ -66,16 +74,16 @@ build-release: build-user-release initrd build-kernel-release
 	@echo 'Release build complete.  Run: make run'
 
 build-kernel:
-	cargo build
+	$(CARGO) build
 
 build-kernel-release:
-	cargo build --release
+	$(CARGO) build --release
 
 build-user:
-	cd user && cargo build
+	cd user && $(CARGO) build
 
 build-user-release:
-	cd user && cargo build --release
+	cd user && $(CARGO) build --release
 
 initrd: test_root/proc test_root/dev
 	@for bin in $(BINS); do \
@@ -96,6 +104,12 @@ test_root/proc test_root/dev:
 
 # ── Run ────────────────────────────────────────────────────────────────────────
 
+disk: $(DISK_IMG)
+
+$(DISK_IMG):
+	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=$(DISK_SIZE_MB) 2>/dev/null
+	@echo '  disk   : $(DISK_IMG) ($(DISK_SIZE_MB) MB)'
+
 run: $(KERNEL) $(INITRD)
 	@echo 'Booting openv...'
 	@echo '  kernel : $(KERNEL)'
@@ -103,11 +117,20 @@ run: $(KERNEL) $(INITRD)
 	@echo '  memory : $(QEMU_MEM)'
 	@echo '  (Ctrl-A X to quit QEMU)'
 	@echo ''
-	qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL)
+	@if [ -f $(DISK_IMG) ]; then \
+	  echo '  disk   : $(DISK_IMG) (persistent OFS)'; \
+	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK); \
+	else \
+	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL); \
+	fi
 
 debug: $(KERNEL) $(INITRD)
 	@echo 'Booting openv with GDB server on :1234...'
-	qemu-system-riscv64 $(QEMU_FLAGS) -initrd $(INITRD) -kernel $(KERNEL) -s -S
+	@if [ -f $(DISK_IMG) ]; then \
+	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK) -s -S; \
+	else \
+	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) -s -S; \
+	fi
 
 # ── Disk image ─────────────────────────────────────────────────────────────────
 
@@ -120,32 +143,32 @@ image-release: $(KERNEL_REL) $(INITRD)
 # ── Quality ────────────────────────────────────────────────────────────────────
 
 check:
-	cargo check
+	$(CARGO) check
 
 clippy:
-	cargo clippy -- -D warnings
+	$(CARGO) clippy -- -D warnings
 
 fmt:
-	cargo fmt
-	cd user && cargo fmt
+	$(CARGO) fmt
+	cd user && $(CARGO) fmt
 
 # ── Clean ──────────────────────────────────────────────────────────────────────
 
 clean:
-	rm -rf openv.img openv.bin
-	cd user && cargo clean
-	cargo clean
+	rm -rf openv.img openv.bin $(DISK_IMG)
+	cd user && $(CARGO) clean
+	$(CARGO) clean
 
 clean-user:
-	cd user && cargo clean
+	cd user && $(CARGO) clean
 
 # ── File dependencies ──────────────────────────────────────────────────────────
 
 $(KERNEL):
-	cargo build
+	$(CARGO) build
 
 $(KERNEL_REL):
-	cargo build --release
+	$(CARGO) build --release
 
 $(INITRD):
 	@cd test_root && test -f ../$(INITRD) || { \

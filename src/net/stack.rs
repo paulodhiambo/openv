@@ -2,7 +2,7 @@ use smoltcp::iface::{Config, Interface, SocketSet};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, IpAddress, Ipv4Address};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium};
-use spin::Mutex;
+use crate::sync::Mutex;
 use alloc::vec::Vec;
 use crate::net::NetDevice;
 

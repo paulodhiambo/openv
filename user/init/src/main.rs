@@ -25,6 +25,12 @@ pub extern "C" fn main() -> ! {
     ok_line(b"Mounting virtual filesystem");
     ok_line(b"Starting UART console");
 
+    // Start the network daemon (runs in background; init reaps it if it exits)
+    let net_pid = spawn(b"/net-smoltcp".as_ptr(), 12);
+    if net_pid > 0 {
+        ok_line(b"Starting network daemon (10.0.2.15/24)");
+    }
+
     // Run fork test
     let ft_pid = spawn(b"/forktest".as_ptr(), 9);
     if ft_pid > 0 {
@@ -78,6 +84,7 @@ fn ok_line(msg: &[u8]) {
     wrt(b"\x1b[32m[ OK ]\x1b[0m\n");
 }
 
+#[allow(dead_code)]
 fn fail_line(msg: &[u8]) {
     wrt(b"  \x1b[2m*\x1b[0m ");
     wrt(msg);
