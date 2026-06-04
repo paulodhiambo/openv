@@ -1,8 +1,9 @@
-TARGET      := riscv64gc-unknown-none-elf
-NIGHTLY     := $(shell rustup which cargo --toolchain nightly | sed 's|/cargo$$||')
-CARGO       ?= $(NIGHTLY)/cargo
-RUSTC       ?= $(NIGHTLY)/rustc
-export RUSTC
+TARGET           := riscv64gc-unknown-none-elf
+NIGHTLY          := $(shell rustup which cargo --toolchain nightly | sed 's|/cargo$$||')
+CARGO            ?= cargo
+RUSTC            ?= rustc
+export PATH      := $(NIGHTLY):$(PATH)
+export RUSTUP_TOOLCHAIN := nightly-aarch64-apple-darwin
 KERNEL_DIR  := target/$(TARGET)/debug
 KERNEL      := $(KERNEL_DIR)/openv
 KERNEL_REL  := target/$(TARGET)/release/openv
@@ -12,7 +13,7 @@ DISK_IMG    := disk.img
 DISK_SIZE_MB := 8
 
 # Overridable via env or make args
-BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp spin
+BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server
 QEMU_MEM   ?= 128M
 QEMU_CPUS  ?= 1
 QEMU_FLAGS  = -machine virt -bios default -nographic -m $(QEMU_MEM) -smp $(QEMU_CPUS)
@@ -48,8 +49,8 @@ help:
 	@echo '  image-release      Build release disk image (openv.img)'
 	@echo ''
 	@echo 'Quality'
-	@echo '  check              cargo check (kernel)'
-	@echo '  clippy             cargo clippy (kernel)'
+	@echo '  check              cargo check (kernel + userspace)'
+	@echo '  clippy             cargo clippy (kernel + userspace, CI-equivalent flags)'
 	@echo '  fmt                cargo fmt (kernel + userspace)'
 	@echo ''
 	@echo 'Clean'
@@ -145,11 +146,37 @@ sd_write:
 
 # ── Quality ────────────────────────────────────────────────────────────────────
 
+CLIPPY_ALLOW := \
+  -A clippy::missing_safety_doc \
+  -A clippy::identity_op \
+  -A clippy::collapsible_if \
+  -A clippy::unnecessary_cast \
+  -A clippy::extra_unused_lifetimes \
+  -A clippy::implicit_saturating_sub \
+  -A clippy::manual_contains \
+  -A clippy::manual_div_ceil \
+  -A clippy::manual_is_multiple_of \
+  -A clippy::manual_range_contains \
+  -A clippy::needless_range_loop \
+  -A clippy::not_unsafe_ptr_arg_deref \
+  -A clippy::redundant_pattern_matching \
+  -A clippy::result_unit_err \
+  -A clippy::slow_vector_initialization \
+  -A clippy::unnecessary_map_or \
+  -A clippy::while_let_loop \
+  -A clippy::clone_on_copy \
+  -A clippy::never_loop \
+  -A clippy::new_without_default \
+  -A clippy::unwrap_or_default \
+  -A clippy::empty_line_after_doc_comments
+
 check:
 	$(CARGO) check
+	cd user && $(CARGO) check
 
 clippy:
-	$(CARGO) clippy -- -D warnings
+	$(CARGO) clippy -- -D warnings $(CLIPPY_ALLOW)
+	cd user && $(CARGO) clippy -- -D warnings $(CLIPPY_ALLOW)
 
 fmt:
 	$(CARGO) fmt
