@@ -1,0 +1,246 @@
+/Users/paul/.rustup/toolchains/nightly-aarch64-apple-darwin/bin/cargo check
+    Checking openv v0.1.0 (/Users/paul/RustroverProjects/openv)
+error[E0425]: cannot find function `current_hart` in module `crate::posix::process`
+    --> src/trap.rs:1534:39
+     |
+1534 |             if crate::posix::process::current_hart() == 0 {
+     |                                       ^^^^^^^^^^^^
+     |
+    ::: src/posix/process.rs:84:1
+     |
+  84 | pub fn current_pid() -> Pid {
+     | --------------------------- similarly named function `current_pid` defined here
+     |
+help: a function with a similar name exists
+     |
+1534 -             if crate::posix::process::current_hart() == 0 {
+1534 +             if crate::posix::process::current_pid() == 0 {
+     |
+
+error[E0425]: cannot find function `current_hart` in module `crate::posix::process`
+    --> src/trap.rs:1612:47
+     |
+1612 |             let hart = crate::posix::process::current_hart();
+     |                                               ^^^^^^^^^^^^
+     |
+    ::: src/posix/process.rs:84:1
+     |
+  84 | pub fn current_pid() -> Pid {
+     | --------------------------- similarly named function `current_pid` defined here
+     |
+help: a function with a similar name exists
+     |
+1612 -             let hart = crate::posix::process::current_hart();
+1612 +             let hart = crate::posix::process::current_pid();
+     |
+
+warning: unused import: `alloc_page`
+ --> src/mm/vmm.rs:1:35
+  |
+1 | use crate::mm::pmm::{alloc_frame, alloc_page};
+  |                                   ^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::net::pktbuf::PktBuf`
+ --> src/net/virtio_net.rs:3:5
+  |
+3 | use crate::net::pktbuf::PktBuf;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::net::pktbuf::PktBuf as _Pkt`
+  --> src/net/virtio_net.rs:49:5
+   |
+49 | use crate::net::pktbuf::PktBuf as _Pkt;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PTE_V`
+ --> src/posix/elf.rs:2:36
+  |
+2 | use crate::mm::vmm::{PTE_R, PTE_U, PTE_V, PTE_W, PTE_X, PageTable};
+  |                                    ^^^^^
+
+warning: unused import: `alloc_page`
+ --> src/posix/spawn.rs:1:35
+  |
+1 | use crate::mm::pmm::{alloc_frame, alloc_page, PAGE_SIZE};
+  |                                   ^^^^^^^^^^
+
+warning: unused imports: `sscratch` and `sstatus`
+ --> src/trap.rs:5:37
+  |
+5 | use riscv::register::{scause, sepc, sscratch, sstatus, stvec};
+  |                                     ^^^^^^^^  ^^^^^^^
+
+warning: unreachable expression
+  --> src/smp.rs:33:5
+   |
+32 |     crate::posix::process::schedule();
+   |     --------------------------------- any code following this expression is unreachable
+33 |     unsafe { __halt_cpu() }
+   |     ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable expression
+   --> src/trap.rs:291:25
+    |
+290 |                         crate::posix::process::schedule();
+    |                         --------------------------------- any code following this expression is unreachable
+291 |                         unsafe { __halt_cpu() }
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:304:21
+    |
+303 |                     crate::posix::process::schedule();
+    |                     --------------------------------- any code following this expression is unreachable
+304 |                     unsafe { __halt_cpu() }
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:412:41
+    |
+411 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+412 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:484:49
+    |
+483 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+484 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:509:45
+    |
+508 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+509 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:531:37
+    |
+530 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+531 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:575:37
+    |
+574 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+575 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:824:29
+    |
+823 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+824 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:973:37
+    |
+972 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+973 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1337:33
+     |
+1336 | ...                   crate::posix::process::schedule();
+     |                       --------------------------------- any code following this expression is unreachable
+1337 | ...                   unsafe { __halt_cpu() }
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1497:21
+     |
+1496 |                     crate::posix::process::schedule();
+     |                     --------------------------------- any code following this expression is unreachable
+1497 |                     unsafe { __halt_cpu() }
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1520:29
+     |
+1519 | ...                   crate::posix::process::schedule();
+     |                       --------------------------------- any code following this expression is unreachable
+1520 | ...                   unsafe { __halt_cpu() }
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1546:29
+     |
+1545 | ...                   crate::posix::process::schedule();
+     |                       --------------------------------- any code following this expression is unreachable
+1546 | ...                   unsafe { __halt_cpu() }
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1597:17
+     |
+1596 |                 crate::posix::process::schedule();
+     |                 --------------------------------- any code following this expression is unreachable
+1597 |                 unsafe { __halt_cpu() }
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1634:17
+     |
+1633 |                 crate::posix::process::schedule();
+     |                 --------------------------------- any code following this expression is unreachable
+1634 |                 unsafe { __halt_cpu() }
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable statement
+   --> src/uart.rs:120:9
+    |
+120 |         $crate::uart::write_str($s)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+    |
+   ::: src/main.rs:211:9
+    |
+211 |         posix::process::schedule();
+    |         -------------------------- any code following this expression is unreachable
+212 |         crate::raw_print!("[HART-ONLY] SCHEDULE RETURNED! Hanging forever...\n");
+    |         ------------------------------------------------------------------------ in this macro invocation
+    |
+    = note: this warning originates in the macro `crate::raw_print` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unreachable statement
+   --> src/uart.rs:120:9
+    |
+120 |         $crate::uart::write_str($s)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+    |
+   ::: src/main.rs:217:9
+    |
+217 |         posix::process::schedule();
+    |         -------------------------- any code following this expression is unreachable
+218 |         crate::raw_print!("[HART-ONLY] SCHEDULE RETURNED (fallback)! Hanging forever...\n");
+    |         ----------------------------------------------------------------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `crate::raw_print` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `waker`
+ --> src/posix/wait.rs:9:5
+  |
+9 |     waker: &Waker,
+  |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_waker`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `openv` (bin "openv") generated 25 warnings
+error: could not compile `openv` (bin "openv") due to 2 previous errors; 25 warnings emitted
+make: *** [check] Error 101

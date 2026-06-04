@@ -1,0 +1,656 @@
+cd user && /Users/paul/.rustup/toolchains/nightly-aarch64-apple-darwin/bin/cargo build
+warning: the `#![no_std]` attribute can only be used at the crate root
+ --> libos/src/smoltcp_device.rs:1:1
+  |
+1 | #![no_std]
+  | ^^^^^^^^^^
+  |
+  = help: the crate root is at `libos/src/lib.rs`
+  = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: `libos` (lib) generated 1 warning
+warning: the `#![no_std]` attribute can only be used at the crate root
+ --> net-smoltcp/src/device.rs:1:1
+  |
+1 | #![no_std]
+  | ^^^^^^^^^^
+  |
+  = help: the crate root is at `net-smoltcp/src/main.rs`
+  = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: creating a shared reference to mutable static
+  --> net-smoltcp/src/allocator.rs:14:26
+   |
+14 |         let heap_start = HEAP_SPACE.as_ptr() as usize;
+   |                          ^^^^^^^^^^^^^^^^^^^ shared reference to mutable static
+   |
+   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+   = note: `#[warn(static_mut_refs)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning: creating a shared reference to mutable static
+  --> net-smoltcp/src/allocator.rs:15:25
+   |
+15 |         let heap_size = HEAP_SPACE.len();
+   |                         ^^^^^^^^^^^^^^^^ shared reference to mutable static
+   |
+   = note: shared references to mutable statics are dangerous; it's undefined behavior if the static is mutated or if a mutable reference is created for it while the shared reference lives
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/static-mut-references.html>
+
+warning: unused imports: `exit` and `sys_yield`
+ --> consumer/src/main.rs:4:13
+  |
+4 | use libos::{exit, read, sys_yield, write};
+  |             ^^^^        ^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `exit`
+ --> ls/src/main.rs:4:13
+  |
+4 | use libos::{exit, getdents, write};
+  |             ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `fail_line` is never used
+  --> init/src/main.rs:87:4
+   |
+87 | fn fail_line(msg: &[u8]) {
+   |    ^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `exit`
+ --> producer/src/main.rs:4:20
+  |
+4 | use libos::{close, exit, open, read, sys_yield, write};
+  |                    ^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning[E0133]: dereference of raw pointer is unsafe and requires unsafe block
+  --> cat/src/main.rs:46:11
+   |
+46 |     while *ptr.add(len) != 0 {
+   |           ^^^^^^^^^^^^^ dereference of raw pointer
+   |
+   = note: raw pointers may be null, dangling or unaligned; they can violate aliasing rules and cause data races: all of these are undefined behavior
+note: an unsafe function restricts its caller, but its body is safe by default
+  --> cat/src/main.rs:44:1
+   |
+44 | unsafe fn cstr_slice(ptr: *const u8) -> &'static [u8] {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+   = note: `#[warn(unsafe_op_in_unsafe_fn)]` (part of `#[warn(rust_2024_compatibility)]`) on by default
+
+warning[E0133]: call to unsafe function `core::ptr::const_ptr::<impl *const T>::add` is unsafe and requires unsafe block
+  --> cat/src/main.rs:46:12
+   |
+46 |     while *ptr.add(len) != 0 {
+   |            ^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+warning[E0133]: call to unsafe function `core::slice::from_raw_parts` is unsafe and requires unsafe block
+  --> cat/src/main.rs:49:5
+   |
+49 |     core::slice::from_raw_parts(ptr, len)
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior
+   = note: for more information, see <https://doc.rust-lang.org/edition-guide/rust-2024/unsafe-op-in-unsafe-fn.html>
+
+For more information about this error, try `rustc --explain E0133`.
+warning: `net-smoltcp` (bin "net-smoltcp") generated 3 warnings
+warning: `consumer` (bin "consumer") generated 1 warning (run `cargo fix --bin "consumer" -p consumer` to apply 1 suggestion)
+warning: `ls` (bin "ls") generated 1 warning (run `cargo fix --bin "ls" -p ls` to apply 1 suggestion)
+warning: `init` (bin "init") generated 1 warning
+warning: `producer` (bin "producer") generated 1 warning (run `cargo fix --bin "producer" -p producer` to apply 1 suggestion)
+warning: `cat` (bin "cat") generated 3 warnings (run `cargo fix --bin "cat" -p cat` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.30s
+  initrd: copied init
+  initrd: copied sh
+  initrd: copied ls
+  initrd: copied cat
+  initrd: copied hello
+  initrd: copied producer
+  initrd: copied consumer
+  initrd: copied doexec
+  initrd: copied forktest
+  initrd: copied net-smoltcp
+  initrd: copied spin
+  initrd: test_root.tar (size:  40M)
+/Users/paul/.rustup/toolchains/nightly-aarch64-apple-darwin/bin/cargo build
+   Compiling openv v0.1.0 (/Users/paul/RustroverProjects/openv)
+error[E0425]: cannot find value `next_parent_pa` in this scope
+   --> src/mm/vmm.rs:116:38
+    |
+116 |                 unsafe { clone_level(next_parent_pa, next_child_pa, level - 1)? };
+    |                                      ^^^^^^^^^^^^^^ not found in this scope
+
+warning: unused import: `crate::net::pktbuf::PktBuf`
+ --> src/net/virtio_net.rs:3:5
+  |
+3 | use crate::net::pktbuf::PktBuf;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::net::pktbuf::PktBuf as _Pkt`
+  --> src/net/virtio_net.rs:49:5
+   |
+49 | use crate::net::pktbuf::PktBuf as _Pkt;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PTE_V`
+ --> src/posix/elf.rs:2:36
+  |
+2 | use crate::mm::vmm::{PTE_R, PTE_U, PTE_V, PTE_W, PTE_X, PageTable};
+  |                                    ^^^^^
+
+warning: unused imports: `sscratch` and `sstatus`
+ --> src/trap.rs:5:37
+  |
+5 | use riscv::register::{scause, sepc, sscratch, sstatus, stvec};
+  |                                     ^^^^^^^^  ^^^^^^^
+
+error[E0308]: mismatched types
+   --> src/block/virtio_blk.rs:59:43
+    |
+ 59 |                 crate::mm::pmm::free_page(hdr_pa);
+    |                 ------------------------- ^^^^^^ expected `usize`, found `PhysFrame`
+    |                 |
+    |                 arguments to this function are incorrect
+    |
+note: function defined here
+   --> src/mm/pmm.rs:164:8
+    |
+164 | pub fn free_page(page: usize) {
+    |        ^^^^^^^^^ -----------
+
+error[E0308]: mismatched types
+   --> src/block/virtio_blk.rs:83:47
+    |
+ 83 |                     crate::mm::pmm::free_page(hdr_pa);
+    |                     ------------------------- ^^^^^^ expected `usize`, found `PhysFrame`
+    |                     |
+    |                     arguments to this function are incorrect
+    |
+note: function defined here
+   --> src/mm/pmm.rs:164:8
+    |
+164 | pub fn free_page(page: usize) {
+    |        ^^^^^^^^^ -----------
+
+error[E0308]: mismatched types
+   --> src/block/virtio_blk.rs:84:47
+    |
+ 84 |                     crate::mm::pmm::free_page(stat_pa);
+    |                     ------------------------- ^^^^^^^ expected `usize`, found `PhysFrame`
+    |                     |
+    |                     arguments to this function are incorrect
+    |
+note: function defined here
+   --> src/mm/pmm.rs:164:8
+    |
+164 | pub fn free_page(page: usize) {
+    |        ^^^^^^^^^ -----------
+
+error[E0308]: mismatched types
+   --> src/block/virtio_blk.rs:107:35
+    |
+107 |         crate::mm::pmm::free_page(hdr_pa);
+    |         ------------------------- ^^^^^^ expected `usize`, found `PhysFrame`
+    |         |
+    |         arguments to this function are incorrect
+    |
+note: function defined here
+   --> src/mm/pmm.rs:164:8
+    |
+164 | pub fn free_page(page: usize) {
+    |        ^^^^^^^^^ -----------
+
+error[E0308]: mismatched types
+   --> src/block/virtio_blk.rs:108:35
+    |
+108 |         crate::mm::pmm::free_page(stat_pa);
+    |         ------------------------- ^^^^^^^ expected `usize`, found `PhysFrame`
+    |         |
+    |         arguments to this function are incorrect
+    |
+note: function defined here
+   --> src/mm/pmm.rs:164:8
+    |
+164 | pub fn free_page(page: usize) {
+    |        ^^^^^^^^^ -----------
+
+error[E0605]: non-primitive cast: `PhysFrame` as `*mut BlkReqHeader`
+  --> src/block/virtio_blk.rs:65:23
+   |
+65 |             let hdr = hdr_pa as *mut BlkReqHeader;
+   |                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `PhysFrame` as `*mut u8`
+  --> src/block/virtio_blk.rs:69:14
+   |
+69 |             *(stat_pa as *mut u8) = 0xFF;
+   |              ^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `PhysFrame` as `u64`
+  --> src/block/virtio_blk.rs:73:14
+   |
+73 |             (hdr_pa as u64, core::mem::size_of::<BlkReqHeader>() as u32, false),
+   |              ^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `PhysFrame` as `u64`
+  --> src/block/virtio_blk.rs:75:14
+   |
+75 |             (stat_pa as u64, 1, true),
+   |              ^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `PhysFrame` as `*const u8`
+   --> src/block/virtio_blk.rs:106:35
+    |
+106 |         let ok_status = unsafe { *(stat_pa as *const u8) };
+    |                                   ^^^^^^^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0369]: no implementation for `PhysFrame >> {integer}`
+   --> src/block/virtio_blk.rs:163:52
+    |
+163 |     VirtioBlk::mmio_w32(base, OFF_QUEUE_PFN, (q_pa >> 12) as u32);
+    |                                               ---- ^^ -- {integer}
+    |                                               |
+    |                                               PhysFrame
+    |
+note: an implementation of `Shr<{integer}>` might be missing for `PhysFrame`
+   --> src/mm/pmm.rs:38:1
+    |
+ 38 | pub struct PhysFrame(pub usize);
+    | ^^^^^^^^^^^^^^^^^^^^ must implement `Shr<{integer}>`
+note: the trait `Shr` must be implemented
+   --> /Users/paul/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/bit.rs:584:1
+    |
+584 | pub const trait Shr<Rhs = Self> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+   --> src/block/virtio_blk.rs:168:39
+    |
+168 |         vq: Mutex::new(VirtQueue::new(q_pa, qsize)),
+    |                        -------------- ^^^^ expected `usize`, found `PhysFrame`
+    |                        |
+    |                        arguments to this function are incorrect
+    |
+note: associated function defined here
+   --> src/net/virtqueue.rs:49:12
+    |
+ 49 |     pub fn new(page_pa: usize, size: usize) -> Self {
+    |            ^^^ --------------
+
+error[E0605]: non-primitive cast: `PhysFrame` as `*mut u8`
+   --> src/block/virtio_blk.rs:160:37
+    |
+160 |     unsafe { core::ptr::write_bytes(q_pa as *mut u8, 0, 4096) };
+    |                                     ^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0308]: mismatched types
+  --> src/mm/heap.rs:24:33
+   |
+18 |     let mut seg_start = 0;
+   |                         - expected due to this value
+...
+24 |                     seg_start = pa;
+   |                                 ^^ expected integer, found `PhysFrame`
+
+error[E0308]: mismatched types
+  --> src/mm/heap.rs:26:51
+   |
+26 |                 Some(prev) if prev + PAGE_SIZE != pa => {
+   |                               ----------------    ^^ expected `usize`, found `PhysFrame`
+   |                               |
+   |                               expected because this is `usize`
+
+error[E0308]: mismatched types
+  --> src/mm/heap.rs:33:33
+   |
+18 |     let mut seg_start = 0;
+   |                         - expected due to this value
+...
+33 |                     seg_start = pa;
+   |                                 ^^ expected `usize`, found `PhysFrame`
+
+error[E0308]: mismatched types
+   --> src/mm/heap.rs:37:28
+    |
+ 37 |             prev_pa = Some(pa);
+    |                       ---- ^^ expected `usize`, found `PhysFrame`
+    |                       |
+    |                       arguments to this enum variant are incorrect
+    |
+help: the type constructed contains `PhysFrame` due to the type of the argument passed
+   --> src/mm/heap.rs:37:23
+    |
+ 37 |             prev_pa = Some(pa);
+    |                       ^^^^^--^
+    |                            |
+    |                            this argument influences the type of `Some`
+note: tuple variant defined here
+   --> /Users/paul/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/option.rs:605:5
+    |
+605 |     Some(#[stable(feature = "rust1", since = "1.0.0")] T),
+    |     ^^^^
+
+error[E0308]: mismatched types
+   --> src/mm/vmo.rs:22:31
+    |
+ 22 |                     free_page(p);
+    |                     --------- ^ expected `usize`, found `PhysFrame`
+    |                     |
+    |                     arguments to this function are incorrect
+    |
+note: function defined here
+   --> src/mm/pmm.rs:164:8
+    |
+164 | pub fn free_page(page: usize) {
+    |        ^^^^^^^^^ -----------
+
+error[E0308]: mismatched types
+  --> src/mm/vmo.rs:30:29
+   |
+18 |                 pages.push(page);
+   |                 -----      ---- this argument has type `PhysFrame`...
+   |                 |
+   |                 ... which causes `pages` to have type `Vec<PhysFrame>`
+...
+30 |             physical_pages: pages,
+   |                             ^^^^^ expected `Vec<usize>`, found `Vec<PhysFrame>`
+   |
+   = note: expected struct `Vec<usize>`
+              found struct `Vec<PhysFrame>`
+
+error[E0605]: non-primitive cast: `PhysFrame` as `u64`
+   --> src/net/virtio_mmio.rs:121:60
+    |
+121 |                 let _ = self.rx_vq.lock().enqueue_chain(&[(pa as u64, 4096, true)]);
+    |                                                            ^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0308]: mismatched types
+   --> src/net/virtio_mmio.rs:176:39
+    |
+176 |             crate::mm::pmm::free_page(pa);
+    |             ------------------------- ^^ expected `usize`, found `PhysFrame`
+    |             |
+    |             arguments to this function are incorrect
+    |
+note: function defined here
+   --> src/mm/pmm.rs:164:8
+    |
+164 | pub fn free_page(page: usize) {
+    |        ^^^^^^^^^ -----------
+
+error[E0605]: non-primitive cast: `PhysFrame` as `*mut u8`
+   --> src/net/virtio_mmio.rs:164:23
+    |
+164 |             let ptr = pa as *mut u8;
+    |                       ^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `PhysFrame` as `u64`
+   --> src/net/virtio_mmio.rs:171:31
+    |
+171 |             .enqueue_chain(&[(pa as u64, total as u32, false)])
+    |                               ^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0308]: arguments to this function are incorrect
+   --> src/net/virtio_mmio.rs:331:15
+    |
+331 |     let drv = VirtioDriver::new(base, rx_pa, tx_pa, qsize, irq);
+    |               ^^^^^^^^^^^^^^^^^       -----  ----- expected `usize`, found `PhysFrame`
+    |                                       |
+    |                                       expected `usize`, found `PhysFrame`
+    |
+note: associated function defined here
+   --> src/net/virtio_mmio.rs:81:8
+    |
+ 81 |     fn new(base: usize, rx_pa: usize, tx_pa: usize, qsize: usize, irq: u32) -> Self {
+    |        ^^^              ------------  ------------
+
+error[E0308]: arguments to this method are incorrect
+   --> src/net/virtio_mmio.rs:332:9
+    |
+332 |     drv.init_device(rx_pa, tx_pa, qsize);
+    |         ^^^^^^^^^^^ -----  ----- expected `usize`, found `PhysFrame`
+    |                     |
+    |                     expected `usize`, found `PhysFrame`
+    |
+note: method defined here
+   --> src/net/virtio_mmio.rs:101:8
+    |
+101 |     fn init_device(&self, rx_pa: usize, tx_pa: usize, qsize: usize) {
+    |        ^^^^^^^^^^^        ------------  ------------
+
+error[E0605]: non-primitive cast: `PhysFrame` as `*mut u8`
+   --> src/net/virtio_mmio.rs:327:32
+    |
+327 |         core::ptr::write_bytes(rx_pa as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+    |                                ^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0605]: non-primitive cast: `PhysFrame` as `*mut u8`
+   --> src/net/virtio_mmio.rs:328:32
+    |
+328 |         core::ptr::write_bytes(tx_pa as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
+    |                                ^^^^^^^^^^^^^^^^ an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object
+
+error[E0369]: cannot add `usize` to `PhysFrame`
+   --> src/posix/elf.rs:118:46
+    |
+118 | ...                   let pa_ptr = (pa + page_offset) as *mut u8;
+    |                                     -- ^ ----------- usize
+    |                                     |
+    |                                     PhysFrame
+    |
+note: an implementation of `Add<usize>` might be missing for `PhysFrame`
+   --> src/mm/pmm.rs:38:1
+    |
+ 38 | pub struct PhysFrame(pub usize);
+    | ^^^^^^^^^^^^^^^^^^^^ must implement `Add<usize>`
+note: the trait `Add` must be implemented
+   --> /Users/paul/.rustup/toolchains/nightly-aarch64-apple-darwin/lib/rustlib/src/rust/library/core/src/ops/arith.rs:76:1
+    |
+ 76 | pub const trait Add<Rhs = Self> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0308]: mismatched types
+   --> src/posix/elf.rs:128:41
+    |
+128 |                 page_table.map_page(va, pa, flags)?;
+    |                            --------     ^^ expected `usize`, found `PhysFrame`
+    |                            |
+    |                            arguments to this method are incorrect
+    |
+note: method defined here
+   --> src/mm/vmm.rs:40:12
+    |
+ 40 |     pub fn map_page(&mut self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
+    |            ^^^^^^^^                       ---------
+
+warning: unreachable expression
+  --> src/smp.rs:33:5
+   |
+32 |     crate::posix::process::schedule();
+   |     --------------------------------- any code following this expression is unreachable
+33 |     unsafe { __halt_cpu() }
+   |     ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable expression
+   --> src/trap.rs:291:25
+    |
+290 |                         crate::posix::process::schedule();
+    |                         --------------------------------- any code following this expression is unreachable
+291 |                         unsafe { __halt_cpu() }
+    |                         ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:304:21
+    |
+303 |                     crate::posix::process::schedule();
+    |                     --------------------------------- any code following this expression is unreachable
+304 |                     unsafe { __halt_cpu() }
+    |                     ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:412:41
+    |
+411 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+412 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:484:49
+    |
+483 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+484 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:509:45
+    |
+508 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+509 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:531:37
+    |
+530 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+531 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:575:37
+    |
+574 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+575 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:824:29
+    |
+823 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+824 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+   --> src/trap.rs:973:37
+    |
+972 | ...                   crate::posix::process::schedule();
+    |                       --------------------------------- any code following this expression is unreachable
+973 | ...                   unsafe { __halt_cpu() }
+    |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1337:33
+     |
+1336 | ...                   crate::posix::process::schedule();
+     |                       --------------------------------- any code following this expression is unreachable
+1337 | ...                   unsafe { __halt_cpu() }
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1497:21
+     |
+1496 |                     crate::posix::process::schedule();
+     |                     --------------------------------- any code following this expression is unreachable
+1497 |                     unsafe { __halt_cpu() }
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1520:29
+     |
+1519 | ...                   crate::posix::process::schedule();
+     |                       --------------------------------- any code following this expression is unreachable
+1520 | ...                   unsafe { __halt_cpu() }
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1546:29
+     |
+1545 | ...                   crate::posix::process::schedule();
+     |                       --------------------------------- any code following this expression is unreachable
+1546 | ...                   unsafe { __halt_cpu() }
+     |                       ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1597:17
+     |
+1596 |                 crate::posix::process::schedule();
+     |                 --------------------------------- any code following this expression is unreachable
+1597 |                 unsafe { __halt_cpu() }
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable expression
+    --> src/trap.rs:1634:17
+     |
+1633 |                 crate::posix::process::schedule();
+     |                 --------------------------------- any code following this expression is unreachable
+1634 |                 unsafe { __halt_cpu() }
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^ unreachable expression
+
+warning: unreachable statement
+   --> src/uart.rs:120:9
+    |
+120 |         $crate::uart::write_str($s)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+    |
+   ::: src/main.rs:210:9
+    |
+210 |         posix::process::schedule();
+    |         -------------------------- any code following this expression is unreachable
+211 |         crate::raw_print!("[HART-ONLY] SCHEDULE RETURNED! Hanging forever...\n");
+    |         ------------------------------------------------------------------------ in this macro invocation
+    |
+    = note: this warning originates in the macro `crate::raw_print` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unreachable statement
+   --> src/uart.rs:120:9
+    |
+120 |         $crate::uart::write_str($s)
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+    |
+   ::: src/main.rs:216:9
+    |
+216 |         posix::process::schedule();
+    |         -------------------------- any code following this expression is unreachable
+217 |         crate::raw_print!("[HART-ONLY] SCHEDULE RETURNED (fallback)! Hanging forever...\n");
+    |         ----------------------------------------------------------------------------------- in this macro invocation
+    |
+    = note: this warning originates in the macro `crate::raw_print` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `waker`
+ --> src/posix/wait.rs:9:5
+  |
+9 |     waker: &Waker,
+  |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_waker`
+  |
+  = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `sepc`
+   --> src/trap.rs:269:9
+    |
+269 |     let sepc = sepc::read();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_sepc`
+
+Some errors have detailed explanations: E0308, E0369, E0425, E0605.
+For more information about an error, try `rustc --explain E0308`.
+warning: `openv` (bin "openv") generated 24 warnings
+error: could not compile `openv` (bin "openv") due to 30 previous errors; 24 warnings emitted
+make: *** [build-kernel] Error 101
