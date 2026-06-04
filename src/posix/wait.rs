@@ -6,7 +6,7 @@ use core::task::{Poll, Waker};
 pub fn poll_waitpid(
     ppid: Pid,
     target_pid: Pid,
-    waker: &Waker,
+    _waker: &Waker,
 ) -> Poll<Result<(Pid, i32), &'static str>> {
     let mut table = PROCESS_TABLE.lock();
 

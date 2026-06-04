@@ -43,8 +43,10 @@ fn copy_fd(fd: usize) -> i32 {
 /// Return a byte slice from a null-terminated C string pointer.
 unsafe fn cstr_slice(ptr: *const u8) -> &'static [u8] {
     let mut len = 0;
-    while *ptr.add(len) != 0 {
-        len += 1;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        core::slice::from_raw_parts(ptr, len)
     }
-    core::slice::from_raw_parts(ptr, len)
 }

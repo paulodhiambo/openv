@@ -25,6 +25,7 @@ pub fn start_secondaries() {
 }
 
 #[unsafe(no_mangle)]
+#[allow(unreachable_code)]
 pub extern "C" fn secondary_kmain(hartid: usize, _dtb_ptr: usize) -> ! {
     crate::println!("HART {} online", hartid);
     crate::trap::init_hart();

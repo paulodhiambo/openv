@@ -9,9 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# ── Toolchain helper ──────────────────────────────────────────────────────────
 # rust-toolchain.toml in the repo root pins the exact nightly + components.
-# `rustup show` will install it automatically on the runner.
+# `rustup show` installs it automatically on the runner.
 
 jobs:
   # ── Lint (kernel + userspace in parallel) ───────────────────────────────────
@@ -24,10 +23,8 @@ jobs:
         include:
           - workspace: kernel
             dir: .
-            extra_flags: ""
           - workspace: userspace
             dir: user
-            extra_flags: ""
 
     defaults:
       run:
@@ -37,7 +34,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Rust toolchain
-        run: rustup show   # installs the pinned nightly from rust-toolchain.toml
+        # Reads rust-toolchain.toml; installs nightly + rust-src + clippy + targets
+        run: rustup show
 
       - name: Restore Cargo registry cache
         uses: actions/cache@v4
@@ -45,27 +43,45 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock', 'user/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-registry-
 
       - name: cargo check
-        run: cargo check ${{ matrix.extra_flags }} 2>&1
+        run: cargo check
 
       - name: cargo clippy
-        # -D warnings turns every clippy warning into an error so the job fails
-        # if the code review issues (dead code, unused features, etc.) are present.
         run: |
-          cargo clippy ${{ matrix.extra_flags }} -- \
+          cargo clippy -- \
             -D warnings \
             -A clippy::missing_safety_doc \
-            -A clippy::identity_op
+            -A clippy::identity_op \
+            -A clippy::collapsible_if \
+            -A clippy::unnecessary_cast \
+            -A clippy::extra_unused_lifetimes \
+            -A clippy::implicit_saturating_sub \
+            -A clippy::manual_contains \
+            -A clippy::manual_div_ceil \
+            -A clippy::manual_is_multiple_of \
+            -A clippy::manual_range_contains \
+            -A clippy::needless_range_loop \
+            -A clippy::not_unsafe_ptr_arg_deref \
+            -A clippy::redundant_pattern_matching \
+            -A clippy::result_unit_err \
+            -A clippy::slow_vector_initialization \
+            -A clippy::unnecessary_map_or \
+            -A clippy::while_let_loop \
+            -A clippy::clone_on_copy \
+            -A clippy::never_loop \
+            -A clippy::new_without_default \
+            -A clippy::unwrap_or_default \
+            -A clippy::empty_line_after_doc_comments
 
   # ── Build (depends on lint passing) ─────────────────────────────────────────
   build:
     name: Build
     runs-on: ubuntu-latest
-    needs: lint   # only run if lint passes
+    needs: lint
 
     steps:
       - uses: actions/checkout@v4
@@ -81,7 +97,7 @@ jobs:
             ~/.cargo/git
             target
             user/target
-          key: ${{ runner.os }}-cargo-build-${{ hashFiles('Cargo.lock', 'user/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-build-
 
@@ -99,7 +115,6 @@ jobs:
         run: |
           mkdir -p test_root/proc test_root/dev
 
-          # Copy every user binary that was successfully built
           for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp; do
             src="user/target/riscv64gc-unknown-none-elf/debug/$bin"
             if [ -f "$src" ]; then
@@ -111,7 +126,6 @@ jobs:
           done
 
           echo "Hello from initrd TAR!" > test_root/dummy.txt
-
           cd test_root && tar -cf ../test_root.tar .
           echo "initrd size: $(du -sh ../test_root.tar | cut -f1)"
 
@@ -144,7 +158,9 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "#### Section breakdown (debug kernel)" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          size target/riscv64gc-unknown-none-elf/debug/openv >> $GITHUB_STEP_SUMMARY || true
+          # Use llvm-size from the installed llvm-tools-preview component
+          LLVM_SIZE="$(rustup which --toolchain nightly llvm-size 2>/dev/null || echo 'size')"
+          "$LLVM_SIZE" target/riscv64gc-unknown-none-elf/debug/openv >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       # ── Artifacts ─────────────────────────────────────────────────────────

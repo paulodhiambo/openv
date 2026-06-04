@@ -81,6 +81,7 @@ pub extern "C" fn sys_yield() {
 #[unsafe(no_mangle)]
 pub extern "C" fn exit(status: i32) -> ! {
     syscall(1, status as usize, 0, 0);
+    #[allow(clippy::empty_loop)]
     loop {}
 }
 

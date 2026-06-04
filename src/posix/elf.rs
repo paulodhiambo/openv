@@ -1,5 +1,5 @@
 use crate::mm::pmm::{PAGE_SIZE, alloc_page};
-use crate::mm::vmm::{PTE_R, PTE_U, PTE_V, PTE_W, PTE_X, PageTable};
+use crate::mm::vmm::{PTE_R, PTE_U, PTE_W, PTE_X, PageTable};
 #[repr(C)]
 struct ElfHeader {
     ident: [u8; 16],

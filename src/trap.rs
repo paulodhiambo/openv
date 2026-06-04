@@ -2,7 +2,7 @@ use crate::println;
 use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::sync::atomic::Ordering;
-use riscv::register::{scause, sepc, sscratch, sstatus, stvec};
+use riscv::register::{scause, sepc, stvec};
 
 unsafe extern "C" {
     fn __halt_cpu() -> !;

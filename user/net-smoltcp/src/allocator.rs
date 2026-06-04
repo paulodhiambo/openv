@@ -11,8 +11,8 @@ unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align();
         let size = layout.size();
-        let heap_start = HEAP_SPACE.as_ptr() as usize;
-        let heap_size = HEAP_SPACE.len();
+        let heap_start = core::ptr::addr_of!(HEAP_SPACE) as usize;
+        let heap_size = core::mem::size_of::<[u8; 128 * 1024]>();
 
         loop {
             let cur_off = OFFSET.load(Ordering::SeqCst);

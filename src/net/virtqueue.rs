@@ -22,6 +22,7 @@ pub struct UsedElem {
     pub len: u32,
 }
 
+#[allow(dead_code)]
 pub struct VirtQueue {
     pub size: usize,
     desc: *mut Descriptor,

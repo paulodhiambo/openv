@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![allow(unreachable_code)] // after schedule() -> ! and similar diverging calls
 
 
 extern crate alloc;

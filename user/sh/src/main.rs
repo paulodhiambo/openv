@@ -2,6 +2,7 @@
 #![no_main]
 extern crate alloc;
 
+use alloc::vec;
 use alloc::vec::Vec;
 use libos::{
     chdir, close, create, dup, dup2, exec_args, exit, fork, getdents, mkdir, open, pipe, read,
@@ -95,13 +96,14 @@ struct Shell {
 
 impl Shell {
     fn new() -> Self {
-        let mut env: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        env.push((b"HOME".to_vec(),     b"/".to_vec()));
-        env.push((b"USER".to_vec(),     b"guest".to_vec()));
-        env.push((b"SHELL".to_vec(),    b"/sh".to_vec()));
-        env.push((b"PATH".to_vec(),     b"/".to_vec()));
-        env.push((b"HOSTNAME".to_vec(), b"openv".to_vec()));
-        env.push((b"PWD".to_vec(),      b"/".to_vec()));
+        let env: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"HOME".to_vec(),     b"/".to_vec()),
+            (b"USER".to_vec(),     b"guest".to_vec()),
+            (b"SHELL".to_vec(),    b"/sh".to_vec()),
+            (b"PATH".to_vec(),     b"/".to_vec()),
+            (b"HOSTNAME".to_vec(), b"openv".to_vec()),
+            (b"PWD".to_vec(),      b"/".to_vec()),
+        ];
         Shell {
             cwd: b"/".to_vec(),
             history: Vec::new(),
@@ -581,9 +583,7 @@ impl Shell {
                     if !cur.is_empty() {
                         tokens.push(core::mem::take(&mut cur));
                     }
-                    let mut tok = Vec::new();
-                    tok.push(b);
-                    tokens.push(tok);
+                    tokens.push(vec![b]);
                     i += 1;
                 }
                 b'>' => {

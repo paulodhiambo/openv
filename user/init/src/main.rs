@@ -84,6 +84,7 @@ fn ok_line(msg: &[u8]) {
     wrt(b"\x1b[32m[ OK ]\x1b[0m\n");
 }
 
+#[allow(dead_code)]
 fn fail_line(msg: &[u8]) {
     wrt(b"  \x1b[2m*\x1b[0m ");
     wrt(msg);

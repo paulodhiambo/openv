@@ -20,6 +20,7 @@ pub struct EndpointState {
 
 /// A ChannelEndpoint represents one side of a bidirectional channel.
 pub struct ChannelEndpoint {
+    #[allow(dead_code)]
     koid: Koid,
     state: Mutex<EndpointState>,
     peer: Mutex<Weak<ChannelEndpoint>>,

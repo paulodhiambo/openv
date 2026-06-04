@@ -1,5 +1,3 @@
-#![no_std]
-
 use libos::smoltcp_device;
 
 pub struct SmolDevice {

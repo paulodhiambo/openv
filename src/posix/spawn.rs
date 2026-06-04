@@ -1,9 +1,8 @@
-use crate::mm::pmm::{alloc_frame, alloc_page, PAGE_SIZE};
+use crate::mm::pmm::{alloc_frame, PAGE_SIZE};
 use crate::mm::vmm::{PTE_R, PTE_U, PTE_W};
 use crate::posix::elf::load_elf;
 use crate::posix::process::{PROCESS_TABLE, Pid, Process};
 use crate::vfs::lookup_path;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 

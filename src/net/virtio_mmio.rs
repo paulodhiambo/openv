@@ -18,7 +18,9 @@ static DRIVER_GLOBAL: Mutex<Option<&'static VirtioDriver>> = Mutex::new(None);
 
 // ── MMIO register offsets (legacy spec) ──────────────────────────────────────
 
+#[allow(dead_code)]
 const OFF_MAGIC: usize          = 0x000;
+#[allow(dead_code)]
 const OFF_VERSION: usize        = 0x004;
 const OFF_DEVICE_ID: usize      = 0x008;
 const OFF_DEVICE_FEATURES: usize = 0x010;

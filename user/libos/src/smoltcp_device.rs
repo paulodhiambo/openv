@@ -1,5 +1,3 @@
-#![no_std]
-
 use crate::syscall as syscall_fn;
 
 /// Send a raw Ethernet frame via kernel net_send syscall (10).

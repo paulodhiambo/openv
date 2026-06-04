@@ -1,4 +1,4 @@
-use crate::mm::pmm::{alloc_frame, alloc_page};
+use crate::mm::pmm::alloc_frame;
 use crate::println;
 use core::arch::asm;
 use riscv::register::satp;

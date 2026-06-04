@@ -1,6 +1,5 @@
 // Minimal virtio-net driver skeleton. For M1 this provides a loopback device
 use crate::net::NetDevice;
-use crate::net::pktbuf::PktBuf;
 
 pub struct LoopbackNet;
 
@@ -46,7 +45,6 @@ impl NetDevice for LoopbackNet {
     }
 }
 
-use crate::net::pktbuf::PktBuf as _Pkt;
 use crate::sync::Mutex;
 
 struct StaticPkt {
