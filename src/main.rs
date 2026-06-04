@@ -53,23 +53,10 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     unsafe {
         BOOT_DTB_PTR = dtb_ptr;
     }
-    // Raw UART test: manually write "hartid=N" bypassing fmt
-    {
-        let mut u = uart::Uart::new();
-        for &b in b"hartid=" {
-            u.put_char(b);
-        }
-        u.put_char(b'0' + hartid as u8);
-        u.put_char(b'\r');
-        u.put_char(b'\n');
-    }
-    // Test raw put_char after initialization
-    {
-        let mut u = uart::Uart::new();
-        for &b in b"RAW_TEST_START\n" {
-            u.put_char(b);
-        }
-    }
+    // Detect UART base from DTB before the first print so the kernel works on
+    // boards where the console isn't at the QEMU virt default (0x1000_0000).
+    uart::init_from_dtb(dtb_ptr);
+
     crate::println!("Hello from openv!");
     crate::println!("Booted on hart ID: {}", hartid);
     crate::println!("DTB address: {:#x}", dtb_ptr);
