@@ -23,17 +23,14 @@ struct Vfs {
 impl Vfs {
     fn new() -> Self {
         let mut nodes = BTreeMap::new();
-        // Root directory always exists.
         nodes.insert(String::from("/"), FsNode::Dir(Vec::new()));
         Self { nodes }
     }
 
-    /// Return `true` if the path exists.
     fn exists(&self, path: &str) -> bool {
         self.nodes.contains_key(path)
     }
 
-    /// Canonical parent path + final component for a given path.
     fn parent_and_name(path: &str) -> Option<(String, String)> {
         let path = path.trim_end_matches('/');
         let slash = path.rfind('/')?;
@@ -43,14 +40,23 @@ impl Vfs {
         Some((String::from(parent), String::from(name)))
     }
 
+    /// Create directory and all ancestors silently.
+    fn mkdir_all(&mut self, path: &str) {
+        if path == "/" || self.exists(path) { return; }
+        if let Some(slash) = path.rfind('/') && slash > 0 {
+            self.mkdir_all(&path[..slash]);
+        }
+        if !self.exists(path) { self.mkdir(path); }
+    }
+
     fn mkdir(&mut self, path: &str) -> bool {
         if self.exists(path) { return false; }
-        if let Some((parent, name)) = Self::parent_and_name(path) {
-            if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
-                children.push(name);
-                self.nodes.insert(String::from(path), FsNode::Dir(Vec::new()));
-                return true;
-            }
+        if let Some((parent, name)) = Self::parent_and_name(path)
+            && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
+        {
+            children.push(name);
+            self.nodes.insert(String::from(path), FsNode::Dir(Vec::new()));
+            return true;
         }
         false
     }
@@ -59,11 +65,20 @@ impl Vfs {
         if let Some((parent, name)) = Self::parent_and_name(path) {
             let already_exists = self.nodes.contains_key(path);
             if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
-                if !already_exists {
-                    children.push(name);
-                }
-                // Insert or truncate.
+                if !already_exists { children.push(name); }
                 self.nodes.insert(String::from(path), FsNode::File(Vec::new()));
+                return true;
+            }
+        }
+        false
+    }
+
+    fn create_with_data(&mut self, path: &str, data: Vec<u8>) -> bool {
+        if let Some((parent, name)) = Self::parent_and_name(path) {
+            let already_exists = self.nodes.contains_key(path);
+            if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
+                if !already_exists { children.push(name); }
+                self.nodes.insert(String::from(path), FsNode::File(data));
                 return true;
             }
         }
@@ -72,10 +87,10 @@ impl Vfs {
 
     fn unlink(&mut self, path: &str) -> bool {
         if !self.exists(path) { return false; }
-        if let Some((parent, name)) = Self::parent_and_name(path) {
-            if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
-                children.retain(|c| c != &name);
-            }
+        if let Some((parent, name)) = Self::parent_and_name(path)
+            && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
+        {
+            children.retain(|c| c != &name);
         }
         self.nodes.remove(path);
         true
@@ -122,6 +137,78 @@ impl Vfs {
     }
 }
 
+// ── TAR parser ───────────────────────────────────────────────────────────────
+
+fn octal_to_usize(bytes: &[u8]) -> usize {
+    let mut v = 0usize;
+    for &b in bytes {
+        if b == 0 || b == b' ' { break; }
+        if (b'0'..=b'7').contains(&b) { v = v * 8 + (b - b'0') as usize; }
+    }
+    v
+}
+
+fn populate_from_tar(vfs: &mut Vfs, tar: &[u8]) {
+    let mut offset = 0usize;
+    let mut consecutive_empty = 0u32;
+
+    while offset + 512 <= tar.len() {
+        let header = &tar[offset..offset + 512];
+
+        // Two consecutive zero blocks = end of archive.
+        if header.iter().all(|&b| b == 0) {
+            consecutive_empty += 1;
+            if consecutive_empty >= 2 { break; }
+            offset += 512;
+            continue;
+        }
+        consecutive_empty = 0;
+
+        // Name (null-terminated, up to 100 bytes; UStar prefix at 345..500 ignored).
+        let name_end = header[..100].iter().position(|&b| b == 0).unwrap_or(100);
+        let name = match core::str::from_utf8(&header[..name_end]) {
+            Ok(s) => s,
+            Err(_) => { offset += 512; continue; }
+        };
+        if name.is_empty() { offset += 512; continue; }
+
+        let type_flag = header[156];
+        let size = octal_to_usize(&header[124..136]);
+
+        // Canonicalize to absolute path, strip trailing slash.
+        let mut path = if name.starts_with('/') {
+            String::from(name)
+        } else {
+            let mut s = String::from("/");
+            s.push_str(name);
+            s
+        };
+        if path.len() > 1 && path.ends_with('/') {
+            path.pop();
+        }
+
+        let is_dir = type_flag == b'5'
+            || (type_flag == 0 && size == 0 && name.ends_with('/'));
+
+        if is_dir {
+            vfs.mkdir_all(&path);
+        } else if type_flag == b'0' || type_flag == 0 || type_flag == b'\0' {
+            // Regular file.  Ensure all parents exist first.
+            if let Some(slash) = path.rfind('/') {
+                let parent = if slash == 0 { "/" } else { &path[..slash] };
+                vfs.mkdir_all(parent);
+            }
+            let data_start = offset + 512;
+            let data_end = (data_start + size).min(tar.len());
+            let data = tar[data_start..data_end].to_vec();
+            vfs.create_with_data(&path, data);
+        }
+
+        let data_blocks = size.div_ceil(512);
+        offset += 512 + data_blocks * 512;
+    }
+}
+
 // ── Open-file table ───────────────────────────────────────────────────────────
 
 struct OpenFile {
@@ -149,7 +236,7 @@ impl OpenTable {
     fn close(&mut self, fd: u32) { self.files.remove(&fd); }
 }
 
-// ── IPC helpers (thin libos wrappers) ────────────────────────────────────────
+// ── IPC helpers ───────────────────────────────────────────────────────────────
 
 fn ipc_send(to: i32, buf: &[u8]) -> i32 {
     libos::syscall(61, to as usize, buf.as_ptr() as usize, buf.len()) as i32
@@ -159,11 +246,23 @@ fn ipc_recv(buf: &mut [u8], from: &mut i32) -> usize {
     libos::syscall(62, buf.as_mut_ptr() as usize, buf.len(), from as *mut i32 as usize)
 }
 
-fn vfs_register() {
-    libos::syscall(63, 0, 0, 0);
+fn vfs_register() { libos::syscall(63, 0, 0, 0); }
+
+/// Fetch the full initrd TAR from the kernel (syscall 65).
+fn fetch_initrd() -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut offset = 0usize;
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = libos::syscall(65, chunk.as_mut_ptr() as usize, offset, chunk.len());
+        if n == 0 { break; }
+        buf.extend_from_slice(&chunk[..n]);
+        offset += n;
+    }
+    buf
 }
 
-// ── Reply builders ────────────────────────────────────────────────────────────
+// ── Reply helpers ─────────────────────────────────────────────────────────────
 
 fn reply_ok(client: i32, payload: &[u8]) {
     let mut buf = [0u8; MAX_MSG];
@@ -173,10 +272,7 @@ fn reply_ok(client: i32, payload: &[u8]) {
     ipc_send(client, &buf[..1 + n]);
 }
 
-fn reply_err(client: i32) {
-    let buf = [REPLY_ERR];
-    ipc_send(client, &buf);
-}
+fn reply_err(client: i32) { ipc_send(client, &[REPLY_ERR]); }
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
@@ -190,8 +286,10 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             if body.len() < 4 { reply_err(client); return; }
             let mut off = 0;
             let _flags = get_u32(body, &mut off);
-            let path_bytes = &body[off..];
-            let path = core::str::from_utf8(path_bytes).unwrap_or("");
+            let path = match core::str::from_utf8(&body[off..]) {
+                Ok(s) => s,
+                Err(_) => { reply_err(client); return; }
+            };
             if vfs.exists(path) {
                 let fd = open_table.open(path);
                 let mut p = [0u8; 4];
@@ -204,21 +302,14 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
         OP_READ => {
             if body.len() < 13 { reply_err(client); return; }
             let mut off = 0;
-            let fd   = get_u32(body, &mut off);
+            let fd     = get_u32(body, &mut off);
             let offset = get_u64(body, &mut off);
             let len_req = get_u32(body, &mut off) as usize;
 
-            // Use stored offset if read was sequential.
-            let read_off = if let Some(f) = open_table.get(fd) {
-                if offset == u64::MAX { f.offset } else { offset }
-            } else {
-                reply_err(client); return;
-            };
-
-            let path = if let Some(f) = open_table.get(fd) {
-                f.path.clone()
-            } else {
-                reply_err(client); return;
+            let (path, read_off) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(),
+                             if offset == u64::MAX { f.offset } else { offset }),
+                None => { reply_err(client); return; }
             };
 
             let mut data_buf = [0u8; MAX_MSG - 1];
@@ -240,16 +331,10 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             let offset = get_u64(body, &mut off);
             let data   = &body[off..];
 
-            let write_off = if let Some(f) = open_table.get(fd) {
-                if offset == u64::MAX { f.offset } else { offset }
-            } else {
-                reply_err(client); return;
-            };
-
-            let path = if let Some(f) = open_table.get(fd) {
-                f.path.clone()
-            } else {
-                reply_err(client); return;
+            let (path, write_off) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(),
+                             if offset == u64::MAX { f.offset } else { offset }),
+                None => { reply_err(client); return; }
             };
 
             match vfs.write(&path, write_off, data) {
@@ -272,7 +357,10 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             reply_ok(client, &[]);
         }
         OP_GETDENTS => {
-            let path = core::str::from_utf8(body).unwrap_or("");
+            let path = match core::str::from_utf8(body) {
+                Ok(s) => s,
+                Err(_) => { reply_err(client); return; }
+            };
             match vfs.readdir(path) {
                 Some(children) => {
                     let mut buf = [0u8; MAX_MSG - 1];
@@ -290,11 +378,11 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             }
         }
         OP_MKDIR => {
-            let path = core::str::from_utf8(body).unwrap_or("");
+            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
             if vfs.mkdir(path) { reply_ok(client, &[]) } else { reply_err(client) }
         }
         OP_CREATE => {
-            let path = core::str::from_utf8(body).unwrap_or("");
+            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
             if vfs.create(path) {
                 let fd = open_table.open(path);
                 let mut p = [0u8; 4];
@@ -305,11 +393,11 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             }
         }
         OP_UNLINK => {
-            let path = core::str::from_utf8(body).unwrap_or("");
+            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
             if vfs.unlink(path) { reply_ok(client, &[]) } else { reply_err(client) }
         }
         OP_STAT => {
-            let path = core::str::from_utf8(body).unwrap_or("");
+            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
             match vfs.stat(path) {
                 Some((is_dir, size)) => {
                     let mut p = [0u8; 9];
@@ -326,22 +414,19 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
             let mut off = 0;
             let old_len = get_u32(body, &mut off) as usize;
             if body.len() < 4 + old_len { reply_err(client); return; }
-            let old_bytes = &body[off..off + old_len]; off += old_len;
-            let new_bytes = &body[off..];
-            let old = core::str::from_utf8(old_bytes).unwrap_or("");
-            let new = core::str::from_utf8(new_bytes).unwrap_or("");
+            let old = match core::str::from_utf8(&body[off..off + old_len]) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
+            let new = match core::str::from_utf8(&body[off + old_len..]) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
 
-            // Move node: insert under new name, remove old.
             if let Some(node) = vfs.nodes.remove(old) {
-                if let Some((old_parent, old_name)) = Vfs::parent_and_name(old) {
-                    if let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&old_parent) {
-                        c.retain(|x| x != &old_name);
-                    }
+                if let Some((op, on)) = Vfs::parent_and_name(old)
+                    && let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&op)
+                {
+                    c.retain(|x| x != &on);
                 }
-                if let Some((new_parent, new_name)) = Vfs::parent_and_name(new) {
-                    if let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&new_parent) {
-                        c.push(new_name);
-                    }
+                if let Some((np, nn)) = Vfs::parent_and_name(new)
+                    && let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&np)
+                {
+                    c.push(nn);
                 }
                 vfs.nodes.insert(new.to_string(), node);
                 reply_ok(client, &[]);
@@ -357,17 +442,26 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: usize, _argv: usize) -> i32 {
+    // Register as the VFS server before touching the filesystem.
     vfs_register();
 
     let mut vfs = Vfs::new();
+
+    // Populate from the kernel's initrd TAR (fetch in 4 KB chunks via syscall 65).
+    {
+        let tar = fetch_initrd();
+        if !tar.is_empty() {
+            populate_from_tar(&mut vfs, &tar);
+        }
+    }
+
+    // Ensure standard writable directories exist even if absent from initrd.
+    vfs.mkdir_all("/tmp");
+    vfs.mkdir_all("/home/guest");
+
     let mut open_table = OpenTable::new();
-
-    // Pre-create standard directories.
-    vfs.mkdir("/tmp");
-    vfs.mkdir("/home");
-    vfs.mkdir("/home/guest");
-
     let mut msg_buf = [0u8; MAX_MSG];
+
     loop {
         let mut from: i32 = 0;
         let len = ipc_recv(&mut msg_buf, &mut from);

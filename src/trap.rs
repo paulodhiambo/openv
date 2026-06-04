@@ -1582,6 +1582,31 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let pid = VFS_SERVER_PID.load(Ordering::Relaxed);
                     tf.regs[10] = if pid > 0 { pid as usize } else { usize::MAX };
                 }
+                65 => {
+                    // sys_initrd_data(buf_ptr, offset, max_len) → bytes_copied
+                    // Lets the VFS server fetch chunks of the initrd TAR from kernel memory.
+                    let buf_ptr = arg0;
+                    let offset  = arg1;
+                    let max_len = arg2;
+                    let start = crate::INITRD_START.load(Ordering::Relaxed);
+                    let total = crate::INITRD_LEN.load(Ordering::Relaxed);
+                    if start == 0 || offset >= total {
+                        tf.regs[10] = 0;
+                    } else {
+                        let avail = total - offset;
+                        let copy_len = max_len.min(avail).min(4096);
+                        unsafe {
+                            let src = core::slice::from_raw_parts(
+                                (start + offset) as *const u8, copy_len,
+                            );
+                            let dst = core::slice::from_raw_parts_mut(
+                                buf_ptr as *mut u8, copy_len,
+                            );
+                            dst.copy_from_slice(src);
+                        }
+                        tf.regs[10] = copy_len;
+                    }
+                }
                 _ => {
                     // Unknown syscall — return ENOSYS rather than crashing the kernel.
                     crate::println!("pid {}: unknown syscall {}", crate::posix::process::current_pid(), syscall_num);

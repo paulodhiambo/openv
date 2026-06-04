@@ -32,6 +32,13 @@ pub fn boot_dtb_ptr() -> usize {
     unsafe { BOOT_DTB_PTR }
 }
 
+/// Physical base address of the initrd (set in kmain from DTB, 0 if absent).
+pub static INITRD_START: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+/// Length of the initrd in bytes.
+pub static INITRD_LEN: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
 // Include the boot assembly
 global_asm!(include_str!("boot.s"));
 
@@ -94,6 +101,9 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
                     end,
                     end - start
                 );
+                // Store for sys_initrd_data (syscall 65) so the VFS server can fetch it.
+                INITRD_START.store(start, core::sync::atomic::Ordering::Relaxed);
+                INITRD_LEN.store(end - start, core::sync::atomic::Ordering::Relaxed);
                 let initrd_slice =
                     unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
                 let root_fs = vfs::tar::parse_tar(initrd_slice);

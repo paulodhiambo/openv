@@ -6,7 +6,11 @@ use core::arch::asm;
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 
-// ── User-space heap (2 MB in BSS, zero-filled before main) ───────────────────
+// ── User-space heap ────────────────────────────────────────────────────────────
+// Default: 2 MiB. Enable `large-heap` feature for 8 MiB (used by vfs-server).
+#[cfg(feature = "large-heap")]
+const USER_HEAP_SIZE: usize = 8 * 1024 * 1024;
+#[cfg(not(feature = "large-heap"))]
 const USER_HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 #[global_allocator]
@@ -32,6 +36,7 @@ global_asm!(
         mv s0, a0
         mv s1, a1
         call libos_init
+        call vfs_connect_inner   # cache VFS server PID before main()
         mv a0, s0
         mv a1, s1
         call main
@@ -39,6 +44,72 @@ global_asm!(
         call exit
     "#
 );
+
+// ── VFS file descriptor table ─────────────────────────────────────────────────
+//
+// User-visible fd numbers for VFS-server-backed files start at VFS_FD_BASE.
+// Kernel fds (console, pipe, channel) remain in the range 0..VFS_FD_BASE.
+// Each process has its own copy of this table (no cross-process sharing needed).
+
+const VFS_FD_BASE: u32 = 1000;
+const VFS_FD_SLOTS: usize = 64;
+
+struct VfsFdSlot {
+    active: bool,
+    vfs_fd: u32,  // fd assigned by the VFS server
+    offset: u64,  // sequential read/write cursor
+}
+
+// SAFETY: single-threaded user process; no re-entrant access.
+static mut VFS_FDES: [VfsFdSlot; VFS_FD_SLOTS] = {
+    const EMPTY: VfsFdSlot = VfsFdSlot { active: false, vfs_fd: 0, offset: 0 };
+    [EMPTY; VFS_FD_SLOTS]
+};
+
+fn vfs_fd_slot(idx: usize) -> *mut VfsFdSlot {
+    unsafe { core::ptr::addr_of_mut!(VFS_FDES).cast::<VfsFdSlot>().add(idx) }
+}
+
+fn vfs_fd_alloc(server_fd: u32) -> i32 {
+    for i in 0..VFS_FD_SLOTS {
+        let slot = vfs_fd_slot(i);
+        if !unsafe { (*slot).active } {
+            unsafe {
+                (*slot).active = true;
+                (*slot).vfs_fd = server_fd;
+                (*slot).offset = 0;
+            }
+            return (VFS_FD_BASE + i as u32) as i32;
+        }
+    }
+    -1
+}
+
+fn vfs_fd_get(user_fd: i32) -> Option<(u32, u64)> {
+    if user_fd < VFS_FD_BASE as i32 { return None; }
+    let idx = (user_fd as u32 - VFS_FD_BASE) as usize;
+    if idx >= VFS_FD_SLOTS { return None; }
+    let slot = vfs_fd_slot(idx);
+    let (active, vfs_fd, offset) = unsafe { ((*slot).active, (*slot).vfs_fd, (*slot).offset) };
+    if active { Some((vfs_fd, offset)) } else { None }
+}
+
+fn vfs_fd_advance(user_fd: i32, delta: u64) {
+    if user_fd < VFS_FD_BASE as i32 { return; }
+    let idx = (user_fd as u32 - VFS_FD_BASE) as usize;
+    if idx < VFS_FD_SLOTS {
+        let slot = vfs_fd_slot(idx);
+        unsafe { if (*slot).active { (*slot).offset += delta; } }
+    }
+}
+
+fn vfs_fd_free(user_fd: i32) {
+    if user_fd < VFS_FD_BASE as i32 { return; }
+    let idx = (user_fd as u32 - VFS_FD_BASE) as usize;
+    if idx < VFS_FD_SLOTS {
+        unsafe { (*vfs_fd_slot(idx)).active = false; }
+    }
+}
 
 #[inline]
 pub fn syscall(sys_num: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
@@ -86,7 +157,28 @@ pub extern "C" fn exit(status: i32) -> ! {
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn write(fd: usize, buf: *const u8, len: usize) -> isize {
+    if let Some((vfs_fd, offset)) = vfs_fd_get(fd as i32) {
+        if let Some(server) = vfs_pid() {
+            let data = unsafe { core::slice::from_raw_parts(buf, len) };
+            const HDR: usize = 1 + 4 + 8; // op + fd + offset
+            let chunk = data.len().min(vfs_proto::MAX_MSG - HDR);
+            let mut req = [0u8; vfs_proto::MAX_MSG];
+            let n = vfs_proto::build_write(&mut req, vfs_fd, offset, &data[..chunk]);
+            ipc_send(server, &req[..n]);
+            let mut reply = [0u8; 8];
+            let mut from = 0i32;
+            let rlen = ipc_recv(&mut reply, &mut from);
+            let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+            if status == vfs_proto::REPLY_OK {
+                let written = vfs_proto::parse_write_reply(payload) as usize;
+                vfs_fd_advance(fd as i32, written as u64);
+                return written as isize;
+            }
+        }
+        return -1;
+    }
     syscall(2, fd, buf as usize, len) as isize
 }
 
@@ -96,42 +188,136 @@ pub extern "C" fn pipe(fds: *mut [u32; 2]) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn read(fd: usize, buf: *mut u8, len: usize) -> isize {
+    if let Some((vfs_fd, offset)) = vfs_fd_get(fd as i32) {
+        if let Some(server) = vfs_pid() {
+            let want = (len as u32).min((vfs_proto::MAX_MSG - 1) as u32);
+            let mut req = [0u8; 17]; // 1+4+8+4
+            let n = vfs_proto::build_read(&mut req, vfs_fd, offset, want);
+            ipc_send(server, &req[..n]);
+            let mut reply = [0u8; vfs_proto::MAX_MSG];
+            let mut from = 0i32;
+            let rlen = ipc_recv(&mut reply, &mut from);
+            let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+            if status == vfs_proto::REPLY_OK {
+                let data = vfs_proto::parse_read_reply(payload);
+                let copy = data.len().min(len);
+                unsafe { core::slice::from_raw_parts_mut(buf, copy).copy_from_slice(&data[..copy]); }
+                vfs_fd_advance(fd as i32, copy as u64);
+                return copy as isize;
+            }
+        }
+        return 0;
+    }
     syscall(5, fd, buf as usize, len) as isize
 }
 
+/// Open a file. Tries the VFS server first; falls back to the kernel.
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn open(path_ptr: *const u8, path_len: usize, flags: u32) -> i32 {
+    if let Some(server) = vfs_pid() {
+        let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+        let mut req = [0u8; vfs_proto::MAX_MSG];
+        let n = vfs_proto::build_open(&mut req, flags, path);
+        ipc_send(server, &req[..n]);
+        let mut reply = [0u8; vfs_proto::MAX_MSG];
+        let mut from = 0i32;
+        let rlen = ipc_recv(&mut reply, &mut from);
+        let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+        if status == vfs_proto::REPLY_OK && let Some(vfs_fd) = vfs_proto::parse_open_reply(payload) {
+            return vfs_fd_alloc(vfs_fd);
+        }
+    }
     syscall(8, path_ptr as usize, path_len, flags as usize) as i32
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn getdents(
     path_ptr: *const u8,
     path_len: usize,
     buf: *mut u8,
     len: usize,
 ) -> isize {
+    if let Some(server) = vfs_pid() {
+        let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
+        let mut req = [0u8; vfs_proto::MAX_MSG];
+        let n = vfs_proto::build_getdents(&mut req, path);
+        ipc_send(server, &req[..n]);
+        let mut reply = [0u8; vfs_proto::MAX_MSG];
+        let mut from = 0i32;
+        let rlen = ipc_recv(&mut reply, &mut from);
+        let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+        if status == vfs_proto::REPLY_OK {
+            let copy = payload.len().min(len);
+            unsafe { core::slice::from_raw_parts_mut(buf, copy).copy_from_slice(&payload[..copy]); }
+            return copy as isize;
+        }
+    }
     syscall4(12, path_ptr as usize, path_len, buf as usize, len) as isize
 }
 
 /// Create or truncate a file at `path`, returning a writable fd (or -1 on error).
 pub fn create(path: &[u8]) -> i32 {
+    if let Some(server) = vfs_pid() {
+        let mut req = [0u8; vfs_proto::MAX_MSG];
+        let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_CREATE, path);
+        ipc_send(server, &req[..n]);
+        let mut reply = [0u8; vfs_proto::MAX_MSG];
+        let mut from = 0i32;
+        let rlen = ipc_recv(&mut reply, &mut from);
+        let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+        if status == vfs_proto::REPLY_OK && let Some(vfs_fd) = vfs_proto::parse_open_reply(payload) {
+            return vfs_fd_alloc(vfs_fd);
+        }
+    }
     syscall(26, path.as_ptr() as usize, path.len(), 0) as i32
 }
 
 /// Create a directory at `path`. Returns 0 on success, -1 on error.
 pub fn mkdir(path: &[u8]) -> i32 {
+    if let Some(server) = vfs_pid() {
+        let mut req = [0u8; vfs_proto::MAX_MSG];
+        let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_MKDIR, path);
+        ipc_send(server, &req[..n]);
+        let mut reply = [0u8; 4];
+        let mut from = 0i32;
+        let rlen = ipc_recv(&mut reply, &mut from);
+        let (status, _) = vfs_proto::parse_reply(&reply, rlen);
+        if status == vfs_proto::REPLY_OK { return 0; }
+    }
     syscall(27, path.as_ptr() as usize, path.len(), 0) as i32
 }
 
 /// Remove a file or directory at `path`. Returns 0 on success, -1 on error.
 pub fn unlink(path: &[u8]) -> i32 {
+    if let Some(server) = vfs_pid() {
+        let mut req = [0u8; vfs_proto::MAX_MSG];
+        let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_UNLINK, path);
+        ipc_send(server, &req[..n]);
+        let mut reply = [0u8; 4];
+        let mut from = 0i32;
+        let rlen = ipc_recv(&mut reply, &mut from);
+        let (status, _) = vfs_proto::parse_reply(&reply, rlen);
+        if status == vfs_proto::REPLY_OK { return 0; }
+    }
     syscall(28, path.as_ptr() as usize, path.len(), 0) as i32
 }
 
 /// Rename `old` to `new`. Returns 0 on success, -1 on error.
 pub fn rename(old: &[u8], new: &[u8]) -> i32 {
+    if let Some(server) = vfs_pid() {
+        let mut req = [0u8; vfs_proto::MAX_MSG];
+        let n = vfs_proto::build_rename(&mut req, old, new);
+        ipc_send(server, &req[..n]);
+        let mut reply = [0u8; 4];
+        let mut from = 0i32;
+        let rlen = ipc_recv(&mut reply, &mut from);
+        let (status, _) = vfs_proto::parse_reply(&reply, rlen);
+        if status == vfs_proto::REPLY_OK { return 0; }
+    }
     syscall4(
         29,
         old.as_ptr() as usize,
@@ -148,6 +334,18 @@ pub fn set_raw(enabled: u32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn close(fd: i32) -> i32 {
+    if let Some((vfs_fd, _)) = vfs_fd_get(fd) {
+        if let Some(server) = vfs_pid() {
+            let mut req = [0u8; 5];
+            let n = vfs_proto::build_close(&mut req, vfs_fd);
+            ipc_send(server, &req[..n]);
+            let mut reply = [0u8; 4];
+            let mut from = 0i32;
+            ipc_recv(&mut reply, &mut from);
+        }
+        vfs_fd_free(fd);
+        return 0;
+    }
     syscall(9, fd as usize, 0, 0) as i32
 }
 
@@ -322,12 +520,18 @@ use core::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
 
 static VFS_SERVER_PID: AtomicI32 = AtomicI32::new(0);
 
-/// Cache the VFS server PID; must be called once at startup after the server is running.
-pub fn vfs_connect() {
+/// Cache the VFS server PID.  Called automatically from `_start` before `main`.
+#[unsafe(no_mangle)]
+pub extern "C" fn vfs_connect_inner() {
     let pid = get_vfs_pid();
     if pid > 0 {
         VFS_SERVER_PID.store(pid, AtomicOrdering::Relaxed);
     }
+}
+
+/// Re-query the VFS server PID (call if it might have (re-)registered after startup).
+pub fn vfs_connect() {
+    vfs_connect_inner();
 }
 
 fn vfs_pid() -> Option<i32> {
