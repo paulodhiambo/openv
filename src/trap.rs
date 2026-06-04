@@ -7,11 +7,31 @@ use riscv::register::{scause, sepc, sscratch, sstatus, stvec};
 unsafe extern "C" {
     fn __halt_cpu() -> !;
 }
-use spin::Mutex;
+use crate::sync::Mutex;
+use core::sync::atomic::{AtomicBool, AtomicI32};
 
 static LINE_DISC_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static ECHO_ENABLED: Mutex<bool> = Mutex::new(true);
 static RAW_MODE: Mutex<bool> = Mutex::new(false);
+// PID of the process blocked waiting for stdin (0 = nobody).
+static STDIN_WAITER: AtomicI32 = AtomicI32::new(0);
+// Set when Ctrl+C arrives and no external foreground process exists.
+// Causes the next Console sys_read to return 0 (EOF / EINTR) so builtins like
+// `cat` that loop on n <= 0 exit cleanly.
+static CTRLC_PENDING: AtomicBool = AtomicBool::new(false);
+
+macro_rules! get_current_proc_or_esrch {
+    ($tf:expr) => {
+        match crate::posix::process::get_current_proc() {
+            Some(p) => p,
+            None => {
+                $tf.regs[10] = crate::errno::ESRCH;
+                $tf.sepc += 4;
+                return $tf as *mut _;
+            }
+        }
+    };
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -39,24 +59,36 @@ global_asm!(
     .global trap_vector
     .align 4
 trap_vector:
-    # Swap sp and sscratch. Now sp points to TrapFrame, sscratch has user sp.
-    csrrw sp, sscratch, sp
-    
-    # Save all general-purpose registers
-    sd ra, 1*8+8(sp)
-    
-    # Save user sp
-    csrr t0, sscratch
-    sd t0, 2*8+8(sp)
+    # Swap a0 and sscratch
+    csrrw a0, sscratch, a0
+    bnez a0, 1f
 
+    # --- Came from S-mode ---
+    csrrw a0, sscratch, a0 # Restore a0, sscratch is 0
+    addi sp, sp, -288
+    sd a0, 10*8+8(sp)
+    sd t0, 5*8+8(sp)
+    addi t0, sp, 288
+    sd t0, 2*8+8(sp)
+    j 2f
+
+1:
+    # --- Came from U-mode ---
+    sd t0, 5*8+8(a0)
+    csrr t0, sscratch
+    sd t0, 10*8+8(a0)
+    csrw sscratch, zero # Indicate S-mode
+    sd sp, 2*8+8(a0)
+    mv sp, a0
+
+2:
+    sd ra, 1*8+8(sp)
     sd gp, 3*8+8(sp)
     sd tp, 4*8+8(sp)
-    sd t0, 5*8+8(sp)
     sd t1, 6*8+8(sp)
     sd t2, 7*8+8(sp)
     sd s0, 8*8+8(sp)
     sd s1, 9*8+8(sp)
-    sd a0, 10*8+8(sp)
     sd a1, 11*8+8(sp)
     sd a2, 12*8+8(sp)
     sd a3, 13*8+8(sp)
@@ -79,37 +111,33 @@ trap_vector:
     sd t5, 30*8+8(sp)
     sd t6, 31*8+8(sp)
 
-    # Save sepc and sstatus
     csrr t0, sepc
     sd t0, 32*8+8(sp)
     csrr t1, sstatus
     sd t1, 33*8+8(sp)
 
-    # Move TrapFrame ptr to a0 as arg
     mv a0, sp
+
+    csrr t0, sstatus
+    andi t0, t1, 0x100
+    bnez t0, 3f
     
-    # Switch to kernel stack!
     ld sp, 0(a0)
-    
-    # Call the Rust handler
+3:
     call rust_trap_handler
     
-    # rust_trap_handler returns the TrapFrame ptr in a0
     .global return_to_user
 return_to_user:
     mv sp, a0
 
-    # Restore sepc and sstatus
     ld t0, 32*8+8(sp)
     csrw sepc, t0
     ld t1, 33*8+8(sp)
     csrw sstatus, t1
 
-    # Restore registers
     ld ra, 1*8+8(sp)
     ld gp, 3*8+8(sp)
     ld tp, 4*8+8(sp)
-    ld t0, 5*8+8(sp)
     ld t1, 6*8+8(sp)
     ld t2, 7*8+8(sp)
     ld s0, 8*8+8(sp)
@@ -137,13 +165,19 @@ return_to_user:
     ld t5, 30*8+8(sp)
     ld t6, 31*8+8(sp)
 
-    # Load user sp into sscratch, and TrapFrame address remains in sp
+    csrr t0, sstatus
+    andi t0, t0, 0x100
+    bnez t0, 4f
+
     ld t0, 2*8+8(sp)
     csrw sscratch, t0
-    
-    # Swap sp and sscratch back
+    ld t0, 5*8+8(sp)
     csrrw sp, sscratch, sp
+    sret
 
+4:
+    ld t0, 5*8+8(sp)
+    ld sp, 2*8+8(sp)
     sret
     "#
 );
@@ -153,9 +187,142 @@ unsafe extern "C" {
     pub fn return_to_user(trap_frame: usize) -> !;
 }
 
+/// Set up argc/argv on the new user stack after exec, returning (argc, argv_ptr, new_sp).
+///
+/// `argv_data` is a packed buffer of null-terminated strings: "arg0\0arg1\0...argN\0".
+/// Strings and the argv[] pointer array are written just below USER_STACK_TOP.
+/// S-mode can access U-mode pages because sstatus.SUM=1 (set when returning to user mode
+/// and left set through the trap, so the kernel trap handler inherits it).
+fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
+    use crate::posix::spawn::USER_STACK_TOP;
+
+    // Parse null-separated args from the packed buffer.
+    let mut args: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    let mut start = 0usize;
+    for (i, &b) in argv_data.iter().enumerate() {
+        if b == 0 {
+            if i > start {
+                args.push(&argv_data[start..i]);
+            }
+            start = i + 1;
+        }
+    }
+    if start < argv_data.len() {
+        args.push(&argv_data[start..]);
+    }
+
+    let argc = args.len();
+    if argc == 0 {
+        return (0, 0, USER_STACK_TOP);
+    }
+
+    let mut sp = USER_STACK_TOP;
+    let mut string_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+
+    // Write each arg string from the top of the stack downward (including null terminator).
+    for arg in &args {
+        let len = arg.len() + 1;
+        sp -= len;
+        unsafe {
+            let dst = core::slice::from_raw_parts_mut(sp as *mut u8, len);
+            dst[..arg.len()].copy_from_slice(arg);
+            dst[arg.len()] = 0;
+        }
+        string_addrs.push(sp);
+    }
+
+    // 8-byte align before writing the pointer array.
+    sp &= !7;
+
+    // Write argv[argc] = NULL first, then argv[N-1] .. argv[0] downward.
+    sp -= 8;
+    unsafe { *(sp as *mut usize) = 0; }
+    for &addr in string_addrs.iter().rev() {
+        sp -= 8;
+        unsafe { *(sp as *mut usize) = addr; }
+    }
+
+    let argv_ptr = sp;
+
+    // Leave 16 bytes below argv[0] and 16-byte align.
+    sp = (sp - 16) & !15;
+
+    (argc, argv_ptr, sp)
+}
+
+/// Drain all pending UART bytes into LINE_DISC_BUFFER and wake any blocked
+/// stdin reader.  Called both from the timer ISR (HART 0 only) and from
+/// schedule()'s idle loop so chars are serviced even when SIE=0 in S-mode.
+fn poll_uart_into_linedisc() {
+    let mut uart = crate::uart::Uart::new();
+    let mut any_pushed = false;
+    loop {
+        let c = match uart.try_get_char() {
+            Some(c) => c,
+            None => break,
+        };
+        if c == 0x03 {
+            let fg = crate::posix::process::FOREGROUND_PID.swap(-1, Ordering::Relaxed);
+            uart.put_char(b'^');
+            uart.put_char(b'C');
+            uart.put_char(b'\n');
+            if fg > 0 {
+                // Kill the external foreground process (e.g. a spawned child).
+                crate::posix::spawn::exit(fg, 130);
+            } else {
+                // No external fg process — unblock any Console reader (e.g. builtin cat).
+                CTRLC_PENDING.store(true, Ordering::Relaxed);
+                let waiter = STDIN_WAITER.swap(0, Ordering::Relaxed);
+                if waiter > 0 {
+                    crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+                }
+            }
+            break;
+        }
+        let mut buf = LINE_DISC_BUFFER.lock();
+        let echo = *ECHO_ENABLED.lock();
+        let raw = *RAW_MODE.lock();
+        let pushed = if raw {
+            buf.push(c);
+            true
+        } else if c == b'\r' || c == b'\n' {
+            if echo { uart.put_char(b'\n'); }
+            buf.push(b'\n');
+            true
+        } else if c == 0x08 || c == 0x7F {
+            if buf.pop().is_some() && echo {
+                uart.put_char(0x08);
+                uart.put_char(b' ');
+                uart.put_char(0x08);
+            }
+            false
+        } else {
+            if echo { uart.put_char(c); }
+            buf.push(c);
+            true
+        };
+        drop(buf);
+        if pushed { any_pushed = true; }
+    }
+    if any_pushed {
+        let waiter = STDIN_WAITER.swap(0, Ordering::Relaxed);
+        if waiter > 0 {
+            crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+        }
+    }
+}
+
+/// Called from schedule()'s idle loop so UART chars are serviced when the
+/// timer ISR cannot fire (SIE=0 in supervisor mode).
+pub fn service_uart() {
+    if crate::smp::current_hartid() == 0 {
+        poll_uart_into_linedisc();
+    }
+}
+
 pub fn init() {
     unsafe {
-        stvec::write(trap_vector as usize, stvec::TrapMode::Direct);
+        stvec::write(trap_vector as *const () as usize, stvec::TrapMode::Direct);
         // Enable supervisor software interrupts (for TLB shootdown).
         // Timer interrupts are NOT enabled here — they are enabled right
         // before the first call to schedule() to avoid firing while
@@ -169,7 +336,7 @@ pub fn init() {
 /// Called by secondary HARTs from secondary_kmain — same as init() without the print.
 pub fn init_hart() {
     unsafe {
-        stvec::write(trap_vector as usize, stvec::TrapMode::Direct);
+        stvec::write(trap_vector as *const () as usize, stvec::TrapMode::Direct);
         riscv::register::sie::set_ssoft();
     }
 }
@@ -198,15 +365,24 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             let arg1 = tf.regs[11]; // a1
             let arg2 = tf.regs[12]; // a2
 
+            // Advance sepc to next instruction after ecall unconditionally.
+            // Blocking syscalls that diverge to schedule() and wish to restart
+            // must subtract 4 from tf.sepc before yielding.
+            tf.sepc += 4;
+
             match syscall_num {
                 0 => {
-                    // sys_yield
-                    tf.sepc += 4;
-                    crate::posix::process::RUN_QUEUE
-                        .lock()
-                        .push_back(crate::posix::process::current_pid());
-                    crate::posix::process::schedule();
-                    unsafe { __halt_cpu() }
+                    // sys_yield — only switch if another process is actually waiting.
+                    // When alone, fall through so sepc advances and we return to the
+                    // caller immediately (avoids a pointless sfence.vma + context switch).
+                    let mut rq = crate::posix::process::RUN_QUEUE.lock();
+                    if !rq.is_empty() {
+                        rq.push_back(crate::posix::process::current_pid());
+                        drop(rq);
+                        crate::posix::process::schedule();
+                        unsafe { __halt_cpu() }
+                    }
+                    // else: fall through — bottom of Exception(8) arm advances sepc
                 }
                 1 => {
                     // sys_exit
@@ -223,11 +399,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     // sys_write
                     // arg0 = fd, arg1 = buf ptr, arg2 = len
                     let buf = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2) };
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let fds = proc.fds.lock();
                     if let Some(obj) = fds.get(arg0 as u32) {
                         match obj {
@@ -266,7 +438,13 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                 for &b in buf {
                                     data.push_back(b);
                                 }
+                                drop(data);
                                 tf.regs[10] = arg2;
+                                // Wake any process blocked on the read end.
+                                let waiter = half.waiter.swap(0, Ordering::Relaxed);
+                                if waiter > 0 {
+                                    crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+                                }
                             }
                             _ => {
                                 tf.regs[10] = usize::MAX; // EBADF
@@ -279,11 +457,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 3 => {
                     // sys_pipe — arg0 = ptr to [u32; 2] filled with [read_fd, write_fd]
                     let (rh, wh) = crate::ipc::handle::create_pipe();
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let mut fds = proc.fds.lock();
                     let h_r = {
                         let h = fds.lowest_free();
@@ -305,130 +479,69 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 5 => {
                     // sys_read
                     // arg0 = fd, arg1 = buf ptr, arg2 = max_len
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let fds = proc.fds.lock();
                     if let Some(obj) = fds.get(arg0 as u32) {
                         match obj {
                             crate::ipc::handle::KernelObject::Console => {
-                                // Raw mode: return one byte immediately (no line discipline)
-                                if *RAW_MODE.lock() {
-                                    let mut uart = crate::uart::Uart::new();
-                                    if let Some(c) = uart.try_get_char() {
-                                        let user_buf = unsafe {
-                                            core::slice::from_raw_parts_mut(arg1 as *mut u8, 1)
-                                        };
-                                        user_buf[0] = c;
-                                        tf.regs[10] = 1;
+                                // Ctrl+C was pressed while we were blocked — return EOF so
+                                // builtin loops (e.g. `cat` with no args) exit cleanly.
+                                if CTRLC_PENDING.swap(false, Ordering::Relaxed) {
+                                    tf.regs[10] = 0;
+                                    // sepc was already advanced by the +4 at the top of
+                                    // Exception(8); just fall through.
+                                } else {
+                                    // The timer ISR is the sole UART reader.  It fills
+                                    // LINE_DISC_BUFFER (handling echo, backspace, newlines)
+                                    // and wakes STDIN_WAITER.  sys_read only reads the buffer.
+                                    let raw = *RAW_MODE.lock();
+                                    let mut buf_lock = LINE_DISC_BUFFER.lock();
+
+                                    let ready = if raw {
+                                        // Raw mode: any byte satisfies the read.
+                                        !buf_lock.is_empty()
                                     } else {
+                                        // Cooked mode: wait for a complete line ('\n').
+                                        buf_lock.iter().any(|&b| b == b'\n')
+                                    };
+
+                                    if ready {
+                                        let len = if raw {
+                                            // Return up to arg2 bytes.
+                                            let take = core::cmp::min(arg2, buf_lock.len());
+                                            let user_buf = unsafe {
+                                                core::slice::from_raw_parts_mut(arg1 as *mut u8, take)
+                                            };
+                                            for i in 0..take { user_buf[i] = buf_lock[i]; }
+                                            buf_lock.drain(0..take);
+                                            take
+                                        } else {
+                                            // Return up to and including the first '\n'.
+                                            let nl = buf_lock.iter().position(|&b| b == b'\n').unwrap();
+                                            let take = core::cmp::min(arg2, nl + 1);
+                                            let user_buf = unsafe {
+                                                core::slice::from_raw_parts_mut(arg1 as *mut u8, take)
+                                            };
+                                            for i in 0..take { user_buf[i] = buf_lock[i]; }
+                                            buf_lock.drain(0..take);
+                                            take
+                                        };
+                                        tf.regs[10] = len;
+                                    } else {
+                                        // Buffer not ready — block.  The timer ISR will fill
+                                        // LINE_DISC_BUFFER and wake us via STDIN_WAITER.
+                                        drop(buf_lock);
                                         drop(fds);
                                         drop(proc);
                                         tf.sepc -= 4;
-                                        crate::posix::process::RUN_QUEUE
-                                            .lock()
-                                            .push_back(crate::posix::process::current_pid());
+                                        STDIN_WAITER.store(
+                                            crate::posix::process::current_pid(),
+                                            Ordering::Relaxed,
+                                        );
                                         crate::posix::process::schedule();
                                         unsafe { __halt_cpu() }
                                     }
-                                } else {
-                                    let mut uart = crate::uart::Uart::new();
-                                    let mut buf_lock = LINE_DISC_BUFFER.lock();
-
-                                    // Check if we already have a full line in the buffer
-                                    if let Some(newline_idx) =
-                                        buf_lock.iter().position(|&b| b == b'\n')
-                                    {
-                                        let len = core::cmp::min(arg2, newline_idx + 1);
-                                        let user_buf = unsafe {
-                                            core::slice::from_raw_parts_mut(arg1 as *mut u8, len)
-                                        };
-                                        for i in 0..len {
-                                            user_buf[i] = buf_lock[i];
-                                        }
-                                        // Remove the consumed bytes
-                                        buf_lock.drain(0..len);
-                                        tf.regs[10] = len;
-                                    } else {
-                                        // Poll for a character
-                                        if let Some(c) = uart.try_get_char() {
-                                            if c == b'\r' || c == b'\n' {
-                                                uart.put_char(b'\n');
-                                                buf_lock.push(b'\n');
-
-                                                // Since we just got a newline, fulfill the read immediately
-                                                let len = core::cmp::min(arg2, buf_lock.len());
-                                                let user_buf = unsafe {
-                                                    core::slice::from_raw_parts_mut(
-                                                        arg1 as *mut u8,
-                                                        len,
-                                                    )
-                                                };
-                                                for i in 0..len {
-                                                    user_buf[i] = buf_lock[i];
-                                                }
-                                                buf_lock.drain(0..len);
-                                                tf.regs[10] = len;
-                                            } else if c == 0x08 || c == 0x7F {
-                                                // Backspace or DEL
-                                                if buf_lock.pop().is_some() {
-                                                    if *ECHO_ENABLED.lock() {
-                                                        uart.put_char(0x08);
-                                                        uart.put_char(b' ');
-                                                        uart.put_char(0x08);
-                                                    }
-                                                }
-                                                // Restart syscall
-                                                drop(buf_lock);
-                                                drop(fds);
-                                                tf.sepc -= 4;
-                                            } else if c == 0x03 {
-                                                // Ctrl-C — kill the registered foreground
-                                                // process (the child the shell is waiting
-                                                // on), or fall back to the current process.
-                                                uart.put_char(b'^');
-                                                uart.put_char(b'C');
-                                                uart.put_char(b'\n');
-                                                drop(buf_lock);
-                                                drop(fds);
-                                                drop(proc);
-                                                let fg = crate::posix::process::FOREGROUND_PID
-                                                    .swap(-1, Ordering::Relaxed);
-                                                let target = if fg > 0 {
-                                                    fg
-                                                } else {
-                                                    crate::posix::process::current_pid()
-                                                };
-                                                crate::posix::spawn::exit(target, 130);
-                                                crate::posix::process::schedule();
-                                                unsafe { __halt_cpu() }
-                                            } else {
-                                                // Regular character
-                                                buf_lock.push(c);
-                                                if *ECHO_ENABLED.lock() {
-                                                    uart.put_char(c);
-                                                }
-                                                // Restart syscall to keep reading
-                                                drop(buf_lock);
-                                                drop(fds);
-                                                tf.sepc -= 4;
-                                            }
-                                        } else {
-                                            // Block by restarting the syscall and yielding
-                                            drop(buf_lock);
-                                            drop(fds);
-                                            drop(proc);
-                                            tf.sepc -= 4;
-                                            crate::posix::process::RUN_QUEUE
-                                                .lock()
-                                                .push_back(crate::posix::process::current_pid());
-                                            crate::posix::process::schedule();
-                                            unsafe { __halt_cpu() }
-                                        }
-                                    }
-                                } // end cooked-mode else
+                                }
                             }
                             crate::ipc::handle::KernelObject::Channel(ep) => {
                                 if let Some(msg) = ep.try_recv() {
@@ -473,21 +586,23 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                         core::slice::from_raw_parts_mut(arg1 as *mut u8, len)
                                     };
                                     for b in buf.iter_mut() {
-                                        *b = data.pop_front().unwrap();
+                                        *b = data.pop_front().unwrap_or(0);
                                     }
                                     tf.regs[10] = len;
                                 } else if half.write_open.upgrade().is_none() {
                                     // All write ends closed — EOF
                                     tf.regs[10] = 0;
                                 } else {
-                                    // No data yet — yield and retry
+                                    // Block until the write half wakes us — do NOT spin.
+                                    let waiter = half.waiter.clone();
                                     drop(data);
                                     drop(fds);
                                     drop(proc);
                                     tf.sepc -= 4;
-                                    crate::posix::process::RUN_QUEUE
-                                        .lock()
-                                        .push_back(crate::posix::process::current_pid());
+                                    waiter.store(
+                                        crate::posix::process::current_pid(),
+                                        Ordering::Relaxed,
+                                    );
                                     crate::posix::process::schedule();
                                     unsafe { __halt_cpu() }
                                 }
@@ -521,16 +636,14 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 8 => {
                     // sys_open
-                    // arg0 = path_ptr, arg1 = path_len, arg2 = flags
+                    // arg0 = path_ptr, arg1 = path_len, arg2 = flags (O_RDONLY=0, O_WRONLY=1,
+                    //   O_RDWR=2; O_CLOEXEC=0x80000)
+                    const O_CLOEXEC: usize = 0x80000;
                     let path_bytes =
                         unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
                     if let Ok(path) = core::str::from_utf8(path_bytes) {
                         if let Ok(vnode) = crate::vfs::lookup_path(path) {
-                            let proc = crate::posix::process::PROCESS_TABLE
-                                .lock()
-                                .get(&crate::posix::process::current_pid())
-                                .cloned()
-                                .unwrap();
+                            let proc = get_current_proc_or_esrch!(tf);
 
                             // Basic flag decoding: 0=O_RDONLY, 1=O_WRONLY, 2=O_RDWR
                             let mut requested = 0;
@@ -544,14 +657,15 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                             if crate::vfs::check_access(&proc, &*vnode, requested) {
                                 let fd_desc = crate::ipc::handle::FileDescription {
                                     vnode,
-                                    offset: spin::Mutex::new(0),
+                                    offset: crate::sync::Mutex::new(0),
                                 };
-                                let fd =
-                                    proc.fds
-                                        .lock()
-                                        .insert(crate::ipc::handle::KernelObject::File(
-                                            alloc::sync::Arc::new(fd_desc),
-                                        ));
+                                let mut fds = proc.fds.lock();
+                                let fd = fds.insert(crate::ipc::handle::KernelObject::File(
+                                    alloc::sync::Arc::new(fd_desc),
+                                ));
+                                if (arg2 & O_CLOEXEC) != 0 {
+                                    fds.set_cloexec(fd, true);
+                                }
                                 tf.regs[10] = fd as usize;
                             } else {
                                 crate::println!("sys_open: access denied to '{}'", path);
@@ -567,11 +681,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 9 => {
                     // sys_close
                     // arg0 = fd
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     if proc.fds.lock().remove(arg0 as u32).is_some() {
                         tf.regs[10] = 0;
                     } else {
@@ -639,11 +749,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     // sys_socket -- create a proxied socket: pair a channel with net-daemon
                     // returns a user fd backed by a Channel; the net-daemon will pick up the peer via sys_daemon_next_socket
                     let (ep_user, ep_net) = crate::ipc::channel::ChannelEndpoint::create_pair();
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let user_fd = proc
                         .fds
                         .lock()
@@ -663,11 +769,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 41 => {
                     // sys_daemon_next_socket -- net-daemon pulls next socket created by a user
                     if let Some((sid, ep)) = crate::net::socket::pop_new_socket() {
-                        let proc = crate::posix::process::PROCESS_TABLE
-                            .lock()
-                            .get(&crate::posix::process::current_pid())
-                            .cloned()
-                            .unwrap();
+                        let proc = get_current_proc_or_esrch!(tf);
                         let fd = proc
                             .fds
                             .lock()
@@ -688,11 +790,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         let (user_ep, net_ep) = crate::ipc::channel::ChannelEndpoint::create_pair();
 
                         // Insert net_ep into daemon's fd table (return to daemon)
-                        let proc = crate::posix::process::PROCESS_TABLE
-                            .lock()
-                            .get(&crate::posix::process::current_pid())
-                            .cloned()
-                            .unwrap();
+                        let proc = get_current_proc_or_esrch!(tf);
                         let net_fd = proc
                             .fds
                             .lock()
@@ -701,11 +799,18 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         // Deliver user_ep into the owner process: either wake a blocked accept or queue it
                         crate::net::socket::push_pending_accepted(listen_sid, {
                             // insert into owner's fd table
-                            let owner_proc = crate::posix::process::PROCESS_TABLE
+                            let owner_proc = match crate::posix::process::PROCESS_TABLE
                                 .lock()
                                 .get(&owner_pid)
                                 .cloned()
-                                .unwrap();
+                            {
+                                Some(p) => p,
+                                None => {
+                                    tf.regs[10] = crate::errno::ESRCH;
+                                    tf.sepc += 4;
+                                    return tf as *mut _;
+                                }
+                            };
                             owner_proc
                                 .fds
                                 .lock()
@@ -759,11 +864,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let fd = arg0 as u32;
                     let addr_ptr = arg1 as *const u8;
                     let addr_len = arg2 as usize;
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let fds = proc.fds.lock();
                     if let Some(obj) = fds.get(fd) {
                         match obj {
@@ -793,11 +894,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     // sys_listen(fd, backlog, _)
                     let fd = arg0 as u32;
                     let backlog = arg1 as u32;
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let fds = proc.fds.lock();
                     if let Some(obj) = fds.get(fd) {
                         match obj {
@@ -825,11 +922,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let fd = arg0 as u32;
                     let addr_ptr = arg1 as *const u8;
                     let addr_len = arg2 as usize;
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let fds = proc.fds.lock();
                     if let Some(obj) = fds.get(fd) {
                         match obj {
@@ -859,11 +952,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let fd = arg0 as u32;
                     let buf_ptr = arg1 as *const u8;
                     let len = arg2 as usize;
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let fds = proc.fds.lock();
                     if let Some(obj) = fds.get(fd) {
                         match obj {
@@ -892,11 +981,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let fd = arg0 as u32;
                     let buf_ptr = arg1 as *mut u8;
                     let max_len = arg2 as usize;
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let fds = proc.fds.lock();
                     if let Some(obj) = fds.get(fd) {
                         match obj {
@@ -932,11 +1017,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let fd = arg0 as u32;
                     let buf_ptr = arg1 as *mut u8;
                     let max_len = arg2 as usize;
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let fds = proc.fds.lock();
                     if let Some(obj) = fds.get(fd) {
                         match obj {
@@ -960,11 +1041,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 23 => {
                     // sys_setuid
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     if proc.euid.load(Ordering::Relaxed) == 0 {
                         // Root can set UID to anything
                         let val = arg0 as u32;
@@ -981,11 +1058,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 24 => {
                     // sys_setgid
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     if proc.euid.load(Ordering::Relaxed) == 0 {
                         let val = arg0 as u32;
                         proc.gid.store(val, Ordering::Relaxed);
@@ -1006,14 +1079,10 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         match crate::vfs::lookup_parent(path) {
                             Ok((parent, name)) => match parent.create(&name) {
                                 Ok(vnode) => {
-                                    let proc = crate::posix::process::PROCESS_TABLE
-                                        .lock()
-                                        .get(&crate::posix::process::current_pid())
-                                        .cloned()
-                                        .unwrap();
+                                    let proc = get_current_proc_or_esrch!(tf);
                                     let fd_desc = crate::ipc::handle::FileDescription {
                                         vnode,
-                                        offset: spin::Mutex::new(0),
+                                        offset: crate::sync::Mutex::new(0),
                                     };
                                     let fd = proc.fds.lock().insert(
                                         crate::ipc::handle::KernelObject::File(
@@ -1032,38 +1101,22 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 30 => {
                     // sys_getuid
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     tf.regs[10] = proc.uid.load(Ordering::Relaxed) as usize;
                 }
                 31 => {
                     // sys_geteuid
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     tf.regs[10] = proc.euid.load(Ordering::Relaxed) as usize;
                 }
                 32 => {
                     // sys_getgid
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     tf.regs[10] = proc.gid.load(Ordering::Relaxed) as usize;
                 }
                 33 => {
                     // sys_getegid
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     tf.regs[10] = proc.egid.load(Ordering::Relaxed) as usize;
                 }
                 34 => {
@@ -1087,11 +1140,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     // sys_can_sudo
                     // arg0 = uid to check (or 0 = use current process uid)
                     let uid = if arg0 == 0 {
-                        let proc = crate::posix::process::PROCESS_TABLE
-                            .lock()
-                            .get(&crate::posix::process::current_pid())
-                            .cloned()
-                            .unwrap();
+                        let proc = get_current_proc_or_esrch!(tf);
                         proc.uid.load(Ordering::Relaxed)
                     } else {
                         arg0 as u32
@@ -1125,27 +1174,64 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     }
                 }
                 51 => {
-                    // sys_exec(path_ptr, len)
+                    // sys_exec(path_ptr, path_len, argv_buf_ptr, argv_buf_len)
+                    // argv_buf: packed null-terminated strings "arg0\0arg1\0...argN\0"
                     let path_ptr = arg0 as *const u8;
                     let path_len = arg1 as usize;
+                    let argv_buf_ptr = arg2 as *const u8;
+                    let argv_buf_len = tf.regs[13]; // a3
+
+                    // Copy argv from user memory BEFORE sys_exec destroys the old address space.
+                    let argv_data: alloc::vec::Vec<u8> =
+                        if argv_buf_len > 0 && arg2 != 0 {
+                            unsafe {
+                                core::slice::from_raw_parts(argv_buf_ptr, argv_buf_len).to_vec()
+                            }
+                        } else {
+                            alloc::vec::Vec::new()
+                        };
+
                     match crate::posix::spawn::sys_exec(path_ptr, path_len) {
                         Ok(entry_point) => {
-                            // sys_exec has already installed the new page table into
-                            // the process struct; now switch the CPU to it and jump to
-                            // the new entry point — do NOT advance sepc by 4.
+                            let pid = crate::posix::process::current_pid();
+
+                            // Close FD_CLOEXEC handles — the new image must not see them.
+                            {
+                                let table = crate::posix::process::PROCESS_TABLE.lock();
+                                if let Some(proc) = table.get(&pid) {
+                                    proc.fds.lock().close_on_exec();
+                                }
+                            }
+
+                            // Reset wait state — new image starts with no pending wait.
+                            {
+                                let table = crate::posix::process::PROCESS_TABLE.lock();
+                                if let Some(proc) = table.get(&pid) {
+                                    *proc.wait_result.lock() = None;
+                                    *proc.wait_target.lock() = None;
+                                }
+                            }
+
+                            // Set up argc/argv on the new user stack.
+                            let (argc, argv_ptr, new_sp) = setup_exec_stack(&argv_data);
+
+                            // Reinstall the new page table on this CPU (sys_exec already
+                            // stored it in proc.satp_val; we need the CPU to see it).
                             let new_satp = crate::posix::process::PROCESS_TABLE
                                 .lock()
-                                .get(&crate::posix::process::current_pid())
-                                .map(|p| p.satp_val)
+                                .get(&pid)
+                                .map(|p| p.satp_val.load(Ordering::Relaxed))
                                 .unwrap_or(0);
                             unsafe {
                                 riscv::register::satp::write(new_satp);
                                 core::arch::asm!("sfence.vma");
                             }
+
                             tf.sepc = entry_point;
-                            tf.regs[2] = crate::posix::spawn::USER_STACK_TOP;
+                            tf.regs[2] = new_sp;    // sp
+                            tf.regs[10] = argc;     // a0 = argc
+                            tf.regs[11] = argv_ptr; // a1 = argv
                             tf.sstatus = (1 << 5) | (1 << 18);
-                            tf.regs[10] = 0;
                             return tf as *mut _;
                         }
                         Err(_) => {
@@ -1167,29 +1253,28 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
 
                     if let Some((zpid, zstatus)) = delivered {
                         // Extract resources then remove — must free after lock is released.
-                        let (kstack, zombie_satp) = {
+                        let (kstack, zombie_satp, parent_arc) = {
                             let mut table = crate::posix::process::PROCESS_TABLE.lock();
                             let r = table
                                 .get(&zpid)
-                                .map(|p| (p.kernel_stack_bottom, p.satp_val))
+                                .map(|p| (p.kernel_stack_bottom, p.satp_val.load(Ordering::Relaxed)))
                                 .unwrap_or((0, 0));
                             table.remove(&zpid);
-                            if let Some(parent) = table.get(&ppid) {
-                                parent.children.lock().retain(|&p| p != zpid);
-                            }
-                            if let Some(parent) = table.get(&ppid) {
-                                *parent.wait_target.lock() = None;
-                                *parent.wait_status_ptr.lock() = None;
-                            }
-                            r
+                            let parent = table.get(&ppid).cloned();
+                            (r.0, r.1, parent)
                         };
+                        if let Some(parent) = parent_arc {
+                            parent.children.lock().retain(|&p| p != zpid);
+                            *parent.wait_target.lock() = None;
+                            *parent.wait_status_ptr.lock() = None;
+                        }
                         // Free resources after lock is dropped.
                         if kstack != 0 {
                             const KSZ: usize = 65536;
                             unsafe {
                                 alloc::alloc::dealloc(
                                     kstack as *mut u8,
-                                    core::alloc::Layout::from_size_align(KSZ, 16).unwrap(),
+                                    core::alloc::Layout::from_size_align(KSZ, 16).unwrap_or_else(|_| unreachable!("constant layout")),
                                 );
                             }
                         }
@@ -1228,28 +1313,27 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
 
                         if let Some((zpid, zstatus)) = found_zombie {
                             // Extract resources then remove.
-                            let (kstack, zombie_satp) = {
+                            let (kstack, zombie_satp, parent_arc) = {
                                 let mut table = crate::posix::process::PROCESS_TABLE.lock();
                                 let r = table
                                     .get(&zpid)
-                                    .map(|p| (p.kernel_stack_bottom, p.satp_val))
+                                    .map(|p| (p.kernel_stack_bottom, p.satp_val.load(Ordering::Relaxed)))
                                     .unwrap_or((0, 0));
                                 table.remove(&zpid);
-                                if let Some(parent) = table.get(&ppid) {
-                                    parent.children.lock().retain(|&p| p != zpid);
-                                }
-                                if let Some(parent) = table.get(&ppid) {
-                                    *parent.wait_target.lock() = None;
-                                    *parent.wait_status_ptr.lock() = None;
-                                }
-                                r
+                                let parent = table.get(&ppid).cloned();
+                                (r.0, r.1, parent)
                             };
+                            if let Some(parent) = parent_arc {
+                                parent.children.lock().retain(|&p| p != zpid);
+                                *parent.wait_target.lock() = None;
+                                *parent.wait_status_ptr.lock() = None;
+                            }
                             if kstack != 0 {
                                 const KSZ: usize = 65536;
                                 unsafe {
                                     alloc::alloc::dealloc(
                                         kstack as *mut u8,
-                                        core::alloc::Layout::from_size_align(KSZ, 16).unwrap(),
+                                        core::alloc::Layout::from_size_align(KSZ, 16).unwrap_or_else(|_| unreachable!("constant layout")),
                                     );
                                 }
                             }
@@ -1276,7 +1360,8 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                 *proc.wait_status_ptr.lock() = Some(status_ptr as usize);
                                 tf.sepc -= 4; // restart waitpid when resumed
                                 *proc.state.lock() = crate::posix::process::ProcState::Stopped;
-                                crate::posix::process::RUN_QUEUE.lock().push_back(ppid);
+                                // Do NOT push to RUN_QUEUE — exit() will set us Running
+                                // and re-queue us when the child exits.
                                 drop(proc); // drop Arc before diverging into schedule()
                                 crate::posix::process::schedule();
                                 unsafe { __halt_cpu() }
@@ -1362,7 +1447,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let ppid = crate::posix::process::PROCESS_TABLE
                         .lock()
                         .get(&crate::posix::process::current_pid())
-                        .map(|p| p.ppid)
+                        .map(|p| p.ppid.load(core::sync::atomic::Ordering::Relaxed))
                         .unwrap_or(0);
                     tf.regs[10] = ppid as usize;
                 }
@@ -1373,11 +1458,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     if let Ok(path) = core::str::from_utf8(path_bytes) {
                         match crate::vfs::lookup_path(path) {
                             Ok(vnode) if vnode.stat().vtype == crate::vfs::VnodeType::Directory => {
-                                let proc = crate::posix::process::PROCESS_TABLE
-                                    .lock()
-                                    .get(&crate::posix::process::current_pid())
-                                    .cloned()
-                                    .unwrap();
+                                let proc = get_current_proc_or_esrch!(tf);
                                 *proc.cwd.lock() = alloc::string::String::from(path);
                                 tf.regs[10] = 0;
                             }
@@ -1389,11 +1470,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 56 => {
                     // sys_getcwd(buf_ptr, buf_len)
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     let cwd = proc.cwd.lock().clone();
                     let bytes = cwd.as_bytes();
                     let len = core::cmp::min(arg1, bytes.len());
@@ -1403,11 +1480,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 57 => {
                     // sys_dup(oldfd) → new_fd (lowest available)
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     match proc.fds.lock().dup(arg0 as u32) {
                         Some(new_h) => tf.regs[10] = new_h as usize,
                         None => tf.regs[10] = usize::MAX,
@@ -1415,11 +1488,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 58 => {
                     // sys_dup2(oldfd, newfd) → newfd
-                    let proc = crate::posix::process::PROCESS_TABLE
-                        .lock()
-                        .get(&crate::posix::process::current_pid())
-                        .cloned()
-                        .unwrap();
+                    let proc = get_current_proc_or_esrch!(tf);
                     if proc.fds.lock().dup2(arg0 as u32, arg1 as u32) {
                         tf.regs[10] = arg1;
                     } else {
@@ -1434,12 +1503,12 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     tf.regs[10] = 0;
                 }
                 _ => {
-                    panic!("Unknown syscall {}", syscall_num);
+                    // Unknown syscall — return ENOSYS rather than crashing the kernel.
+                    crate::println!("pid {}: unknown syscall {}", crate::posix::process::current_pid(), syscall_num);
+                    tf.regs[10] = usize::MAX; // -1 (ENOSYS)
                 }
             }
 
-            // Advance sepc to next instruction after ecall
-            tf.sepc += 4;
             tf as *mut _
         }
         // Instruction or load page fault — demand paging
@@ -1457,55 +1526,62 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
             }
         }
-        // Store/AMO page fault — copy-on-write
+        // Store/AMO page fault — copy-on-write, then demand paging (stack growth)
         scause::Trap::Exception(15) => {
             use riscv::register::stval;
             let fault_va = stval::read();
+            // Try COW first (fork: shared read-only page → private writable copy).
             match crate::mm::vmm::handle_store_page_fault(fault_va) {
                 Ok(()) => tf as *mut _,
-                Err(e) => {
-                    panic!("Unhandled store page fault: {}", e);
+                Err(_) => {
+                    // Not a COW page — try demand paging (stack growth or lazy alloc).
+                    match crate::mm::vmm::handle_user_page_fault(fault_va) {
+                        Ok(()) => tf as *mut _,
+                        Err(e) => {
+                            let pid = crate::posix::process::current_pid();
+                            crate::println!(
+                                "Segfault pid {}: store {} at va={:#x}",
+                                pid, e, fault_va
+                            );
+                            crate::posix::spawn::exit(pid, -11);
+                            crate::posix::process::schedule();
+                            unsafe { __halt_cpu() }
+                        }
+                    }
                 }
             }
         }
         // Supervisor timer interrupt — preempt current process.
-        // We ONLY re-queue the current process and return; we do NOT
-        // call schedule() here because the interrupted code may hold
-        // kernel locks (e.g. PROCESS_TABLE) that schedule() would try
-        // to acquire, causing a deadlock with spin::Mutex.
+        // Timer fires only in user mode (SIE=1), so no kernel locks are held;
+        // calling schedule() here is safe.
         scause::Trap::Interrupt(5) => {
             crate::timer::set_next_timer();
 
-            // Poll UART for Ctrl+C while the foreground process is not doing read().
-            // The timer fires only in user mode (interrupts disabled in kernel mode),
-            // so no Rust locks are held here — safe to call exit() + schedule().
-            {
-                let mut uart = crate::uart::Uart::new();
-                if let Some(c) = uart.try_get_char() {
-                    if c == 0x03 {
-                        let fg = crate::posix::process::FOREGROUND_PID
-                            .swap(-1, Ordering::Relaxed);
-                        if fg > 0 {
-                            uart.put_char(b'^');
-                            uart.put_char(b'C');
-                            uart.put_char(b'\n');
-                            crate::posix::spawn::exit(fg, 130);
-                            crate::posix::process::schedule();
-                            unsafe { __halt_cpu() }
-                        }
-                    } else {
-                        // Non-Ctrl+C: push into the line discipline buffer for the
-                        // next read() syscall to pick up.
-                        LINE_DISC_BUFFER.lock().push(c);
-                    }
-                }
+            // Drain all available UART bytes into LINE_DISC_BUFFER in one shot.
+            // Only HART 0 polls UART to avoid multiple HARTs racing on the RX register.
+            if crate::smp::current_hartid() == 0 {
+                poll_uart_into_linedisc();
             }
 
-            let pid = crate::posix::process::current_pid();
-            if pid != 0 {
-                crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+            // Only preempt if we came from U-mode (SPP == 0) AND there is genuinely
+            // another runnable process.  Do NOT push the current pid when staying put —
+            // that would create a phantom queue entry and defeat the sys_yield no-op.
+            let is_user = (tf.sstatus & (1 << 8)) == 0;
+            if is_user {
+                let pid = crate::posix::process::current_pid();
+                let should_preempt = !crate::posix::process::RUN_QUEUE.lock().is_empty();
+                if should_preempt {
+                    if pid != 0 {
+                        crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                    }
+                    crate::posix::process::schedule();
+                    unsafe { __halt_cpu() }
+                } else {
+                    tf as *mut _
+                }
+            } else {
+                tf as *mut _
             }
-            tf as *mut _
         }
         // Supervisor software interrupt — TLB shootdown IPI
         scause::Trap::Interrupt(1) => {
@@ -1517,7 +1593,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
         }
         // External interrupts — PLIC claim/complete
         scause::Trap::Interrupt(9) | scause::Trap::Interrupt(11) => {
-            let hart = crate::posix::process::current_hart();
+            let hart = crate::smp::current_hartid();
             let irq = crate::plic::claim(hart as usize);
             if irq != 0 {
                 crate::drivers::dispatch_interrupt(irq as usize);
@@ -1529,15 +1605,52 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
             crate::println!("Unhandled interrupt: {}", n);
             tf as *mut _
         }
+        // Instruction address misaligned
+        scause::Trap::Exception(0) => {
+            if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
+                panic!("Kernel instruction address misaligned at sepc={:#x}", sepc);
+            }
+            let pid = crate::posix::process::current_pid();
+            crate::println!("pid {}: instruction address misaligned sepc={:#x} — killed", pid, sepc);
+            crate::posix::spawn::exit(pid, -4); // SIGILL equivalent
+            crate::posix::process::schedule();
+            unsafe { __halt_cpu() }
+        }
+        // Illegal instruction
+        scause::Trap::Exception(2) => {
+            if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
+                panic!("Kernel illegal instruction at sepc={:#x} stval={:#x}", sepc, stval);
+            }
+            let pid = crate::posix::process::current_pid();
+            crate::println!("pid {}: illegal instruction sepc={:#x} stval={:#x} — killed", pid, sepc, stval);
+            crate::posix::spawn::exit(pid, -4); // SIGILL
+            crate::posix::process::schedule();
+            unsafe { __halt_cpu() }
+        }
+        // Load/Store address misaligned
+        scause::Trap::Exception(4) | scause::Trap::Exception(6) => {
+            if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
+                panic!("Kernel misaligned memory access at sepc={:#x} stval={:#x}", sepc, stval);
+            }
+            let pid = crate::posix::process::current_pid();
+            crate::println!("pid {}: misaligned memory access sepc={:#x} stval={:#x} — killed", pid, sepc, stval);
+            crate::posix::spawn::exit(pid, -7); // SIGBUS
+            crate::posix::process::schedule();
+            unsafe { __halt_cpu() }
+        }
         _ => {
-            use riscv::register::stval;
-            panic!(
-                "Unhandled trap: {:?}, sepc: {:#x}, stval: {:#x}, sstatus: {:#x}",
-                cause,
-                tf.sepc,
-                stval::read(),
-                tf.sstatus
+            // Unhandled exception
+            if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
+                panic!("Kernel unhandled trap {:?} at sepc={:#x} stval={:#x}", cause, sepc, stval);
+            }
+            let pid = crate::posix::process::current_pid();
+            crate::println!(
+                "pid {}: unhandled trap {:?} sepc={:#x} stval={:#x} — killed",
+                pid, cause, tf.sepc, stval
             );
+            crate::posix::spawn::exit(pid, -1);
+            crate::posix::process::schedule();
+            unsafe { __halt_cpu() }
         }
     }
 }

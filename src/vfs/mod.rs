@@ -7,7 +7,7 @@ pub mod tar;
 use crate::posix::process::Process;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VnodeType {

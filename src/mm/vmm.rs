@@ -1,4 +1,4 @@
-use crate::mm::pmm::alloc_page;
+use crate::mm::pmm::{alloc_frame, alloc_page};
 use crate::println;
 use core::arch::asm;
 use riscv::register::satp;
@@ -20,7 +20,10 @@ impl PageTable {
     }
 
     pub fn new_process_table() -> Result<usize, &'static str> {
-        let root_page = alloc_page().ok_or("Out of memory")?;
+        let root_page = alloc_frame().ok_or("Out of memory")?.into_raw();
+        // SAFETY:
+        // Preconditions: `root_page` is a newly allocated, 4096-aligned physical address exclusively owned by this call.
+        // Postconditions: Returns a mutable reference to the 4096-byte frame cast as a `PageTable`. Mutability is safe as we hold exclusive ownership.
         let root = unsafe { &mut *(root_page as *mut PageTable) };
 
         // Identity map kernel using 1GB mega-pages (0 to 4GB); NOT PTE_U
@@ -41,11 +44,15 @@ impl PageTable {
         for level in (1..=2).rev() {
             let entry = &mut pt.entries[vpn[level]];
             if *entry & PTE_V == 0 {
-                let new_page = alloc_page().ok_or("Out of memory mapping page")?;
-                let ppn = new_page >> 12;
+                let new_page = alloc_frame().ok_or("Out of memory mapping page")?;
+                let ppn = new_page.pa() >> 12;
                 *entry = (ppn << 10) | PTE_V;
+                new_page.into_raw(); // Ownership transferred to PTE
             }
             let next_pt_pa = (*entry >> 10) << 12;
+            // SAFETY:
+            // Preconditions: `next_pt_pa` is a physical address derived from a valid PTE we just wrote or verified. It represents a 4096-byte aligned page table frame owned by the process.
+            // Postconditions: Updates `pt` to reference the next-level page table. Valid because we hold an exclusive borrow to the overall table via `&mut self`.
             pt = unsafe { &mut *(next_pt_pa as *mut PageTable) };
         }
 
@@ -66,14 +73,18 @@ impl PageTable {
 pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(), &'static str> {
     use crate::mm::pmm;
 
-    // Safety: raw pointer dereferences are safe because we are given valid physical
-    // addresses of page tables that we own (or are currently in use by the parent).
+    // SAFETY for the entire clone_level function:
+    // Preconditions: `parent_pa` and `child_pa` must be valid, 4096-byte aligned physical addresses of page tables owned by the respective processes.
+    // The parent's page table must not be concurrently modified (caller holds process lock).
+    // Postconditions: Recursively clones all mappings and increments refcounts for COW leaf pages.
     unsafe fn clone_level(
         parent_pa: usize,
         child_pa: usize,
         level: usize,
     ) -> Result<(), &'static str> {
+        // SAFETY: Preconditions met by caller (see `clone_level` function documentation).
         let parent_pt = unsafe { &mut *(parent_pa as *mut PageTable) };
+        // SAFETY: Preconditions met by caller (see `clone_level` function documentation).
         let child_pt = unsafe { &mut *(child_pa as *mut PageTable) };
 
         // At root level (2), skip kernel identity entries (indices 0-3).
@@ -92,14 +103,14 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
             let is_leaf = (entry & (PTE_R | PTE_X)) != 0;
             if !is_leaf {
                 // Allocate a new page for child's next level
-                let new_page = pmm::alloc_page().ok_or("OOM cloning page table")?;
-                let ppn = new_page >> 12;
+                let new_page = pmm::alloc_frame().ok_or("OOM cloning page table")?;
+                let ppn = new_page.pa() >> 12;
                 child_pt.entries[idx] = (ppn << 10) | PTE_V;
-
                 let next_parent_pa = (entry >> 10) << 12;
-                let next_child_pa = new_page;
+                let next_child_pa = new_page.into_raw(); // transferred
 
                 // Recurse into next level
+                // SAFETY: see enclosing function doc-comment.
                 unsafe { clone_level(next_parent_pa, next_child_pa, level - 1)? };
             } else {
                 // Leaf mapping
@@ -125,6 +136,9 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
     }
 
     // Start recursion at level 2 (root has 3 levels: 2,1,0)
+    // SAFETY:
+    // Preconditions: `parent_root_pa` and `child_root_pa` are valid, 4096-aligned physical addresses representing root page tables.
+    // Postconditions: Starts the recursive clone operation starting at level 2.
     unsafe { clone_level(parent_root_pa, child_root_pa, 2) }
 }
 
@@ -134,7 +148,8 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
     use crate::mm::pmm;
     use riscv::register::satp;
 
-    let satp_val = unsafe { satp::read().bits() } as usize;
+    // satp::read() is safe — it merely reads a CSR with no side effects.
+    let satp_val = satp::read().bits() as usize;
     let ppn = satp_val & 0xFFFFFFFFFFF;
     let root_pa = ppn << 12;
 
@@ -147,6 +162,9 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
 
     let mut pt_pa = root_pa;
     for level in (1..=2).rev() {
+        // SAFETY:
+        // Preconditions: `pt_pa` is derived from the active `SATP` CSR or a valid intermediate PTE, ensuring it is a valid page table physical address.
+        // Postconditions: Mutably borrows the page table to walk its entries.
         let pt = unsafe { &mut *(pt_pa as *mut PageTable) };
         let entry = pt.entries[vpn[level]];
         if entry & PTE_V == 0 {
@@ -159,6 +177,9 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
         pt_pa = ((entry >> 10) << 12) as usize;
     }
 
+    // SAFETY:
+    // Preconditions: `pt_pa` is a valid L0 page table physical address reached via a successful page walk from `SATP`.
+    // Postconditions: Mutably borrows the leaf page table to alter the PTE.
     let pt = unsafe { &mut *(pt_pa as *mut PageTable) };
     let entry = pt.entries[vpn[0]];
     if entry & PTE_V == 0 {
@@ -171,7 +192,11 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
     // If page is user and not writable, perform COW
     if (flags & PTE_U) != 0 && (flags & PTE_W) == 0 {
         // Allocate a new page and copy contents
-        let new_pa = pmm::alloc_page().ok_or("OOM in COW")?;
+        let new_frame = pmm::alloc_frame().ok_or("OOM in COW")?;
+        let new_pa = new_frame.pa();
+        // SAFETY:
+        // Preconditions: `pa` is a valid physical address of an existing initialized user page. `new_pa` is a freshly allocated page. Both are PAGE_SIZE (4096) bytes.
+        // Postconditions: Copies exactly 4096 bytes from `pa` to `new_pa` without overlapping.
         unsafe {
             core::ptr::copy_nonoverlapping(pa as *const u8, new_pa as *mut u8, pmm::PAGE_SIZE);
         }
@@ -179,6 +204,7 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
         // Update PTE to point to new page with write enabled
         let new_entry = ((new_pa >> 12) << 10) | (flags | PTE_W) | PTE_V;
         pt.entries[vpn[0]] = new_entry;
+        new_frame.into_raw(); // ownership transferred to PTE
 
         // Decrement refcount of old page; free if zero
         let remaining = pmm::decr_ref(pa);
@@ -186,7 +212,10 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
             pmm::free_page(pa);
         }
 
-        // Flush TLB
+        // Flush TLB to make the new writable PTE visible to the CPU.
+        // SAFETY:
+        // Preconditions: Process is in supervisor mode.
+        // Postconditions: Executes the `sfence.vma` instruction to flush the TLB, ensuring the new PTE is visible.
         unsafe { core::arch::asm!("sfence.vma") };
 
         Ok(())
@@ -197,8 +226,11 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
 
 static mut ROOT_PAGE_TABLE: usize = 0;
 
+// SAFETY for destroy_level:
+// Preconditions: `pt_pa` is a valid physical address of a page table owned by the process. No concurrent access to this page table exists.
+// Postconditions: Recursively frees all leaf user pages and intermediate page tables.
 unsafe fn destroy_level(pt_pa: usize, level: usize) {
-    // pt_pa is physical address of a page table
+    // SAFETY: Preconditions met by caller (see `destroy_level` function documentation).
     let pt = unsafe { &mut *(pt_pa as *mut PageTable) };
     for idx in 0..512 {
         let entry = pt.entries[idx];
@@ -221,6 +253,9 @@ unsafe fn destroy_level(pt_pa: usize, level: usize) {
             // pointer to next-level page table
             let next_pa = (entry >> 10) << 12;
             if level > 0 {
+                // SAFETY:
+                // Preconditions: `next_pa` is a valid intermediate page table physical address.
+                // Postconditions: Recursively destroys the child table.
                 unsafe { destroy_level(next_pa, level - 1) };
             }
             // free the page table page itself
@@ -232,6 +267,10 @@ unsafe fn destroy_level(pt_pa: usize, level: usize) {
 
 pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
     // Walk levels and free user mappings and page-table pages (but keep kernel identity entries if present)
+    // SAFETY: `root_pa` is the physical address of the root page table for a
+    // process that is currently exiting.  The process has been removed from the
+    // scheduler so no concurrent access is possible.  Kernel identity entries
+    // (indices 0-3) are explicitly skipped so the kernel mapping is never freed.
     unsafe {
         // root is level 2
         let root = &mut *(root_pa as *mut PageTable);
@@ -286,25 +325,32 @@ pub fn handle_user_page_fault(fault_va: usize) -> Result<(), &'static str> {
     }
     let page_va = fault_va & !(PAGE_SIZE - 1);
 
-    let satp_val = unsafe { riscv::register::satp::read().bits() } as usize;
+    // satp::read() is safe — it merely reads a CSR with no side effects.
+    let satp_val = riscv::register::satp::read().bits() as usize;
     let ppn = satp_val & 0xFFFFFFFFFFF;
     let root_pa = ppn << 12;
+
+    // 2. Allocate a physical page (zeroed by PMM)
+    let frame = crate::mm::pmm::alloc_frame().ok_or("OOM in demand paging")?;
+
+    // 3. Map the new page
+    // SAFETY:
+    // Preconditions: `root_pa` is derived from the active `SATP` CSR, ensuring it is the valid root page table.
+    // Postconditions: Mutably borrows the active root page table.
     let pt = unsafe { &mut *(root_pa as *mut PageTable) };
-
-    let pa = crate::mm::pmm::alloc_page().ok_or("OOM in demand paging")?;
-    // Zero the new page
-    unsafe {
-        core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE);
-    }
-
-    match pt.map_page(page_va, pa, PTE_R | PTE_W | PTE_U) {
+    match pt.map_page(page_va, frame.pa(), PTE_R | PTE_W | PTE_U) {
         Ok(()) => {
+            frame.into_raw(); // Ownership transferred to PTE
+            // SAFETY: sfence.vma is a privileged instruction valid in S-mode.
             unsafe { core::arch::asm!("sfence.vma") };
             Ok(())
         }
         Err(_) => {
-            // Page was already mapped (e.g., a concurrent fault race) — free the new page.
-            crate::mm::pmm::free_page(pa);
+            // Page was already mapped (e.g., a concurrent fault race).
+            // `frame` drops here, automatically freeing the physical page.
+            // SAFETY:
+            // Preconditions: Process is in supervisor mode.
+            // Postconditions: Flushes the TLB so the new mapping or concurrent update is visible.
             unsafe { core::arch::asm!("sfence.vma") };
             Ok(())
         }
@@ -312,11 +358,17 @@ pub fn handle_user_page_fault(fault_va: usize) -> Result<(), &'static str> {
 }
 
 pub fn init() {
-    let root_page = alloc_page().expect("Failed to allocate root page table");
+    let root_page = alloc_frame().expect("Failed to allocate root page table").into_raw();
+    // SAFETY: `ROOT_PAGE_TABLE` is only written here during single-threaded
+    // kernel init before any secondary HARTs are released (SMP_GO_FLAG is
+    // not set yet).  After init(), it is only read.
     unsafe {
         ROOT_PAGE_TABLE = root_page;
     }
 
+    // SAFETY:
+    // Preconditions: `root_page` is a valid, 4096-aligned physical address just allocated.
+    // Postconditions: Modifies the root kernel table to identity-map the first 4GB.
     let root = unsafe { &mut *(root_page as *mut PageTable) };
 
     // Identity map the first 4GB of physical address space using 1GB mega-pages
@@ -332,6 +384,9 @@ pub fn init() {
     // satp MODE: 8 means Sv39
     let satp_val = (8 << 60) | ppn;
 
+    // SAFETY: satp::write() is a privileged CSR write valid in S-mode.
+    // sfence.vma flushes the TLB after enabling paging so stale entries
+    // from the identity-map phase are evicted before any user code runs.
     unsafe {
         satp::write(satp_val);
         asm!("sfence.vma");

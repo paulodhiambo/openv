@@ -142,7 +142,8 @@ pub fn parse_tar(data: &[u8]) -> Arc<MemDir> {
                 .get(&parent_path)
                 .cloned()
                 .unwrap_or_else(|| root.clone());
-            let basename = components.last().unwrap();
+            let components: Vec<&str> = name_str.split('/').filter(|c| !c.is_empty()).collect();
+            let basename = components.last().unwrap_or(&"");
             parent_dir.add_child(basename, file_node);
         }
 

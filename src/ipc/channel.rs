@@ -3,7 +3,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::task::{Poll, Waker};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 /// A message sent over a channel.
 pub struct Message {

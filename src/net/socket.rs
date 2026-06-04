@@ -5,7 +5,7 @@ use crate::posix::process::Pid;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 // Simple socket registry for proxying sockets to a userspace network daemon.
 

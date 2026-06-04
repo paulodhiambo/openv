@@ -1,4 +1,8 @@
 TARGET      := riscv64gc-unknown-none-elf
+NIGHTLY     := $(shell rustup which cargo --toolchain nightly | sed 's|/cargo$$||')
+CARGO       ?= $(NIGHTLY)/cargo
+RUSTC       ?= $(NIGHTLY)/rustc
+export RUSTC
 KERNEL_DIR  := target/$(TARGET)/debug
 KERNEL      := $(KERNEL_DIR)/openv
 KERNEL_REL  := target/$(TARGET)/release/openv
@@ -70,16 +74,16 @@ build-release: build-user-release initrd build-kernel-release
 	@echo 'Release build complete.  Run: make run'
 
 build-kernel:
-	cargo build
+	$(CARGO) build
 
 build-kernel-release:
-	cargo build --release
+	$(CARGO) build --release
 
 build-user:
-	cd user && cargo build
+	cd user && $(CARGO) build
 
 build-user-release:
-	cd user && cargo build --release
+	cd user && $(CARGO) build --release
 
 initrd: test_root/proc test_root/dev
 	@for bin in $(BINS); do \
@@ -139,32 +143,32 @@ image-release: $(KERNEL_REL) $(INITRD)
 # ── Quality ────────────────────────────────────────────────────────────────────
 
 check:
-	cargo check
+	$(CARGO) check
 
 clippy:
-	cargo clippy -- -D warnings
+	$(CARGO) clippy -- -D warnings
 
 fmt:
-	cargo fmt
-	cd user && cargo fmt
+	$(CARGO) fmt
+	cd user && $(CARGO) fmt
 
 # ── Clean ──────────────────────────────────────────────────────────────────────
 
 clean:
 	rm -rf openv.img openv.bin $(DISK_IMG)
-	cd user && cargo clean
-	cargo clean
+	cd user && $(CARGO) clean
+	$(CARGO) clean
 
 clean-user:
-	cd user && cargo clean
+	cd user && $(CARGO) clean
 
 # ── File dependencies ──────────────────────────────────────────────────────────
 
 $(KERNEL):
-	cargo build
+	$(CARGO) build
 
 $(KERNEL_REL):
-	cargo build --release
+	$(CARGO) build --release
 
 $(INITRD):
 	@cd test_root && test -f ../$(INITRD) || { \

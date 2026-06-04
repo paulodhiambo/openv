@@ -5,7 +5,7 @@ pub mod virtio_mmio;
 pub mod virtio_net;
 pub mod virtqueue;
 
-use spin::Mutex;
+use crate::sync::Mutex;
 
 static NET_DEVICE: Mutex<Option<&'static dyn NetDevice>> = Mutex::new(None);
 

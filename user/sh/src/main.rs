@@ -4,8 +4,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use libos::{
-    chdir, close, create, dup, dup2, exec, exit, fork, getdents, mkdir, open, pipe, read, set_raw,
-    set_fg_pid, sys_yield, unlink, waitpid, write,
+    chdir, close, create, dup, dup2, exec_args, exit, fork, getdents, mkdir, open, pipe, read,
+    set_raw, set_fg_pid, sys_yield, unlink, waitpid, write,
 };
 
 const RESET: &[u8] = b"\x1b[0m";
@@ -721,8 +721,13 @@ impl Shell {
     fn exec_child(&self, args: &[Vec<u8>]) -> ! {
         if !args.is_empty() {
             let path = Self::build_path(&args[0]);
-            exec(&path); // returns only on failure
-            // Print error to stderr
+            // Pack args as null-terminated strings for the kernel argv setup.
+            let mut argv_buf: Vec<u8> = Vec::new();
+            for arg in args {
+                argv_buf.extend_from_slice(arg);
+                argv_buf.push(0);
+            }
+            exec_args(&path, &argv_buf); // returns only on failure
             write(2, b"sh: exec: ".as_ptr(), 10);
             write(2, args[0].as_ptr(), args[0].len());
             write(2, b"\n".as_ptr(), 1);

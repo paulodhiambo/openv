@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(alloc_error_handler)]
+
 
 extern crate alloc;
 
@@ -12,6 +12,7 @@ use core::panic::PanicInfo;
 
 pub mod block;
 pub mod drivers;
+pub mod errno;
 pub mod ipc;
 pub mod mm;
 pub mod net;
@@ -22,6 +23,7 @@ pub mod timer;
 pub mod trap;
 pub mod uart;
 pub mod vfs;
+pub mod sync;
 
 static mut BOOT_DTB_PTR: usize = 0;
 
@@ -195,7 +197,7 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 
     // Test POSIX Process logic
     crate::raw_print!("[HART-ONLY] kmain: about to create init process\n");
-    let init_pid = posix::process::Process::new(0).pid; // Mock init process
+    let init_pid = posix::process::Process::new(0).expect("Failed to create mock init process").pid; // Mock init process
 
     // Start secondary HARTs now that kernel data structures are ready
     smp::start_secondaries();

@@ -47,7 +47,7 @@ impl NetDevice for LoopbackNet {
 }
 
 use crate::net::pktbuf::PktBuf as _Pkt;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 struct StaticPkt {
     len: usize,

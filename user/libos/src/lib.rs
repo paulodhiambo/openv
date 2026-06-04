@@ -29,7 +29,11 @@ global_asm!(
     .section .text._start
     .global _start
     _start:
+        mv s0, a0
+        mv s1, a1
         call libos_init
+        mv a0, s0
+        mv a1, s1
         call main
         mv a0, zero
         call exit
@@ -360,7 +364,20 @@ pub fn fork() -> i32 {
 /// Replace the current process image with the binary at `path`.
 /// Returns -1 on error (does not return on success).
 pub fn exec(path: &[u8]) -> i32 {
-    syscall(51, path.as_ptr() as usize, path.len(), 0) as i32
+    syscall4(51, path.as_ptr() as usize, path.len(), 0, 0) as i32
+}
+
+/// Replace the current process image, passing `argv_buf` (packed null-terminated strings)
+/// as the argument vector.  `argv_buf` format: `"arg0\0arg1\0...argN\0"`.
+/// Returns -1 on error (does not return on success).
+pub fn exec_args(path: &[u8], argv_buf: &[u8]) -> i32 {
+    syscall4(
+        51,
+        path.as_ptr() as usize,
+        path.len(),
+        argv_buf.as_ptr() as usize,
+        argv_buf.len(),
+    ) as i32
 }
 
 /// Wait for a child process to change state. If target_pid == -1, waits for any child.

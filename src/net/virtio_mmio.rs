@@ -12,7 +12,7 @@ use crate::net::virtqueue::VirtQueue;
 use crate::println;
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 static DRIVER_GLOBAL: Mutex<Option<&'static VirtioDriver>> = Mutex::new(None);
 
@@ -62,10 +62,16 @@ unsafe impl Sync for VirtioDriver {}
 // ── MMIO helpers ──────────────────────────────────────────────────────────────
 
 fn mmio_read32(base: usize, offset: usize) -> u32 {
+    // SAFETY: `base` is a MMIO physical address obtained from the DTB and
+    // identity-mapped by the kernel. read_volatile prevents the compiler
+    // from eliding or reordering the hardware register read.
     unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
 }
 
 fn mmio_write32(base: usize, offset: usize, v: u32) {
+    // SAFETY: `base` is a MMIO physical address obtained from the DTB and
+    // identity-mapped by the kernel. write_volatile prevents the compiler
+    // from eliding or reordering the hardware register write.
     unsafe { core::ptr::write_volatile((base + offset) as *mut u32, v) }
 }
 
@@ -151,6 +157,9 @@ impl NetDevice for VirtioDriver {
             Some(p) => p,
             None => return,
         };
+        // SAFETY: `pa` is a freshly allocated PMM page exclusively owned
+        // by this TX submission. `ptr` is valid for VNET_HDR_LEN + packet.len()
+        // bytes, both of which fit within one 4 KiB page (checked above).
         unsafe {
             let ptr = pa as *mut u8;
             // Zero-filled virtio-net header (no checksum offload, no GSO)
@@ -191,6 +200,11 @@ impl NetDevice for VirtioDriver {
         let data_len = rx_len.saturating_sub(VNET_HDR_LEN);
         let to_copy = core::cmp::min(data_len, buf.len());
         if to_copy > 0 {
+            // SAFETY: `rx_pa` is a PMM-allocated page that the device DMA'd
+            // into. After pop_used() the device no longer owns this buffer;
+            // we re-enqueue a fresh descriptor above, so this read does not
+            // race with the device. `buf` is a caller-provided mutable slice
+            // of at least `to_copy` bytes.
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     (rx_pa + VNET_HDR_LEN) as *const u8,
@@ -231,6 +245,9 @@ pub fn probe_and_init() -> bool {
     if dtb_ptr == 0 {
         return false;
     }
+    // SAFETY: `dtb_ptr` is the physical address of the DTB passed by OpenSBI
+    // in register a1. It is valid for the entire kernel lifetime and correctly
+    // aligned. The FDT crate only reads from it.
     let fdt = match unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8) } {
         Ok(f) => f,
         Err(_) => return false,
@@ -270,10 +287,8 @@ pub fn probe_and_init() -> bool {
 
         if let Some(drv) = init_net_device(base, irq) {
             println!("virtio-net: initialized at {:#x}, irq={}", base, irq);
-            unsafe {
-                *DRIVER_GLOBAL.lock() = Some(drv);
-                crate::net::register_device(drv);
-            }
+            *DRIVER_GLOBAL.lock() = Some(drv);
+            crate::net::register_device(drv);
             return true;
         }
     }
@@ -288,10 +303,8 @@ pub fn probe_driver(base: usize, irq: usize) -> Option<Box<dyn crate::drivers::D
 
     let drv = init_net_device(base, irq as u32)?;
     println!("virtio-net: initialized (driver framework) at {:#x}, irq={}", base, irq);
-    unsafe {
-        *DRIVER_GLOBAL.lock() = Some(drv);
-        crate::net::register_device(drv);
-    }
+    *DRIVER_GLOBAL.lock() = Some(drv);
+    crate::net::register_device(drv);
     Some(Box::new(VirtioDriverRef(drv)))
 }
 
@@ -308,7 +321,8 @@ fn init_net_device(base: usize, irq: u32) -> Option<&'static VirtioDriver> {
     let rx_pa = crate::mm::pmm::alloc_page()?;
     let tx_pa = crate::mm::pmm::alloc_page()?;
 
-    // Zero-init both queue pages so unused descriptor slots are clean
+    // SAFETY: `rx_pa` and `tx_pa` are freshly allocated PMM pages exclusively
+    // owned here. PAGE_SIZE bytes are within each allocation.
     unsafe {
         core::ptr::write_bytes(rx_pa as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);
         core::ptr::write_bytes(tx_pa as *mut u8, 0, crate::mm::pmm::PAGE_SIZE);

@@ -1,6 +1,6 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::Mutex;
 
 pub trait Driver: Send + Sync {
     fn on_interrupt(&self, irq: usize);
