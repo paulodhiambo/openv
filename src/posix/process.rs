@@ -45,6 +45,11 @@ pub struct Process {
     pub mailbox: Mutex<VecDeque<(Pid, Vec<u8>)>>,
     /// PID stored here (== this process's pid) when blocked in sys_ipc_recv (0 = not waiting).
     pub mailbox_waiter: AtomicI32,
+    
+    // Signals
+    pub pending_signals: AtomicU32,
+    pub blocked_signals: AtomicU32,
+    pub signal_handlers: Mutex<[usize; 32]>,
 }
 
 static NEXT_PID: AtomicI32 = AtomicI32::new(1);
@@ -55,6 +60,9 @@ pub static FOREGROUND_PID: AtomicI32 = AtomicI32::new(-1);
 pub static PROCESS_TABLE: Mutex<BTreeMap<Pid, Arc<Process>>> = Mutex::new(BTreeMap::new());
 pub static RUN_QUEUE: Mutex<alloc::collections::VecDeque<Pid>> =
     Mutex::new(alloc::collections::VecDeque::new());
+
+/// Queue of (Pid, wakeup_mtime_ticks)
+pub static SLEEP_QUEUE: Mutex<alloc::vec::Vec<(Pid, u64)>> = Mutex::new(alloc::vec::Vec::new());
 
 static CURRENT_PIDS: [AtomicI32; crate::smp::MAX_HARTS] = [
     AtomicI32::new(0),
@@ -67,6 +75,21 @@ pub fn generate_pid() -> Pid {
     NEXT_PID.fetch_add(1, Ordering::SeqCst)
 }
 
+pub fn wake_sleepers() {
+    let now = riscv::register::time::read() as u64;
+    let mut sq = SLEEP_QUEUE.lock();
+    if sq.is_empty() { return; }
+    
+    let mut i = 0;
+    while i < sq.len() {
+        if now >= sq[i].1 {
+            let (pid, _) = sq.swap_remove(i);
+            RUN_QUEUE.lock().push_back(pid);
+        } else {
+            i += 1;
+        }
+    }
+}
 
 pub fn current_pid() -> Pid {
     CURRENT_PIDS[crate::smp::current_hartid()].load(Ordering::SeqCst)
@@ -225,6 +248,9 @@ impl Process {
             wait_result: Mutex::new(None),
             mailbox: Mutex::new(VecDeque::new()),
             mailbox_waiter: AtomicI32::new(0),
+            pending_signals: AtomicU32::new(0),
+            blocked_signals: AtomicU32::new(0),
+            signal_handlers: Mutex::new([0; 32]),
         });
 
         PROCESS_TABLE.lock().insert(pid, proc.clone());

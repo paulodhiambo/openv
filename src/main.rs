@@ -20,6 +20,7 @@ pub mod net;
 pub mod plic;
 pub mod posix;
 pub mod smp;
+pub mod syscall;
 pub mod timer;
 pub mod trap;
 pub mod uart;

@@ -131,7 +131,7 @@ pub extern "C" fn main() -> i32 {
                     }
                 }
                 OPCODE_SEND => {
-                    if let ProxyMode::Connection { handle } = proxies[i].mode {
+                    if let ProxyMode::Connection { .. } = proxies[i].mode {
                         if r > 1 {
                             proxies[i].tx_queue.extend_from_slice(&ctrl_buf[1..r]);
                         }

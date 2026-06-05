@@ -487,6 +487,65 @@ pub fn getcwd(buf: &mut [u8]) -> usize {
     syscall(56, buf.as_mut_ptr() as usize, buf.len(), 0)
 }
 
+#[repr(C)]
+pub struct TimeVal {
+    pub tv_sec: i64,
+    pub tv_usec: i64,
+}
+
+#[repr(C)]
+pub struct TimeSpec {
+    pub tv_sec: i64,
+    pub tv_nsec: i64,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gettimeofday(tv: *mut TimeVal, _tz: *mut u8) -> i32 {
+    syscall(82, tv as usize, 0, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nanosleep(req: *const TimeSpec, rem: *mut TimeSpec) -> i32 {
+    syscall(83, req as usize, rem as usize, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn setpgid(pid: i32, pgid: i32) -> i32 {
+    syscall(84, pid as usize, pgid as usize, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn getpgid(pid: i32) -> i32 {
+    syscall(85, pid as usize, 0, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn setsid() -> i32 {
+    syscall(86, 0, 0, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn kill(pid: i32, sig: i32) -> i32 {
+    syscall(87, pid as usize, sig as usize, 0) as i32
+}
+
+#[repr(C)]
+pub struct SigAction {
+    pub sa_handler: usize,
+    pub sa_flags: usize,
+    pub sa_mask: u32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigaction(sig: i32, act: *const SigAction, oact: *mut SigAction) -> i32 {
+    syscall(88, sig as usize, act as usize, oact as usize) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigreturn() {
+    syscall(89, 0, 0, 0);
+}
+
 /// Duplicate `fd` to the lowest available descriptor.  Returns new fd or -1.
 pub fn dup(fd: i32) -> i32 {
     syscall(57, fd as usize, 0, 0) as i32
