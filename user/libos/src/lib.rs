@@ -417,6 +417,24 @@ pub extern "C" fn set_echo(enabled: u32) -> i32 {
 
 pub mod net_adapter;
 pub mod smoltcp_device;
+pub mod ipc;
+
+pub const IPC_ANY: i32 = -1;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn msg_send(dest: i32, msg: *const ipc::Message) -> i32 {
+    syscall(90, dest as usize, msg as usize, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn msg_receive(src: i32, msg: *mut ipc::Message) -> i32 {
+    syscall(91, src as usize, msg as usize, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn msg_sendrec(dest: i32, msg: *mut ipc::Message) -> i32 {
+    syscall(92, dest as usize, msg as usize, 0) as i32
+}
 
 // POSIX-like socket wrappers using kernel proxy syscalls
 
@@ -834,8 +852,8 @@ pub fn waitpid_res(target_pid: i32, status_ptr: *mut i32, options: i32) -> Resul
 }
 
 /// Wait for a specific child (or any child if pid == -1). Returns child PID or -1.
-pub fn waitpid(pid: i32, status: *mut i32) -> i32 {
-    syscall(52, pid as usize, status as usize, 0) as i32
+pub fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32 {
+    syscall(52, pid as usize, status as usize, options as usize) as i32
 }
 
 #[cfg(test)]

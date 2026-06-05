@@ -756,7 +756,7 @@ impl Shell {
             } else if pid > 0 {
                 let mut status = 0i32;
                 set_fg_pid(pid);
-                waitpid(pid, &mut status as *mut i32);
+                waitpid(pid, &mut status as *mut i32, 0);
                 set_fg_pid(-1);
             } else {
                 wrt(b"sh: fork failed\n");
@@ -823,7 +823,7 @@ impl Shell {
         for pid in &pids {
             set_fg_pid(*pid);
             let mut status = 0i32;
-            waitpid(*pid, &mut status as *mut i32);
+            waitpid(*pid, &mut status as *mut i32, 0);
         }
         set_fg_pid(-1);
         set_raw(1);

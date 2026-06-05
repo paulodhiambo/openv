@@ -139,6 +139,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc_test"
+version = "0.1.0"
+dependencies = [
+ "libos",
+]
+
+[[package]]
 name = "libos"
 version = "0.1.0"
 dependencies = [

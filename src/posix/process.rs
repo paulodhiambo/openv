@@ -17,6 +17,16 @@ pub enum ProcState {
     Zombie(i32), // Holds the exit status
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcState {
+    None,
+    Sending { target: Pid, msg: crate::ipc::msg::Message, reply_msg_ptr: Option<usize> },
+    Receiving { source: Pid, msg_ptr: usize }, // source can be ANY (-1)
+    ReceivingReply { source: Pid, msg_ptr: usize },
+    MessageAvailable { msg: crate::ipc::msg::Message },
+    SendComplete,
+}
+
 pub struct Process {
     pub pid: Pid,
     pub ppid: AtomicI32,
@@ -41,10 +51,14 @@ pub struct Process {
     pub wait_target: Mutex<Option<Pid>>,
     pub wait_status_ptr: Mutex<Option<usize>>,
     pub wait_result: Mutex<Option<(Pid, i32)>>,
-    /// Per-process IPC mailbox: (sender_pid, message_bytes).
+    
+    // Asynchronous IPC (to be deprecated in Phase 3)
     pub mailbox: Mutex<VecDeque<(Pid, Vec<u8>)>>,
-    /// PID stored here (== this process's pid) when blocked in sys_ipc_recv (0 = not waiting).
     pub mailbox_waiter: AtomicI32,
+    
+    // Synchronous IPC fields
+    pub ipc_state: Mutex<IpcState>,
+    pub senders: Mutex<VecDeque<Pid>>,
     
     // Signals
     pub pending_signals: AtomicU32,
@@ -248,6 +262,8 @@ impl Process {
             wait_result: Mutex::new(None),
             mailbox: Mutex::new(VecDeque::new()),
             mailbox_waiter: AtomicI32::new(0),
+            ipc_state: Mutex::new(IpcState::None),
+            senders: Mutex::new(VecDeque::new()),
             pending_signals: AtomicU32::new(0),
             blocked_signals: AtomicU32::new(0),
             signal_handlers: Mutex::new([0; 32]),

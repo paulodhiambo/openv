@@ -44,7 +44,7 @@ pub extern "C" fn main() -> ! {
     let ft_pid = spawn(b"/forktest".as_ptr(), 9);
     if ft_pid > 0 {
         let mut status: i32 = 0;
-        waitpid(ft_pid, &mut status as *mut i32);
+        waitpid(ft_pid, &mut status as *mut i32, 0);
     }
 
     wrt(b"\n");
@@ -68,7 +68,7 @@ pub extern "C" fn main() -> ! {
         // Reap /sh and any other children that exit while we wait.
         loop {
             let mut status: i32 = 0;
-            let reaped = waitpid(-1, &mut status as *mut i32);
+            let reaped = waitpid(-1, &mut status as *mut i32, 0);
             if reaped == sh_pid {
                 // Shell exited — break inner loop to respawn.
                 break;

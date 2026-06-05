@@ -48,7 +48,7 @@ pub extern "C" fn main() -> i32 {
     w(b"[FT:parent_waiting]\n");
 
     let mut status: i32 = 0;
-    let reaped = waitpid(pid, &mut status as *mut i32);
+    let reaped = waitpid(pid, &mut status as *mut i32, 0);
 
     w(b"[FT:parent_reaped=");
     wnum(reaped);
