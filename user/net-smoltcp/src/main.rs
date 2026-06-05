@@ -24,6 +24,7 @@ const GW_IP: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);
 
 const OPCODE_BIND: u8 = 1;
 const OPCODE_LISTEN: u8 = 2;
+const OPCODE_CONNECT: u8 = 3;
 const OPCODE_SEND: u8 = 4;
 
 struct ProxyEntry {
@@ -31,6 +32,7 @@ struct ProxyEntry {
     sid: u32,
     bound_port: u16,
     mode: ProxyMode,
+    tx_queue: Vec<u8>,
 }
 
 enum ProxyMode {
@@ -76,6 +78,7 @@ pub extern "C" fn main() -> i32 {
                 sid,
                 bound_port: 0,
                 mode: ProxyMode::New,
+                tx_queue: Vec::new(),
             });
         }
 
@@ -106,11 +109,31 @@ pub extern "C" fn main() -> i32 {
                         proxies[i].mode = ProxyMode::Listening { handle };
                     }
                 }
+                OPCODE_CONNECT => {
+                    if r >= 9 {
+                        let port = u16::from_be_bytes([ctrl_buf[3], ctrl_buf[4]]);
+                        let ip = smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(
+                            ctrl_buf[5], ctrl_buf[6], ctrl_buf[7], ctrl_buf[8]
+                        ));
+                        static mut EPHEMERAL_PORT: u16 = 49152;
+                        let local_port = unsafe {
+                            let p = EPHEMERAL_PORT;
+                            EPHEMERAL_PORT += 1;
+                            if EPHEMERAL_PORT < 49152 { EPHEMERAL_PORT = 49152; }
+                            p
+                        };
+                        let rx = tcp::SocketBuffer::new(alloc::vec![0u8; 4096]);
+                        let tx = tcp::SocketBuffer::new(alloc::vec![0u8; 4096]);
+                        let mut sock = tcp::Socket::new(rx, tx);
+                        sock.connect(iface.context(), (ip, port), local_port).ok();
+                        let handle = sockets.add(sock);
+                        proxies[i].mode = ProxyMode::Connection { handle };
+                    }
+                }
                 OPCODE_SEND => {
                     if let ProxyMode::Connection { handle } = proxies[i].mode {
-                        let sock = sockets.get_mut::<tcp::Socket>(handle);
-                        if sock.can_send() && r > 1 {
-                            sock.send_slice(&ctrl_buf[1..r]).ok();
+                        if r > 1 {
+                            proxies[i].tx_queue.extend_from_slice(&ctrl_buf[1..r]);
                         }
                     }
                 }
@@ -120,6 +143,21 @@ pub extern "C" fn main() -> i32 {
 
         // Poll smoltcp: handles ARP replies, ICMP echo replies, TCP handshakes, TX/RX
         iface.poll(Instant::ZERO, &mut phy, &mut sockets);
+
+        // Process TX queues for established connections
+        for i in 0..proxies.len() {
+            if let ProxyMode::Connection { handle } = proxies[i].mode {
+                if !proxies[i].tx_queue.is_empty() {
+                    let sock = sockets.get_mut::<tcp::Socket>(handle);
+                    if sock.can_send() {
+                        let to_send = &proxies[i].tx_queue;
+                        if let Ok(sent) = sock.send_slice(to_send) {
+                            proxies[i].tx_queue.drain(..sent);
+                        }
+                    }
+                }
+            }
+        }
 
         // Detect listening sockets that now have an established connection
         let n = proxies.len();
@@ -140,6 +178,7 @@ pub extern "C" fn main() -> i32 {
                             sid: 0,
                             bound_port: 0,
                             mode: ProxyMode::Connection { handle },
+                            tx_queue: Vec::new(),
                         });
                     }
                     // Immediately replace with a new listening socket for the next connection

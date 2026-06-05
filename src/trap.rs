@@ -200,7 +200,7 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
     use crate::posix::spawn::USER_STACK_TOP;
 
     // Parse null-separated args from the packed buffer.
-    let mut args: alloc::vec::Vec<&[u8]> = alloc::vec::Vec::new();
+    let mut args: Vec<&[u8]> = Vec::new();
     let mut start = 0usize;
     for (i, &b) in argv_data.iter().enumerate() {
         if b == 0 {
@@ -220,7 +220,7 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
     }
 
     let mut sp = USER_STACK_TOP;
-    let mut string_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+    let mut string_addrs: Vec<usize> = Vec::new();
 
     // Write each arg string from the top of the stack downward (including null terminator).
     for arg in &args {
@@ -239,10 +239,14 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
 
     // Write argv[argc] = NULL first, then argv[N-1] .. argv[0] downward.
     sp -= 8;
-    unsafe { *(sp as *mut usize) = 0; }
+    unsafe {
+        *(sp as *mut usize) = 0;
+    }
     for &addr in string_addrs.iter().rev() {
         sp -= 8;
-        unsafe { *(sp as *mut usize) = addr; }
+        unsafe {
+            *(sp as *mut usize) = addr;
+        }
     }
 
     let argv_ptr = sp;
@@ -289,7 +293,9 @@ fn poll_uart_into_linedisc() {
             buf.push(c);
             true
         } else if c == b'\r' || c == b'\n' {
-            if echo { uart.put_char(b'\n'); }
+            if echo {
+                uart.put_char(b'\n');
+            }
             buf.push(b'\n');
             true
         } else if c == 0x08 || c == 0x7F {
@@ -300,12 +306,16 @@ fn poll_uart_into_linedisc() {
             }
             false
         } else {
-            if echo { uart.put_char(c); }
+            if echo {
+                uart.put_char(c);
+            }
             buf.push(c);
             true
         };
         drop(buf);
-        if pushed { any_pushed = true; }
+        if pushed {
+            any_pushed = true;
+        }
     }
     if any_pushed {
         let waiter = STDIN_WAITER.swap(0, Ordering::Relaxed);
@@ -513,19 +523,30 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                             // Return up to arg2 bytes.
                                             let take = core::cmp::min(arg2, buf_lock.len());
                                             let user_buf = unsafe {
-                                                core::slice::from_raw_parts_mut(arg1 as *mut u8, take)
+                                                core::slice::from_raw_parts_mut(
+                                                    arg1 as *mut u8,
+                                                    take,
+                                                )
                                             };
-                                            for i in 0..take { user_buf[i] = buf_lock[i]; }
+                                            for i in 0..take {
+                                                user_buf[i] = buf_lock[i];
+                                            }
                                             buf_lock.drain(0..take);
                                             take
                                         } else {
                                             // Return up to and including the first '\n'.
-                                            let nl = buf_lock.iter().position(|&b| b == b'\n').unwrap();
+                                            let nl =
+                                                buf_lock.iter().position(|&b| b == b'\n').unwrap();
                                             let take = core::cmp::min(arg2, nl + 1);
                                             let user_buf = unsafe {
-                                                core::slice::from_raw_parts_mut(arg1 as *mut u8, take)
+                                                core::slice::from_raw_parts_mut(
+                                                    arg1 as *mut u8,
+                                                    take,
+                                                )
                                             };
-                                            for i in 0..take { user_buf[i] = buf_lock[i]; }
+                                            for i in 0..take {
+                                                user_buf[i] = buf_lock[i];
+                                            }
                                             buf_lock.drain(0..take);
                                             take
                                         };
@@ -1185,14 +1206,11 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     let argv_buf_len = tf.regs[13]; // a3
 
                     // Copy argv from user memory BEFORE sys_exec destroys the old address space.
-                    let argv_data: alloc::vec::Vec<u8> =
-                        if argv_buf_len > 0 && arg2 != 0 {
-                            unsafe {
-                                core::slice::from_raw_parts(argv_buf_ptr, argv_buf_len).to_vec()
-                            }
-                        } else {
-                            alloc::vec::Vec::new()
-                        };
+                    let argv_data: alloc::vec::Vec<u8> = if argv_buf_len > 0 && arg2 != 0 {
+                        unsafe { core::slice::from_raw_parts(argv_buf_ptr, argv_buf_len).to_vec() }
+                    } else {
+                        alloc::vec::Vec::new()
+                    };
 
                     match crate::posix::spawn::sys_exec(path_ptr, path_len) {
                         Ok(entry_point) => {
@@ -1231,13 +1249,14 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                             }
 
                             tf.sepc = entry_point;
-                            tf.regs[2] = new_sp;    // sp
-                            tf.regs[10] = argc;     // a0 = argc
+                            tf.regs[2] = new_sp; // sp
+                            tf.regs[10] = argc; // a0 = argc
                             tf.regs[11] = argv_ptr; // a1 = argv
                             tf.sstatus = (1 << 5) | (1 << 18);
                             return tf as *mut _;
                         }
-                        Err(_) => {
+                        Err(e) => {
+                            crate::println!("sys_exec error: {}", e);
                             tf.regs[10] = usize::MAX;
                         }
                     }
@@ -1260,7 +1279,9 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                             let mut table = crate::posix::process::PROCESS_TABLE.lock();
                             let r = table
                                 .get(&zpid)
-                                .map(|p| (p.kernel_stack_bottom, p.satp_val.load(Ordering::Relaxed)))
+                                .map(|p| {
+                                    (p.kernel_stack_bottom, p.satp_val.load(Ordering::Relaxed))
+                                })
                                 .unwrap_or((0, 0));
                             table.remove(&zpid);
                             let parent = table.get(&ppid).cloned();
@@ -1277,7 +1298,8 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                             unsafe {
                                 alloc::alloc::dealloc(
                                     kstack as *mut u8,
-                                    core::alloc::Layout::from_size_align(KSZ, 16).unwrap_or_else(|_| unreachable!("constant layout")),
+                                    core::alloc::Layout::from_size_align(KSZ, 16)
+                                        .unwrap_or_else(|_| unreachable!("constant layout")),
                                 );
                             }
                         }
@@ -1320,7 +1342,9 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                 let mut table = crate::posix::process::PROCESS_TABLE.lock();
                                 let r = table
                                     .get(&zpid)
-                                    .map(|p| (p.kernel_stack_bottom, p.satp_val.load(Ordering::Relaxed)))
+                                    .map(|p| {
+                                        (p.kernel_stack_bottom, p.satp_val.load(Ordering::Relaxed))
+                                    })
                                     .unwrap_or((0, 0));
                                 table.remove(&zpid);
                                 let parent = table.get(&ppid).cloned();
@@ -1336,7 +1360,8 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                                 unsafe {
                                     alloc::alloc::dealloc(
                                         kstack as *mut u8,
-                                        core::alloc::Layout::from_size_align(KSZ, 16).unwrap_or_else(|_| unreachable!("constant layout")),
+                                        core::alloc::Layout::from_size_align(KSZ, 16)
+                                            .unwrap_or_else(|_| unreachable!("constant layout")),
                                     );
                                 }
                             }
@@ -1501,8 +1526,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 60 => {
                     // sys_set_fg_pid(pid) — register foreground process for SIGINT delivery
                     let pid = arg0 as i32;
-                    crate::posix::process::FOREGROUND_PID
-                        .store(pid, Ordering::Relaxed);
+                    crate::posix::process::FOREGROUND_PID.store(pid, Ordering::Relaxed);
                     tf.regs[10] = 0;
                 }
                 61 => {
@@ -1560,10 +1584,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     } else {
                         // Block — set waiter flag and rewind ecall so it retries on wakeup.
                         tf.sepc -= 4;
-                        if let Some(p) = crate::posix::process::PROCESS_TABLE
-                            .lock()
-                            .get(&pid)
-                        {
+                        if let Some(p) = crate::posix::process::PROCESS_TABLE.lock().get(&pid) {
                             p.mailbox_waiter.store(pid, Ordering::Relaxed);
                         }
                         crate::posix::process::schedule();
@@ -1586,7 +1607,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     // sys_initrd_data(buf_ptr, offset, max_len) → bytes_copied
                     // Lets the VFS server fetch chunks of the initrd TAR from kernel memory.
                     let buf_ptr = arg0;
-                    let offset  = arg1;
+                    let offset = arg1;
                     let max_len = arg2;
                     let start = crate::INITRD_START.load(Ordering::Relaxed);
                     let total = crate::INITRD_LEN.load(Ordering::Relaxed);
@@ -1597,11 +1618,10 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         let copy_len = max_len.min(avail).min(4096);
                         unsafe {
                             let src = core::slice::from_raw_parts(
-                                (start + offset) as *const u8, copy_len,
+                                (start + offset) as *const u8,
+                                copy_len,
                             );
-                            let dst = core::slice::from_raw_parts_mut(
-                                buf_ptr as *mut u8, copy_len,
-                            );
+                            let dst = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, copy_len);
                             dst.copy_from_slice(src);
                         }
                         tf.regs[10] = copy_len;
@@ -1609,7 +1629,11 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 }
                 _ => {
                     // Unknown syscall — return ENOSYS rather than crashing the kernel.
-                    crate::println!("pid {}: unknown syscall {}", crate::posix::process::current_pid(), syscall_num);
+                    crate::println!(
+                        "pid {}: unknown syscall {}",
+                        crate::posix::process::current_pid(),
+                        syscall_num
+                    );
                     tf.regs[10] = usize::MAX; // -1 (ENOSYS)
                 }
             }
@@ -1646,7 +1670,9 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                             let pid = crate::posix::process::current_pid();
                             crate::println!(
                                 "Segfault pid {}: store {} at va={:#x}",
-                                pid, e, fault_va
+                                pid,
+                                e,
+                                fault_va
                             );
                             crate::posix::spawn::exit(pid, -11);
                             crate::posix::process::schedule();
@@ -1716,7 +1742,11 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 panic!("Kernel instruction address misaligned at sepc={:#x}", sepc);
             }
             let pid = crate::posix::process::current_pid();
-            crate::println!("pid {}: instruction address misaligned sepc={:#x} — killed", pid, sepc);
+            crate::println!(
+                "pid {}: instruction address misaligned sepc={:#x} — killed",
+                pid,
+                sepc
+            );
             crate::posix::spawn::exit(pid, -4); // SIGILL equivalent
             crate::posix::process::schedule();
             unsafe { __halt_cpu() }
@@ -1724,10 +1754,18 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
         // Illegal instruction
         scause::Trap::Exception(2) => {
             if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
-                panic!("Kernel illegal instruction at sepc={:#x} stval={:#x}", sepc, stval);
+                panic!(
+                    "Kernel illegal instruction at sepc={:#x} stval={:#x}",
+                    sepc, stval
+                );
             }
             let pid = crate::posix::process::current_pid();
-            crate::println!("pid {}: illegal instruction sepc={:#x} stval={:#x} — killed", pid, sepc, stval);
+            crate::println!(
+                "pid {}: illegal instruction sepc={:#x} stval={:#x} — killed",
+                pid,
+                sepc,
+                stval
+            );
             crate::posix::spawn::exit(pid, -4); // SIGILL
             crate::posix::process::schedule();
             unsafe { __halt_cpu() }
@@ -1735,10 +1773,18 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
         // Load/Store address misaligned
         scause::Trap::Exception(4) | scause::Trap::Exception(6) => {
             if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
-                panic!("Kernel misaligned memory access at sepc={:#x} stval={:#x}", sepc, stval);
+                panic!(
+                    "Kernel misaligned memory access at sepc={:#x} stval={:#x}",
+                    sepc, stval
+                );
             }
             let pid = crate::posix::process::current_pid();
-            crate::println!("pid {}: misaligned memory access sepc={:#x} stval={:#x} — killed", pid, sepc, stval);
+            crate::println!(
+                "pid {}: misaligned memory access sepc={:#x} stval={:#x} — killed",
+                pid,
+                sepc,
+                stval
+            );
             crate::posix::spawn::exit(pid, -7); // SIGBUS
             crate::posix::process::schedule();
             unsafe { __halt_cpu() }
@@ -1746,12 +1792,18 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
         _ => {
             // Unhandled exception
             if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
-                panic!("Kernel unhandled trap {:?} at sepc={:#x} stval={:#x}", cause, sepc, stval);
+                panic!(
+                    "Kernel unhandled trap {:?} at sepc={:#x} stval={:#x}",
+                    cause, sepc, stval
+                );
             }
             let pid = crate::posix::process::current_pid();
             crate::println!(
                 "pid {}: unhandled trap {:?} sepc={:#x} stval={:#x} — killed",
-                pid, cause, tf.sepc, stval
+                pid,
+                cause,
+                tf.sepc,
+                stval
             );
             crate::posix::spawn::exit(pid, -1);
             crate::posix::process::schedule();
