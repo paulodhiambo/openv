@@ -232,6 +232,16 @@ fn scan_initrd(vfs: &mut Vfs) {
         let path = tar_name_to_path(name);
         if path == "/" { offset += 512; continue; } // skip root entry itself
 
+        // /proc and /dev are kernel VFS mounts; skip them so libos falls back to
+        // the kernel path and sees the live ProcFS / DevFS content.
+        if path == "/proc" || path.starts_with("/proc/")
+            || path == "/dev" || path.starts_with("/dev/")
+        {
+            let data_blocks = size.div_ceil(512);
+            offset += 512 + data_blocks * 512;
+            continue;
+        }
+
         let data_start = offset + 512; // byte offset of first data byte in TAR
 
         let is_dir = type_flag == b'5'

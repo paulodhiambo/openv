@@ -11,7 +11,7 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-BINS="${BINS:-init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server}"
+BINS="${BINS:-init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server echo-server}"
 USER_BUILD_DIR="debug"
 KERNEL_FLAGS=""
 USER_FLAGS=""

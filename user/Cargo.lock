@@ -92,6 +92,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "echo-server"
+version = "0.1.0"
+dependencies = [
+ "libos",
+]
+
+[[package]]
 name = "forktest"
 version = "0.1.0"
 dependencies = [

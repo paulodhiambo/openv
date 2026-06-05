@@ -111,6 +111,17 @@ fn vfs_fd_free(user_fd: i32) {
     }
 }
 
+// Send OP_CLOSE to the VFS server for every active VFS fd slot.
+// Called before exit() and exec() so the server doesn't accumulate orphaned entries.
+fn close_all_vfs_fds() {
+    for i in 0..VFS_FD_SLOTS {
+        let user_fd = (VFS_FD_BASE + i as u32) as i32;
+        if vfs_fd_get(user_fd).is_some() {
+            close(user_fd);
+        }
+    }
+}
+
 #[inline]
 pub fn syscall(sys_num: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
     let mut ret: usize;
@@ -151,6 +162,7 @@ pub extern "C" fn sys_yield() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn exit(status: i32) -> ! {
+    close_all_vfs_fds();
     syscall(1, status as usize, 0, 0);
     #[allow(clippy::empty_loop)]
     loop {}
@@ -730,6 +742,7 @@ pub fn fork() -> i32 {
 /// Replace the current process image with the binary at `path`.
 /// Returns -1 on error (does not return on success).
 pub fn exec(path: &[u8]) -> i32 {
+    close_all_vfs_fds();
     syscall4(51, path.as_ptr() as usize, path.len(), 0, 0) as i32
 }
 
@@ -737,6 +750,7 @@ pub fn exec(path: &[u8]) -> i32 {
 /// as the argument vector.  `argv_buf` format: `"arg0\0arg1\0...argN\0"`.
 /// Returns -1 on error (does not return on success).
 pub fn exec_args(path: &[u8], argv_buf: &[u8]) -> i32 {
+    close_all_vfs_fds();
     syscall4(
         51,
         path.as_ptr() as usize,
