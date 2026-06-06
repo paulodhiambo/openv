@@ -1,0 +1,412 @@
+pub mod interrupt;
+pub mod page_fault;
+
+use crate::println;
+use core::arch::global_asm;
+use core::sync::atomic::Ordering;
+use riscv::register::{scause, sepc, stvec};
+
+unsafe extern "C" {
+    pub(crate) fn __halt_cpu() -> !;
+}
+
+pub unsafe fn halt_cpu() -> ! {
+    unsafe { __halt_cpu() }
+}
+
+use core::sync::atomic::AtomicI32;
+
+/// PID of the registered VFS server process (0 = not yet started).
+pub static VFS_SERVER_PID: AtomicI32 = AtomicI32::new(0);
+
+/// PID of the registered block driver process (0 = not yet started).
+pub static BLK_SERVER_PID: AtomicI32 = AtomicI32::new(0);
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct TrapFrame {
+    pub kernel_sp: usize,
+    pub regs: [usize; 32], // x0 to x31
+    pub sepc: usize,
+    pub sstatus: usize,
+}
+
+/// Signal frame pushed to the user stack on signal delivery.
+/// `sys_sigreturn` reads this back to restore both the trap frame and the signal mask.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct SignalFrame {
+    pub saved_blocked: u32,
+    pub _pad: u32,
+    pub tf: TrapFrame,
+}
+
+impl TrapFrame {
+    pub const fn new() -> Self {
+        TrapFrame {
+            kernel_sp: 0,
+            regs: [0; 32],
+            sepc: 0,
+            sstatus: 0,
+        }
+    }
+}
+
+global_asm!(
+    r#"
+    .section .text
+    .global trap_vector
+    .align 4
+trap_vector:
+    # Swap a0 and sscratch
+    csrrw a0, sscratch, a0
+    bnez a0, 1f
+
+    # --- Came from S-mode ---
+    csrrw a0, sscratch, a0 # Restore a0, sscratch is 0
+    addi sp, sp, -288
+    sd a0, 10*8+8(sp)
+    sd t0, 5*8+8(sp)
+    addi t0, sp, 288
+    sd t0, 2*8+8(sp)
+    j 2f
+
+1:
+    # --- Came from U-mode ---
+    sd t0, 5*8+8(a0)
+    csrr t0, sscratch
+    sd t0, 10*8+8(a0)
+    csrw sscratch, zero # Indicate S-mode
+    sd sp, 2*8+8(a0)
+    mv sp, a0
+
+2:
+    sd ra, 1*8+8(sp)
+    sd gp, 3*8+8(sp)
+    sd tp, 4*8+8(sp)
+    sd t1, 6*8+8(sp)
+    sd t2, 7*8+8(sp)
+    sd s0, 8*8+8(sp)
+    sd s1, 9*8+8(sp)
+    sd a1, 11*8+8(sp)
+    sd a2, 12*8+8(sp)
+    sd a3, 13*8+8(sp)
+    sd a4, 14*8+8(sp)
+    sd a5, 15*8+8(sp)
+    sd a6, 16*8+8(sp)
+    sd a7, 17*8+8(sp)
+    sd s2, 18*8+8(sp)
+    sd s3, 19*8+8(sp)
+    sd s4, 20*8+8(sp)
+    sd s5, 21*8+8(sp)
+    sd s6, 22*8+8(sp)
+    sd s7, 23*8+8(sp)
+    sd s8, 24*8+8(sp)
+    sd s9, 25*8+8(sp)
+    sd s10, 26*8+8(sp)
+    sd s11, 27*8+8(sp)
+    sd t3, 28*8+8(sp)
+    sd t4, 29*8+8(sp)
+    sd t5, 30*8+8(sp)
+    sd t6, 31*8+8(sp)
+
+    csrr t0, sepc
+    sd t0, 32*8+8(sp)
+    csrr t1, sstatus
+    sd t1, 33*8+8(sp)
+
+    mv a0, sp
+
+    csrr t0, sstatus
+    andi t0, t1, 0x100
+    bnez t0, 3f
+    
+    ld sp, 0(a0)
+3:
+    call rust_trap_handler
+    
+    .global return_to_user
+return_to_user:
+    mv sp, a0
+
+    ld t0, 32*8+8(sp)
+    csrw sepc, t0
+    ld t1, 33*8+8(sp)
+    csrw sstatus, t1
+
+    ld ra, 1*8+8(sp)
+    ld gp, 3*8+8(sp)
+    ld tp, 4*8+8(sp)
+    ld t1, 6*8+8(sp)
+    ld t2, 7*8+8(sp)
+    ld s0, 8*8+8(sp)
+    ld s1, 9*8+8(sp)
+    ld a0, 10*8+8(sp)
+    ld a1, 11*8+8(sp)
+    ld a2, 12*8+8(sp)
+    ld a3, 13*8+8(sp)
+    ld a4, 14*8+8(sp)
+    ld a5, 15*8+8(sp)
+    ld a6, 16*8+8(sp)
+    ld a7, 17*8+8(sp)
+    ld s2, 18*8+8(sp)
+    ld s3, 19*8+8(sp)
+    ld s4, 20*8+8(sp)
+    ld s5, 21*8+8(sp)
+    ld s6, 22*8+8(sp)
+    ld s7, 23*8+8(sp)
+    ld s8, 24*8+8(sp)
+    ld s9, 25*8+8(sp)
+    ld s10, 26*8+8(sp)
+    ld s11, 27*8+8(sp)
+    ld t3, 28*8+8(sp)
+    ld t4, 29*8+8(sp)
+    ld t5, 30*8+8(sp)
+    ld t6, 31*8+8(sp)
+
+    csrr t0, sstatus
+    andi t0, t0, 0x100
+    bnez t0, 4f
+
+    ld t0, 2*8+8(sp)
+    csrw sscratch, t0
+    ld t0, 5*8+8(sp)
+    csrrw sp, sscratch, sp
+    sret
+
+4:
+    ld t0, 5*8+8(sp)
+    ld sp, 2*8+8(sp)
+    sret
+    "#
+);
+
+unsafe extern "C" {
+    fn trap_vector();
+    pub fn return_to_user(trap_frame: usize) -> !;
+}
+
+pub fn init() {
+    unsafe {
+        stvec::write(trap_vector as *const () as usize, stvec::TrapMode::Direct);
+        // Enable supervisor software interrupts (for TLB shootdown).
+        // Timer interrupts are NOT enabled here — they are enabled right
+        // before the first call to schedule() to avoid firing while
+        // sscratch is still 0 (which would corrupt address zero in the
+        // trap vector's csrrw sp, sscratch, sp).
+        riscv::register::sie::set_ssoft();
+        riscv::register::sie::set_sext();
+    }
+    println!("Trap handler initialized.");
+}
+
+/// Called by secondary HARTs from secondary_kmain — same as init() without the print.
+pub fn init_hart() {
+    unsafe {
+        stvec::write(trap_vector as *const () as usize, stvec::TrapMode::Direct);
+        riscv::register::sie::set_ssoft();
+        riscv::register::sie::set_sext();
+    }
+}
+
+/// Enable timer interrupts and arm the first timer.
+/// Must be called right before the first schedule(), after sscratch has
+/// been initialised by a prior return_to_user or kernel-mode scratch page.
+pub fn enable_timer() {
+    unsafe {
+        riscv::register::sie::set_stimer();
+    }
+    crate::timer::set_next_timer();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
+    let cause = scause::read().cause();
+    let sepc = sepc::read();
+    let stval = riscv::register::stval::read();
+
+    let ret_tf = match cause {
+        scause::Trap::Exception(8) => {
+            // User ecall
+            let syscall_num = tf.regs[17]; // a7
+            let arg0 = tf.regs[10]; // a0
+            let arg1 = tf.regs[11]; // a1
+            let arg2 = tf.regs[12]; // a2
+
+            // Advance sepc to next instruction after ecall unconditionally.
+            // Blocking syscalls that diverge to schedule() and wish to restart
+            // must subtract 4 from tf.sepc before yielding.
+            tf.sepc += 4;
+
+            let arg3 = tf.regs[13];
+            crate::syscall::dispatch(syscall_num, arg0, arg1, arg2, arg3, tf);
+            tf as *mut _
+        }
+        scause::Trap::Exception(12) | scause::Trap::Exception(13) | scause::Trap::Exception(15) => {
+            let num = match cause {
+                scause::Trap::Exception(x) => x,
+                _ => unreachable!(),
+            };
+            page_fault::handle_page_fault(num, sepc, stval, tf)
+        }
+        scause::Trap::Interrupt(1) | scause::Trap::Interrupt(5) | scause::Trap::Interrupt(9) | scause::Trap::Interrupt(11) => {
+            let num = match cause {
+                scause::Trap::Interrupt(x) => x,
+                _ => unreachable!(),
+            };
+            interrupt::handle_interrupt(num, tf)
+        }
+        scause::Trap::Interrupt(n) => {
+            interrupt::handle_interrupt(n, tf)
+        }
+        // Instruction address misaligned
+        scause::Trap::Exception(0) => {
+            if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
+                panic!("Kernel instruction address misaligned at sepc={:#x}", sepc);
+            }
+            let pid = crate::posix::process::current_pid();
+            crate::println!(
+                "pid {}: instruction address misaligned sepc={:#x} — killed",
+                pid,
+                sepc
+            );
+            crate::posix::spawn::exit(pid, -4); // SIGILL equivalent
+            crate::posix::process::schedule();
+            unsafe { halt_cpu() }
+        }
+        // Illegal instruction
+        scause::Trap::Exception(2) => {
+            if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
+                panic!(
+                    "Kernel illegal instruction at sepc={:#x} stval={:#x}",
+                    sepc, stval
+                );
+            }
+            let pid = crate::posix::process::current_pid();
+            crate::println!(
+                "pid {}: illegal instruction sepc={:#x} stval={:#x} — killed",
+                pid,
+                sepc,
+                stval
+            );
+            crate::posix::spawn::exit(pid, -4); // SIGILL
+            crate::posix::process::schedule();
+            unsafe { halt_cpu() }
+        }
+        // Load/Store address misaligned
+        scause::Trap::Exception(4) | scause::Trap::Exception(6) => {
+            if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
+                panic!(
+                    "Kernel misaligned memory access at sepc={:#x} stval={:#x}",
+                    sepc, stval
+                );
+            }
+            let pid = crate::posix::process::current_pid();
+            crate::println!(
+                "pid {}: misaligned memory access sepc={:#x} stval={:#x} — killed",
+                pid,
+                sepc,
+                stval
+            );
+            crate::posix::spawn::exit(pid, -7); // SIGBUS
+            crate::posix::process::schedule();
+            unsafe { halt_cpu() }
+        }
+        _ => {
+            // Unhandled exception
+            if riscv::register::sstatus::read().spp() == riscv::register::sstatus::SPP::Supervisor {
+                panic!(
+                    "Kernel unhandled trap {:?} at sepc={:#x} stval={:#x}",
+                    cause, sepc, stval
+                );
+            }
+            let pid = crate::posix::process::current_pid();
+            crate::println!(
+                "pid {}: unhandled trap {:?} sepc={:#x} stval={:#x} — killed",
+                pid,
+                cause,
+                tf.sepc,
+                stval
+            );
+            crate::posix::spawn::exit(pid, -1);
+            crate::posix::process::schedule();
+            unsafe { halt_cpu() }
+        }
+    };
+
+    // If we are returning to user-space (SPP == 0), check for pending signals
+    unsafe {
+        let mut_tf = &mut *(ret_tf as *mut TrapFrame);
+        if (mut_tf.sstatus & (1 << 8)) == 0 {
+            let pid = crate::posix::process::current_pid();
+            let table = crate::posix::process::PROCESS_TABLE.lock();
+            if let Some(proc) = table.get(&pid) {
+                let pending = proc.pending_signals.load(core::sync::atomic::Ordering::Relaxed);
+                let blocked = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+                let deliverable = pending & !blocked;
+                
+                if deliverable != 0 {
+                    // Find first set bit (the signal number)
+                    let sig = deliverable.trailing_zeros();
+                    
+                    // Clear the pending bit
+                    proc.pending_signals.fetch_and(!(1 << sig), core::sync::atomic::Ordering::Relaxed);
+                    
+                    if sig == crate::syscall::proc::SIGKILL as u32 {
+                        // Force exit immediately
+                        drop(table);
+                        crate::posix::spawn::exit(pid, -9);
+                        crate::posix::process::schedule();
+                        halt_cpu()
+                    } else {
+                        let handler_addr = proc.signal_handlers.lock()[sig as usize];
+                        let restorer_addr = proc.signal_restorers.lock()[sig as usize];
+                        
+                        if handler_addr == 0 {
+                            drop(table);
+                            crate::posix::spawn::exit(pid, -(sig as i32));
+                            crate::posix::process::schedule();
+                            halt_cpu()
+                        } else {
+                            let frame_size = core::mem::size_of::<SignalFrame>();
+                            let sp = mut_tf.regs[2];
+                            // Guard against stack underflow and kernel-space hijack.
+                            if sp < frame_size + 16 || sp > 0x0000_8000_0000_0000 {
+                                drop(table);
+                                crate::posix::spawn::exit(pid, -11); // SIGSEGV
+                                crate::posix::process::schedule();
+                                halt_cpu()
+                            }
+                            let new_sp = (sp - frame_size) & !15;
+                            // Verify the target page is actually mapped before writing.
+                            let satp = proc.satp_val.load(Ordering::Relaxed);
+                            let root_pa = (satp & 0xFFF_FFFF_FFFF) << 12;
+                            if crate::mm::vmm::PageTable::walk_page_table(root_pa, new_sp).is_err() {
+                                drop(table);
+                                crate::posix::spawn::exit(pid, -11); // SIGSEGV
+                                crate::posix::process::schedule();
+                                halt_cpu()
+                            }
+                            let frame = SignalFrame {
+                                saved_blocked: blocked,
+                                _pad: 0,
+                                tf: *mut_tf,
+                            };
+                            core::ptr::write(new_sp as *mut SignalFrame, frame);
+                            mut_tf.regs[2] = new_sp;
+                            mut_tf.regs[10] = sig as usize;
+                            mut_tf.sepc = handler_addr;
+                            mut_tf.regs[1] = restorer_addr;
+                            // Mask the signal (and any sa_mask bits) during handler execution.
+                            let extra_mask = proc.signal_masks.lock()[sig as usize];
+                            let new_blocked = blocked | extra_mask | (1 << sig);
+                            proc.blocked_signals.store(new_blocked, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    ret_tf
+}

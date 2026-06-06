@@ -5,6 +5,7 @@
 /test_root.tar
 /openv.img
 /openv.bin
+/disk.img
 
 # IDE
 .claude

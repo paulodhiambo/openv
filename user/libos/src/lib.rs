@@ -49,7 +49,6 @@ global_asm!(
         mv a0, s0
         mv a1, s1
         call main
-        mv a0, zero
         call exit
     "#
 );

@@ -1,0 +1,9 @@
+[package]
+name = "pm-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+libos = { path = "../libos" }
+pm-proto = { path = "../pm-proto" }
+vfs-proto = { path = "../vfs-proto" }

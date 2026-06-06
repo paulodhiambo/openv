@@ -1,0 +1,8 @@
+[package]
+name = "virtio-blk-driver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libos = { path = "../libos" }
+spin = "0.9.8"

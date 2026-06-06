@@ -166,9 +166,12 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     crate::raw_print!("[HART-ONLY] kmain: attempting posix_spawn of boot servers\n");
     
     if let Ok(init_pid) = posix::spawn::posix_spawn("/init", 0) {
-        let pm_pid = posix::spawn::posix_spawn("/pm-server", 0).unwrap();
-        let vfs_pid = posix::spawn::posix_spawn("/vfs-server", 0).unwrap();
-        let rs_pid = posix::spawn::posix_spawn("/rs-server", 0).unwrap();
+        // Boot servers inherit init's fds (and thus its TTY) so ACTIVE_TTY stays
+        // pointing at init's TTY throughout boot.  ppid=0 would create a fresh TTY
+        // per server and overwrite ACTIVE_TTY, leaving the shell on the wrong TTY.
+        let pm_pid = posix::spawn::posix_spawn("/pm-server", init_pid).unwrap();
+        let vfs_pid = posix::spawn::posix_spawn("/vfs-server", init_pid).unwrap();
+        let rs_pid = posix::spawn::posix_spawn("/rs-server", init_pid).unwrap();
         
         let table = crate::posix::process::PROCESS_TABLE.lock();
         if let Some(init_proc) = table.get(&init_pid) {
@@ -178,7 +181,10 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             pm_proc.caps.store(posix::process::CAP_PROCESS | posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(vfs_proc) = table.get(&vfs_pid) {
-            vfs_proc.caps.store(posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+            vfs_proc.caps.store(
+                posix::process::CAP_DATACOPY | posix::process::CAP_SYS_ADMIN,
+                core::sync::atomic::Ordering::Relaxed,
+            );
         }
         if let Some(rs_proc) = table.get(&rs_pid) {
             rs_proc.caps.store(

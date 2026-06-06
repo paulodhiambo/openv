@@ -12,7 +12,7 @@ fi
 
 KERNEL="target/riscv64gc-unknown-none-elf/$RELEASE/openv"
 INITRD="test_root.tar"
-MEMORY="${QEMU_MEM:-128M}"
+MEMORY="${QEMU_MEM:-256M}"
 CPUS="${QEMU_CPUS:-1}"
 DISK_IMG="disk.img"
 
@@ -35,11 +35,13 @@ echo "  (Ctrl-A X to quit QEMU)"
 echo ""
 
 QEMU_NET="-netdev user,id=net0 -device virtio-net-device,netdev=net0"
-QEMU_DISK=""
-if [ -f "$DISK_IMG" ]; then
-    echo "  disk   : $DISK_IMG (persistent OFS)"
-    QEMU_DISK="-drive id=disk0,file=$DISK_IMG,format=raw,if=none -device virtio-blk-device,drive=disk0"
+if [ ! -f "$DISK_IMG" ]; then
+    echo "  disk   : creating $DISK_IMG (64 MB fresh image)"
+    dd if=/dev/zero of="$DISK_IMG" bs=1M count=64 status=none
 fi
+
+QEMU_DISK="-drive id=disk0,file=$DISK_IMG,format=raw,if=none -device virtio-blk-device,drive=disk0"
+echo "  disk   : $DISK_IMG ($(du -sh "$DISK_IMG" | cut -f1))"
 
 exec qemu-system-riscv64 \
     -machine virt \
