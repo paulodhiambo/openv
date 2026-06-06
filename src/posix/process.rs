@@ -3,12 +3,51 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Mutex;
+
+/// Reference counts for page tables shared across threads (CLONE_VM).
+/// Entries only exist when refcount > 1; absence means sole owner.
+pub static SATP_REFCOUNT: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+/// Futex wait table: maps (user virtual address) → list of sleeping PIDs.
+pub static FUTEX_TABLE: Mutex<BTreeMap<usize, VecDeque<Pid>>> = Mutex::new(BTreeMap::new());
+
+/// Mark `root_pa` as shared by one additional thread.
+pub fn satp_share(root_pa: usize) {
+    let mut map = SATP_REFCOUNT.lock();
+    let count = map.entry(root_pa).or_insert(1);
+    *count += 1;
+}
+
+/// Called when a process/thread releases `root_pa`.
+/// Returns `true` if the caller should free the page table (last owner).
+pub fn satp_unshare(root_pa: usize) -> bool {
+    let mut map = SATP_REFCOUNT.lock();
+    if let Some(count) = map.get_mut(&root_pa) {
+        *count -= 1;
+        let remaining = *count;
+        if remaining <= 1 {
+            map.remove(&root_pa);
+        }
+        remaining == 0
+    } else {
+        // Not in the shared map — this process is the sole owner.
+        true
+    }
+}
 
 pub type Pid = i32;
 pub type Pgid = i32;
 pub type Sid = i32;
+
+pub const CAP_NONE: u64      = 0;
+pub const CAP_MMIO: u64      = 1 << 0;
+pub const CAP_DATACOPY: u64  = 1 << 1;
+pub const CAP_NET_RAW: u64   = 1 << 2;
+pub const CAP_PROCESS: u64   = 1 << 3;
+pub const CAP_INTERRUPT: u64 = 1 << 4;
+pub const CAP_SYS_ADMIN: u64 = 1 << 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcState {
@@ -17,7 +56,7 @@ pub enum ProcState {
     Zombie(i32), // Holds the exit status
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum IpcState {
     None,
     Sending { target: Pid, msg: crate::ipc::msg::Message, reply_msg_ptr: Option<usize> },
@@ -29,6 +68,7 @@ pub enum IpcState {
 
 pub struct Process {
     pub pid: Pid,
+    pub tgid: AtomicI32,  // thread group id; equals pid for the main thread
     pub ppid: AtomicI32,
     pub pgid: AtomicI32,
     pub sid: AtomicI32,
@@ -36,6 +76,7 @@ pub struct Process {
     pub gid: AtomicU32,
     pub euid: AtomicU32,
     pub egid: AtomicU32,
+    pub caps: AtomicU64,
     pub state: Mutex<ProcState>,
     pub fds: Mutex<HandleTable>,
     pub children: Mutex<Vec<Pid>>,
@@ -43,6 +84,10 @@ pub struct Process {
     /// Sv39 SATP register value for this process.  Atomic so sys_exec can
     /// update it without going through an unsafe Arc::as_ptr cast.
     pub satp_val: AtomicUsize,
+    /// Next available virtual address for anonymous mmap allocations.
+    pub next_mmap_va: AtomicUsize,
+    /// Current program break (top of data segment) for brk/sbrk.
+    pub heap_break: AtomicUsize,
     /// Bottom (lowest address) of the heap-allocated kernel stack.
     pub kernel_stack_bottom: usize,
     /// Current working directory — inherited from parent, updated by chdir.
@@ -59,11 +104,19 @@ pub struct Process {
     // Synchronous IPC fields
     pub ipc_state: Mutex<IpcState>,
     pub senders: Mutex<VecDeque<Pid>>,
+    /// Overflow queue for kernel-injected IRQ messages that arrived while
+    /// ipc_state was already MessageAvailable or mid-IPC.
+    pub irq_pending: Mutex<VecDeque<crate::ipc::msg::Message>>,
     
     // Signals
     pub pending_signals: AtomicU32,
     pub blocked_signals: AtomicU32,
     pub signal_handlers: Mutex<[usize; 32]>,
+    pub signal_restorers: Mutex<[usize; 32]>,
+    pub signal_masks: Mutex<[u32; 32]>,
+
+    // Namespaces
+    pub ns: crate::namespace::NsSet,
 }
 
 static NEXT_PID: AtomicI32 = AtomicI32::new(1);
@@ -98,6 +151,11 @@ pub fn wake_sleepers() {
     while i < sq.len() {
         if now >= sq[i].1 {
             let (pid, _) = sq.swap_remove(i);
+            // Transition back to Running before enqueuing so another HART
+            // can't observe the process as Stopped after it appears in the queue.
+            if let Some(proc) = PROCESS_TABLE.lock().get(&pid).cloned() {
+                *proc.state.lock() = ProcState::Running;
+            }
             RUN_QUEUE.lock().push_back(pid);
         } else {
             i += 1;
@@ -218,43 +276,61 @@ impl Process {
                 HandleTable::new()
             }
         } else {
+            // Allocate the root session TTY and register it as the active ISR target.
+            let tty = crate::tty::TtyState::new();
+            *crate::tty::ACTIVE_TTY.lock() = Some(tty.clone());
             let mut fds = HandleTable::new();
-            fds.insert_at(0, crate::ipc::handle::KernelObject::Console);
-            fds.insert_at(1, crate::ipc::handle::KernelObject::Console);
-            fds.insert_at(2, crate::ipc::handle::KernelObject::Console);
+            let tty_obj = crate::ipc::handle::KernelObject::Tty(tty);
+            fds.insert_at(0, tty_obj.clone());
+            fds.insert_at(1, tty_obj.clone());
+            fds.insert_at(2, tty_obj);
             fds
         };
 
-        let (uid, gid, euid, egid, cwd) = if ppid != 0 {
+        let (uid, gid, euid, egid, caps, cwd, handlers, restorers, masks, blocked, pgid, sid, ns) = if ppid != 0 {
             if let Some(parent) = PROCESS_TABLE.lock().get(&ppid) {
                 (
                     parent.uid.load(Ordering::Relaxed),
                     parent.gid.load(Ordering::Relaxed),
                     parent.euid.load(Ordering::Relaxed),
                     parent.egid.load(Ordering::Relaxed),
+                    parent.caps.load(Ordering::Relaxed),
                     parent.cwd.lock().clone(),
+                    *parent.signal_handlers.lock(),
+                    *parent.signal_restorers.lock(),
+                    *parent.signal_masks.lock(),
+                    parent.blocked_signals.load(Ordering::Relaxed),
+                    parent.pgid.load(Ordering::Relaxed),
+                    parent.sid.load(Ordering::Relaxed),
+                    crate::namespace::NsSet::fork_from(&parent.ns, 0), // inherit, no new ns
                 )
             } else {
-                (0, 0, 0, 0, String::from("/"))
+                (0, 0, 0, 0, CAP_NONE, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
+                 crate::namespace::NsSet::root())
             }
         } else {
-            (0, 0, 0, 0, String::from("/"))
+            (0, 0, 0, 0, CAP_NONE, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
+             crate::namespace::NsSet::root())
         };
 
         let proc = Arc::new(Process {
             pid,
+            tgid: AtomicI32::new(pid), // main thread: tgid == pid; overridden by sys_clone
             ppid: AtomicI32::new(ppid),
-            pgid: AtomicI32::new(pid),
-            sid: AtomicI32::new(pid),
+            pgid: AtomicI32::new(pgid),
+            sid: AtomicI32::new(sid),
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
             euid: AtomicU32::new(euid),
             egid: AtomicU32::new(egid),
+            caps: AtomicU64::new(caps),
             state: Mutex::new(ProcState::Running),
             fds: Mutex::new(fds),
             children: Mutex::new(Vec::new()),
             trap_frame: Mutex::new(tf),
             satp_val: AtomicUsize::new(satp_val_bits),
+            next_mmap_va: AtomicUsize::new(0x4_0000_0000), // 16 GB – above 4 GB identity map
+            heap_break: AtomicUsize::new(0x2_0000_0000),   // 8 GB initial brk
             kernel_stack_bottom: kstack_bottom,
             cwd: Mutex::new(cwd),
             wait_target: Mutex::new(None),
@@ -264,9 +340,13 @@ impl Process {
             mailbox_waiter: AtomicI32::new(0),
             ipc_state: Mutex::new(IpcState::None),
             senders: Mutex::new(VecDeque::new()),
+            irq_pending: Mutex::new(VecDeque::new()),
             pending_signals: AtomicU32::new(0),
-            blocked_signals: AtomicU32::new(0),
-            signal_handlers: Mutex::new([0; 32]),
+            blocked_signals: AtomicU32::new(blocked),
+            signal_handlers: Mutex::new(handlers),
+            signal_restorers: Mutex::new(restorers),
+            signal_masks: Mutex::new(masks),
+            ns,
         });
 
         PROCESS_TABLE.lock().insert(pid, proc.clone());

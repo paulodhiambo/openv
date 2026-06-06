@@ -9,7 +9,25 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use vfs_proto::*;
 
+mod blockfs;
+
 // ── In-memory filesystem ──────────────────────────────────────────────────────
+
+#[allow(static_mut_refs)]
+fn get_blockfs() -> Option<&'static mut blockfs::OfsState> {
+    static mut STATE: Option<blockfs::OfsState> = None;
+    unsafe {
+        if STATE.is_none() {
+            // Resolve the block driver PID dynamically — never hard-code it.
+            let blk_pid = libos::get_blk_pid();
+            if blk_pid > 0 {
+                // new() returns None if the driver isn't ready yet; we'll retry next call.
+                STATE = blockfs::OfsState::new(blockfs::VirtioBlkProxy::new(blk_pid));
+            }
+        }
+        STATE.as_mut()
+    }
+}
 
 enum FsNode {
     /// Read-only file backed by the initrd TAR; data is never copied into memory.
@@ -32,7 +50,16 @@ impl Vfs {
         Self { nodes }
     }
 
-    fn exists(&self, path: &str) -> bool { self.nodes.contains_key(path) }
+    fn exists(&self, path: &str) -> bool {
+        if is_virtual_path(path) { return true; }
+        if path.starts_with("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                return ofs.lookup_path(p).is_some();
+            }
+        }
+        self.nodes.contains_key(path)
+    }
 
     fn parent_and_name(path: &str) -> Option<(String, String)> {
         let path = path.trim_end_matches('/');
@@ -52,6 +79,38 @@ impl Vfs {
     }
 
     fn mkdir(&mut self, path: &str) -> bool {
+        if path.starts_with("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                if let Some((parent, name)) = Self::parent_and_name(p) {
+                    if let Some((dir_ino, etype)) = ofs.lookup_path(&parent) {
+                        if etype == blockfs::ITYPE_DIR_ENTRY {
+                            let child_ino = match ofs.alloc_inode() {
+                                Some(i) => i,
+                                None => return false,
+                            };
+                            let new_inode = blockfs::RawInode {
+                                itype: blockfs::ITYPE_DIR,
+                                _pad: [0; 3],
+                                size: 0,
+                                nlink: 1,
+                                used_blocks: 0,
+                                direct: [0u32; 12],
+                                indirect: 0,
+                                _reserved: [0u32; 15],
+                            };
+                            ofs.write_inode(child_ino, &new_inode);
+                            if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_DIR_ENTRY) {
+                                ofs.free_inode(child_ino);
+                                return false;
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
         if self.exists(path) { return false; }
         if let Some((parent, name)) = Self::parent_and_name(path)
             && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
@@ -74,6 +133,47 @@ impl Vfs {
     }
 
     fn create(&mut self, path: &str) -> bool {
+        if path.starts_with("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                if let Some((parent, name)) = Self::parent_and_name(p) {
+                    if let Some((dir_ino, etype)) = ofs.lookup_path(&parent) {
+                        if etype == blockfs::ITYPE_DIR_ENTRY {
+                            // If it exists, truncate it instead of failing
+                            if let Some((child_ino, ctype)) = ofs.lookup_path(p) {
+                                if ctype == blockfs::ITYPE_FILE_ENTRY {
+                                    ofs.file_truncate(child_ino);
+                                    return true;
+                                }
+                                return false; // Is a directory
+                            }
+
+                            let child_ino = match ofs.alloc_inode() {
+                                Some(i) => i,
+                                None => return false,
+                            };
+                            let new_inode = blockfs::RawInode {
+                                itype: blockfs::ITYPE_FILE,
+                                _pad: [0; 3],
+                                size: 0,
+                                nlink: 1,
+                                used_blocks: 0,
+                                direct: [0u32; 12],
+                                indirect: 0,
+                                _reserved: [0u32; 15],
+                            };
+                            ofs.write_inode(child_ino, &new_inode);
+                            if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_FILE_ENTRY) {
+                                ofs.free_inode(child_ino);
+                                return false;
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
         if let Some((parent, name)) = Self::parent_and_name(path) {
             let already_exists = self.nodes.contains_key(path);
             if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
@@ -86,17 +186,64 @@ impl Vfs {
     }
 
     fn unlink(&mut self, path: &str) -> bool {
-        if !self.exists(path) { return false; }
+        if path.starts_with("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                if let Some((parent, name)) = Self::parent_and_name(p) {
+                    if let Some((dir_ino, etype)) = ofs.lookup_path(&parent) {
+                        if etype == blockfs::ITYPE_DIR_ENTRY {
+                            return ofs.dir_unlink(dir_ino, &name);
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        if !self.nodes.contains_key(path) { return false; }
         if let Some((parent, name)) = Self::parent_and_name(path)
             && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
         {
             children.retain(|c| c != &name);
+            self.nodes.remove(path);
+            return true;
         }
-        self.nodes.remove(path);
-        true
+        false
     }
 
     fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Option<usize> {
+        // Virtual /dev files
+        if path == "/dev/null" { return Some(0); } // always EOF
+        if path == "/dev/zero" {
+            let n = buf.len();
+            buf.fill(0);
+            return Some(n);
+        }
+        if path == "/dev/tty" { return Some(0); } // stub
+
+        // Virtual /proc files
+        if let Some(rest) = path.strip_prefix("/proc/") {
+            if let Some((pid_str, "status")) = rest.split_once('/') {
+                if let Ok(pid) = pid_str.parse::<i32>() {
+                    return virtual_proc_read_status(pid, offset, buf);
+                }
+            }
+            return None;
+        }
+
+        if path.starts_with("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                if let Some((ino, etype)) = ofs.lookup_path(p) {
+                    if etype == blockfs::ITYPE_FILE_ENTRY {
+                        match ofs.file_read(ino, offset as usize, buf) {
+                            Ok(n) => return Some(n),
+                            Err(_) => return None,
+                        }
+                    }
+                }
+            }
+            return None;
+        }
         match self.nodes.get(path)? {
             FsNode::TarFile { tar_offset, size } => {
                 let file_off = offset as usize;
@@ -118,6 +265,20 @@ impl Vfs {
     }
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Option<usize> {
+        if path.starts_with("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                if let Some((ino, etype)) = ofs.lookup_path(p) {
+                    if etype == blockfs::ITYPE_FILE_ENTRY {
+                        match ofs.file_write(ino, offset as usize, data) {
+                            Ok(n) => return Some(n),
+                            Err(_) => return None,
+                        }
+                    }
+                }
+            }
+            return None;
+        }
         match self.nodes.get_mut(path)? {
             FsNode::MemFile(buf) => {
                 let start = offset as usize;
@@ -148,6 +309,39 @@ impl Vfs {
     }
 
     fn readdir(&self, path: &str) -> Option<Vec<String>> {
+        // Virtual directories
+        if path == "/dev" {
+            return Some(alloc::vec![
+                String::from("null"),
+                String::from("zero"),
+                String::from("tty"),
+            ]);
+        }
+        if path == "/proc" {
+            return Some(virtual_proc_list());
+        }
+        if let Some(pid_str) = path.strip_prefix("/proc/") {
+            if pid_str.parse::<i32>().is_ok() {
+                return Some(alloc::vec![String::from("status")]);
+            }
+        }
+
+        if path.starts_with("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                if let Some((dir_ino, etype)) = ofs.lookup_path(p) {
+                    if etype == blockfs::ITYPE_DIR_ENTRY {
+                        let entries = ofs.dir_readall(dir_ino);
+                        let mut children = Vec::new();
+                        for (name, _, _) in entries {
+                            children.push(name);
+                        }
+                        return Some(children);
+                    }
+                }
+            }
+            return None;
+        }
         match self.nodes.get(path)? {
             FsNode::Dir(children) => Some(children.clone()),
             _ => None,
@@ -155,12 +349,66 @@ impl Vfs {
     }
 
     fn stat(&self, path: &str) -> Option<(bool, u64)> {
+        // Virtual paths
+        if path == "/dev" || path == "/proc" { return Some((true, 0)); }
+        if path == "/dev/null" || path == "/dev/zero" || path == "/dev/tty" {
+            return Some((false, 0));
+        }
+        if let Some(rest) = path.strip_prefix("/proc/") {
+            let (pid_part, sub) = rest.split_once('/').map(|(a, b)| (a, b)).unwrap_or((rest, ""));
+            if pid_part.parse::<i32>().is_ok() {
+                if sub.is_empty() { return Some((true, 0)); }
+                if sub == "status" { return Some((false, 256)); }
+            }
+            return None;
+        }
+
+        if path.starts_with("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                if let Some((ino, etype)) = ofs.lookup_path(p) {
+                    if etype == blockfs::ITYPE_DIR_ENTRY {
+                        return Some((true, 0));
+                    } else if let Some(inode) = ofs.read_inode(ino) {
+                        return Some((false, inode.size as u64));
+                    }
+                }
+            }
+            return None;
+        }
         match self.nodes.get(path)? {
             FsNode::TarFile { size, .. } => Some((false, *size as u64)),
             FsNode::MemFile(data)        => Some((false, data.len() as u64)),
             FsNode::Dir(_)               => Some((true, 0)),
         }
     }
+}
+
+// ── Virtual /proc and /dev helpers ───────────────────────────────────────────
+
+/// Returns true for paths that are synthesised virtually (not stored in `nodes`).
+fn is_virtual_path(path: &str) -> bool {
+    matches!(path, "/dev" | "/dev/null" | "/dev/zero" | "/dev/tty" | "/proc")
+        || path.starts_with("/proc/")
+}
+
+/// Ask the kernel for all running PIDs (syscall 110) and return them as strings.
+fn virtual_proc_list() -> Vec<String> {
+    let mut buf = [0u32; 512];
+    let n = libos::syscall(110, buf.as_mut_ptr() as usize, 512, 0);
+    if n == usize::MAX { return Vec::new(); }
+    (0..n.min(512)).map(|i| alloc::format!("{}", buf[i])).collect()
+}
+
+/// Synthesise /proc/<pid>/status content by calling syscall 111.
+fn virtual_proc_read_status(pid: i32, offset: u64, buf: &mut [u8]) -> Option<usize> {
+    let mut tmp = [0u8; 512];
+    let n = libos::syscall(111, pid as usize, tmp.as_mut_ptr() as usize, tmp.len());
+    if n == usize::MAX { return None; }
+    let start = (offset as usize).min(n);
+    let take = (n - start).min(buf.len());
+    buf[..take].copy_from_slice(&tmp[start..start + take]);
+    Some(take)
 }
 
 // ── TAR scanner ───────────────────────────────────────────────────────────────
@@ -278,162 +526,197 @@ impl OpenTable {
     fn get(&self, fd: u32) -> Option<&OpenFile> { self.files.get(&fd) }
     fn get_mut(&mut self, fd: u32) -> Option<&mut OpenFile> { self.files.get_mut(&fd) }
     fn close(&mut self, fd: u32) { self.files.remove(&fd); }
+    fn dup(&mut self, fd: u32) -> Option<u32> {
+        let file = self.files.get(&fd)?;
+        let new_fd = self.next_fd;
+        self.next_fd += 1;
+        self.files.insert(new_fd, OpenFile { path: file.path.clone(), offset: file.offset });
+        Some(new_fd)
+    }
 }
 
 // ── IPC helpers ───────────────────────────────────────────────────────────────
 
-fn ipc_send(to: i32, buf: &[u8]) -> i32 {
-    libos::syscall(61, to as usize, buf.as_ptr() as usize, buf.len()) as i32
-}
-
-fn ipc_recv(buf: &mut [u8], from: &mut i32) -> usize {
-    libos::syscall(62, buf.as_mut_ptr() as usize, buf.len(), from as *mut i32 as usize)
-}
-
 fn vfs_register() { libos::syscall(63, 0, 0, 0); }
 
-// ── Reply helpers ─────────────────────────────────────────────────────────────
-
-fn reply_ok(client: i32, payload: &[u8]) {
-    let mut buf = [0u8; MAX_MSG];
-    buf[0] = REPLY_OK;
-    let n = payload.len().min(MAX_MSG - 1);
-    buf[1..1 + n].copy_from_slice(&payload[..n]);
-    ipc_send(client, &buf[..1 + n]);
+fn reply_ok(client: i32, mut msg: libos::ipc::Message) {
+    msg.type_ = REPLY_OK;
+    libos::msg_send(client, &msg);
 }
 
-fn reply_err(client: i32) { ipc_send(client, &[REPLY_ERR]); }
+fn reply_err(client: i32, mut msg: libos::ipc::Message) {
+    msg.type_ = REPLY_ERR;
+    libos::msg_send(client, &msg);
+}
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
-fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], len: usize) {
-    if len == 0 { reply_err(client); return; }
-    let op = msg[0];
-    let body = &msg[1..len];
+fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Message) {
+    let client = msg.source;
+    let op = msg.type_;
 
     match op {
         OP_OPEN => {
-            if body.len() < 4 { reply_err(client); return; }
-            let mut off = 0;
-            let _flags = get_u32(body, &mut off);
-            let path = match core::str::from_utf8(&body[off..]) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
+            let (_flags, path_ptr, path_len) = unpack_path_req(&msg.data);
+            if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            
             if vfs.exists(path) {
                 let fd = open_table.open(path);
-                let mut p = [0u8; 4];
-                put_u32(&mut p, &mut 0, fd);
-                reply_ok(client, &p);
+                pack_u32_reply(&mut msg.data, fd);
+                reply_ok(client, msg);
             } else {
-                reply_err(client);
+                reply_err(client, msg);
+            }
+        }
+        OP_DUP => {
+            let fd = unpack_u32_reply(&msg.data);
+            if let Some(new_fd) = open_table.dup(fd) {
+                pack_u32_reply(&mut msg.data, new_fd);
+                reply_ok(client, msg);
+            } else {
+                reply_err(client, msg);
             }
         }
         OP_READ => {
-            if body.len() < 13 { reply_err(client); return; }
-            let mut off = 0;
-            let fd      = get_u32(body, &mut off);
-            let offset  = get_u64(body, &mut off);
-            let len_req = get_u32(body, &mut off) as usize;
-
+            let (fd, offset, buf_ptr, len_req) = unpack_rw_req(&msg.data);
             let (path, read_off) = match open_table.get(fd) {
                 Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }),
-                None => { reply_err(client); return; }
+                None => { reply_err(client, msg); return; }
             };
 
-            let mut data_buf = [0u8; MAX_MSG - 1];
-            let take = len_req.min(data_buf.len());
+            let mut data_buf = alloc::vec![0u8; len_req.min(1024 * 1024)]; // max 1MB per chunk
+            let take = data_buf.len();
             match vfs.read(&path, read_off, &mut data_buf[..take]) {
                 Some(n) => {
+                    if libos::datacopy(libos::getpid(), data_buf.as_ptr(), client, buf_ptr as *mut u8, n) < 0 {
+                        reply_err(client, msg); return;
+                    }
                     if let Some(f) = open_table.get_mut(fd) { f.offset = read_off + n as u64; }
-                    reply_ok(client, &data_buf[..n]);
+                    pack_u32_reply(&mut msg.data, n as u32);
+                    reply_ok(client, msg);
                 }
-                None => reply_err(client),
+                None => reply_err(client, msg),
             }
         }
         OP_WRITE => {
-            if body.len() < 13 { reply_err(client); return; }
-            let mut off = 0;
-            let fd     = get_u32(body, &mut off);
-            let offset = get_u64(body, &mut off);
-            let data   = &body[off..];
-
+            let (fd, offset, buf_ptr, len_req) = unpack_rw_req(&msg.data);
             let (path, write_off) = match open_table.get(fd) {
                 Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }),
-                None => { reply_err(client); return; }
+                None => { reply_err(client, msg); return; }
             };
 
-            match vfs.write(&path, write_off, data) {
-                Some(n) => {
-                    if let Some(f) = open_table.get_mut(fd) { f.offset = write_off + n as u64; }
-                    let mut p = [0u8; 4];
-                    put_u32(&mut p, &mut 0, n as u32);
-                    reply_ok(client, &p);
+            let mut data_buf = alloc::vec![0u8; len_req.min(1024 * 1024)];
+            let n = data_buf.len();
+            if libos::datacopy(client, buf_ptr as *const u8, libos::getpid(), data_buf.as_mut_ptr(), n) < 0 {
+                reply_err(client, msg); return;
+            }
+
+            match vfs.write(&path, write_off, &data_buf) {
+                Some(written) => {
+                    if let Some(f) = open_table.get_mut(fd) { f.offset = write_off + written as u64; }
+                    pack_u32_reply(&mut msg.data, written as u32);
+                    reply_ok(client, msg);
                 }
-                None => reply_err(client),
+                None => reply_err(client, msg),
             }
         }
         OP_CLOSE => {
-            if body.len() < 4 { reply_err(client); return; }
-            let mut off = 0;
-            let fd = get_u32(body, &mut off);
+            let fd = unpack_close_req(&msg.data);
             open_table.close(fd);
-            reply_ok(client, &[]);
+            reply_ok(client, msg);
         }
         OP_GETDENTS => {
-            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
+            let (path_ptr, path_len, buf_ptr, buf_len) = unpack_getdents_req(&msg.data);
+            if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            
             match vfs.readdir(path) {
                 Some(children) => {
-                    let mut buf = [0u8; MAX_MSG - 1];
+                    let mut data_buf = alloc::vec![0u8; buf_len];
                     let mut pos = 0usize;
                     for child in &children {
                         let b = child.as_bytes();
-                        if pos + b.len() + 1 > buf.len() { break; }
-                        buf[pos..pos + b.len()].copy_from_slice(b);
+                        if pos + b.len() + 1 > data_buf.len() { break; }
+                        data_buf[pos..pos + b.len()].copy_from_slice(b);
                         pos += b.len();
-                        buf[pos] = 0; pos += 1;
+                        data_buf[pos] = 0; pos += 1;
                     }
-                    reply_ok(client, &buf[..pos]);
+                    if libos::datacopy(libos::getpid(), data_buf.as_ptr(), client, buf_ptr as *mut u8, pos) < 0 {
+                        reply_err(client, msg); return;
+                    }
+                    pack_u32_reply(&mut msg.data, pos as u32);
+                    reply_ok(client, msg);
                 }
-                None => reply_err(client),
+                None => reply_err(client, msg),
             }
         }
         OP_MKDIR => {
-            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
-            if vfs.mkdir(path) { reply_ok(client, &[]) } else { reply_err(client) }
+            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            if vfs.mkdir(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_CREATE => {
-            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
+            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
             if vfs.create(path) {
                 let fd = open_table.open(path);
-                let mut p = [0u8; 4];
-                put_u32(&mut p, &mut 0, fd);
-                reply_ok(client, &p);
+                pack_u32_reply(&mut msg.data, fd);
+                reply_ok(client, msg);
             } else {
-                reply_err(client)
+                reply_err(client, msg)
             }
         }
         OP_UNLINK => {
-            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
-            if vfs.unlink(path) { reply_ok(client, &[]) } else { reply_err(client) }
+            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            if vfs.unlink(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_STAT => {
-            let path = match core::str::from_utf8(body) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
+            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
             match vfs.stat(path) {
                 Some((is_dir, size)) => {
-                    let mut p = [0u8; 9];
-                    p[0] = if is_dir { 1 } else { 0 };
-                    let mut off = 1;
-                    put_u64(&mut p, &mut off, size);
-                    reply_ok(client, &p);
+                    pack_stat_reply(&mut msg.data, is_dir, size);
+                    reply_ok(client, msg);
                 }
-                None => reply_err(client),
+                None => reply_err(client, msg),
             }
         }
         OP_RENAME => {
-            if body.len() < 4 { reply_err(client); return; }
-            let mut off = 0;
-            let old_len = get_u32(body, &mut off) as usize;
-            if body.len() < 4 + old_len { reply_err(client); return; }
-            let old = match core::str::from_utf8(&body[off..off + old_len]) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
-            let new = match core::str::from_utf8(&body[off + old_len..]) { Ok(s) => s, Err(_) => { reply_err(client); return; } };
+            let (old_ptr, old_len, new_ptr, new_len) = unpack_rename_req(&msg.data);
+            let mut old_buf = alloc::vec![0u8; old_len];
+            let mut new_buf = alloc::vec![0u8; new_len];
+            if libos::datacopy(client, old_ptr as *const u8, libos::getpid(), old_buf.as_mut_ptr(), old_len) < 0 ||
+               libos::datacopy(client, new_ptr as *const u8, libos::getpid(), new_buf.as_mut_ptr(), new_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let old = match core::str::from_utf8(&old_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            let new = match core::str::from_utf8(&new_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
 
             if let Some(node) = vfs.nodes.remove(old) {
                 if let Some((op, on)) = Vfs::parent_and_name(old)
@@ -447,12 +730,22 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, client: i32, msg: &[u8], 
                     c.push(nn);
                 }
                 vfs.nodes.insert(new.to_string(), node);
-                reply_ok(client, &[]);
+                reply_ok(client, msg);
             } else {
-                reply_err(client);
+                reply_err(client, msg);
             }
         }
-        _ => reply_err(client),
+        OP_FSYNC => {
+            let fd = unpack_close_req(&msg.data);
+            let is_mnt = open_table.get(fd).map(|f| f.path.starts_with("/mnt")).unwrap_or(false);
+            if is_mnt {
+                let ok = get_blockfs().map(|ofs| ofs.fsync()).unwrap_or(false);
+                if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
+            } else {
+                reply_ok(client, msg) // non-OFS fds have nothing to flush
+            }
+        }
+        _ => reply_err(client, msg),
     }
 }
 
@@ -467,13 +760,18 @@ pub extern "C" fn main(_argc: usize, _argv: usize) -> i32 {
     vfs.mkdir_all("/tmp");
     vfs.mkdir_all("/home/guest");
 
+    // Register /proc and /dev as visible root entries so ls / lists them.
+    // Their content is synthesised on demand; the Dir entries only hold the name.
+    if let Some(FsNode::Dir(root_children)) = vfs.nodes.get_mut("/") {
+        if !root_children.iter().any(|n| n == "proc") { root_children.push(String::from("proc")); }
+        if !root_children.iter().any(|n| n == "dev")  { root_children.push(String::from("dev")); }
+    }
+
     let mut open_table = OpenTable::new();
-    let mut msg_buf = [0u8; MAX_MSG];
+    let mut msg = libos::ipc::Message::new();
 
     loop {
-        let mut from: i32 = 0;
-        let len = ipc_recv(&mut msg_buf, &mut from);
-        if len == 0 { continue; }
-        dispatch(&mut vfs, &mut open_table, from, &msg_buf, len);
+        libos::msg_receive(-1, &mut msg);
+        dispatch(&mut vfs, &mut open_table, msg);
     }
 }

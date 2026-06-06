@@ -1,23 +1,22 @@
 #![no_std]
 
 // Opcodes (request type — first byte of every IPC message).
-pub const OP_OPEN:     u8 = 1;
-pub const OP_READ:     u8 = 2;
-pub const OP_WRITE:    u8 = 3;
-pub const OP_CLOSE:    u8 = 4;
-pub const OP_GETDENTS: u8 = 5;
-pub const OP_MKDIR:    u8 = 6;
-pub const OP_UNLINK:   u8 = 7;
-pub const OP_STAT:     u8 = 8;
-pub const OP_CREATE:   u8 = 9;
-pub const OP_RENAME:   u8 = 10;
+pub const OP_OPEN:     i32 = 1;
+pub const OP_READ:     i32 = 2;
+pub const OP_WRITE:    i32 = 3;
+pub const OP_CLOSE:    i32 = 4;
+pub const OP_GETDENTS: i32 = 5;
+pub const OP_MKDIR:    i32 = 6;
+pub const OP_UNLINK:   i32 = 7;
+pub const OP_STAT:     i32 = 8;
+pub const OP_CREATE:   i32 = 9;
+pub const OP_RENAME:   i32 = 10;
+pub const OP_FSYNC:    i32 = 11;
+pub const OP_DUP:      i32 = 12;
 
-// Reply status codes (second byte of every reply).
-pub const REPLY_OK:  u8 = 0;
-pub const REPLY_ERR: u8 = 1;
-
-// Max IPC message payload in bytes (must match kernel limit).
-pub const MAX_MSG: usize = 4096;
+// Reply status codes (for msg.type_)
+pub const REPLY_OK:  i32 = 0;
+pub const REPLY_ERR: i32 = -1;
 
 // ── Encoding helpers ─────────────────────────────────────────────────────────
 
@@ -29,11 +28,6 @@ pub fn put_u32(buf: &mut [u8], off: &mut usize, v: u32) {
 pub fn put_u64(buf: &mut [u8], off: &mut usize, v: u64) {
     buf[*off..*off + 8].copy_from_slice(&v.to_le_bytes());
     *off += 8;
-}
-
-pub fn put_bytes(buf: &mut [u8], off: &mut usize, data: &[u8]) {
-    buf[*off..*off + data.len()].copy_from_slice(data);
-    *off += data.len();
 }
 
 pub fn get_u32(buf: &[u8], off: &mut usize) -> u32 {
@@ -50,108 +44,113 @@ pub fn get_u64(buf: &[u8], off: &mut usize) -> u64 {
 
 // ── Request builders ─────────────────────────────────────────────────────────
 
-/// Build an OP_OPEN request into `buf`. Returns byte count.
-/// Format: [OP_OPEN, flags(4), path_bytes...]
-pub fn build_open(buf: &mut [u8], flags: u32, path: &[u8]) -> usize {
+/// OP_OPEN / OP_CREATE / OP_MKDIR / OP_UNLINK / OP_STAT
+/// Format: flags(4), path_ptr(8), path_len(4)
+pub fn pack_path_req(data: &mut [u8; 56], flags: u32, path_ptr: usize, path_len: usize) {
     let mut off = 0;
-    buf[off] = OP_OPEN; off += 1;
-    put_u32(buf, &mut off, flags);
-    put_bytes(buf, &mut off, path);
-    off
+    put_u32(data, &mut off, flags);
+    put_u64(data, &mut off, path_ptr as u64);
+    put_u32(data, &mut off, path_len as u32);
 }
 
-/// Build an OP_READ request. Format: [OP_READ, fd(4), offset(8), len(4)]
-pub fn build_read(buf: &mut [u8], fd: u32, offset: u64, len: u32) -> usize {
+pub fn unpack_path_req(data: &[u8; 56]) -> (u32, usize, usize) {
     let mut off = 0;
-    buf[off] = OP_READ; off += 1;
-    put_u32(buf, &mut off, fd);
-    put_u64(buf, &mut off, offset);
-    put_u32(buf, &mut off, len);
-    off
+    let flags = get_u32(data, &mut off);
+    let path_ptr = get_u64(data, &mut off) as usize;
+    let path_len = get_u32(data, &mut off) as usize;
+    (flags, path_ptr, path_len)
 }
 
-/// Build an OP_WRITE request. Format: [OP_WRITE, fd(4), offset(8), data...]
-pub fn build_write(buf: &mut [u8], fd: u32, offset: u64, data: &[u8]) -> usize {
+/// OP_READ / OP_WRITE
+/// Format: fd(4), offset(8), buf_ptr(8), len(4)
+pub fn pack_rw_req(data: &mut [u8; 56], fd: u32, offset: u64, buf_ptr: usize, len: usize) {
     let mut off = 0;
-    buf[off] = OP_WRITE; off += 1;
-    put_u32(buf, &mut off, fd);
-    put_u64(buf, &mut off, offset);
-    put_bytes(buf, &mut off, data);
-    off
+    put_u32(data, &mut off, fd);
+    put_u64(data, &mut off, offset);
+    put_u64(data, &mut off, buf_ptr as u64);
+    put_u32(data, &mut off, len as u32);
 }
 
-/// Build an OP_CLOSE request. Format: [OP_CLOSE, fd(4)]
-pub fn build_close(buf: &mut [u8], fd: u32) -> usize {
+pub fn unpack_rw_req(data: &[u8; 56]) -> (u32, u64, usize, usize) {
     let mut off = 0;
-    buf[off] = OP_CLOSE; off += 1;
-    put_u32(buf, &mut off, fd);
-    off
+    let fd = get_u32(data, &mut off);
+    let offset = get_u64(data, &mut off);
+    let buf_ptr = get_u64(data, &mut off) as usize;
+    let len = get_u32(data, &mut off) as usize;
+    (fd, offset, buf_ptr, len)
 }
 
-/// Build an OP_GETDENTS request. Format: [OP_GETDENTS, path_bytes...]
-pub fn build_getdents(buf: &mut [u8], path: &[u8]) -> usize {
+/// OP_GETDENTS
+/// Format: path_ptr(8), path_len(4), buf_ptr(8), buf_len(4)
+pub fn pack_getdents_req(data: &mut [u8; 56], path_ptr: usize, path_len: usize, buf_ptr: usize, buf_len: usize) {
     let mut off = 0;
-    buf[off] = OP_GETDENTS; off += 1;
-    put_bytes(buf, &mut off, path);
-    off
+    put_u64(data, &mut off, path_ptr as u64);
+    put_u32(data, &mut off, path_len as u32);
+    put_u64(data, &mut off, buf_ptr as u64);
+    put_u32(data, &mut off, buf_len as u32);
 }
 
-/// Build a path-only request (MKDIR, UNLINK, CREATE). Format: [op, path...]
-pub fn build_path_op(buf: &mut [u8], op: u8, path: &[u8]) -> usize {
+pub fn unpack_getdents_req(data: &[u8; 56]) -> (usize, usize, usize, usize) {
     let mut off = 0;
-    buf[off] = op; off += 1;
-    put_bytes(buf, &mut off, path);
-    off
+    let path_ptr = get_u64(data, &mut off) as usize;
+    let path_len = get_u32(data, &mut off) as usize;
+    let buf_ptr = get_u64(data, &mut off) as usize;
+    let buf_len = get_u32(data, &mut off) as usize;
+    (path_ptr, path_len, buf_ptr, buf_len)
 }
 
-/// Build an OP_RENAME request. Format: [OP_RENAME, old_len(4), old..., new...]
-pub fn build_rename(buf: &mut [u8], old: &[u8], new: &[u8]) -> usize {
+/// OP_CLOSE
+/// Format: fd(4)
+pub fn pack_close_req(data: &mut [u8; 56], fd: u32) {
     let mut off = 0;
-    buf[off] = OP_RENAME; off += 1;
-    put_u32(buf, &mut off, old.len() as u32);
-    put_bytes(buf, &mut off, old);
-    put_bytes(buf, &mut off, new);
-    off
+    put_u32(data, &mut off, fd);
 }
 
-/// Build an OP_STAT request. Format: [OP_STAT, path_bytes...]
-pub fn build_stat(buf: &mut [u8], path: &[u8]) -> usize {
-    build_path_op(buf, OP_STAT, path)
-}
-
-// ── Reply parsers ─────────────────────────────────────────────────────────────
-
-/// Parse a reply: returns `(status, payload_slice)`.
-/// status = REPLY_OK or REPLY_ERR; payload follows byte 0.
-pub fn parse_reply(buf: &[u8], len: usize) -> (u8, &[u8]) {
-    if len == 0 { return (REPLY_ERR, &[]); }
-    (buf[0], &buf[1..len])
-}
-
-/// Parse an OP_OPEN reply payload: returns vfs_fd on OK.
-pub fn parse_open_reply(payload: &[u8]) -> Option<u32> {
-    if payload.len() < 4 { return None; }
+pub fn unpack_close_req(data: &[u8; 56]) -> u32 {
     let mut off = 0;
-    Some(get_u32(payload, &mut off))
+    get_u32(data, &mut off)
 }
 
-/// Parse an OP_READ reply payload: returns data slice.
-pub fn parse_read_reply(payload: &[u8]) -> &[u8] {
-    payload
-}
-
-/// Parse an OP_WRITE reply payload: returns bytes_written.
-pub fn parse_write_reply(payload: &[u8]) -> u32 {
-    if payload.len() < 4 { return 0; }
+/// OP_RENAME
+/// Format: old_ptr(8), old_len(4), new_ptr(8), new_len(4)
+pub fn pack_rename_req(data: &mut [u8; 56], old_ptr: usize, old_len: usize, new_ptr: usize, new_len: usize) {
     let mut off = 0;
-    get_u32(payload, &mut off)
+    put_u64(data, &mut off, old_ptr as u64);
+    put_u32(data, &mut off, old_len as u32);
+    put_u64(data, &mut off, new_ptr as u64);
+    put_u32(data, &mut off, new_len as u32);
 }
 
-/// Parse an OP_STAT reply: (is_dir, size).
-pub fn parse_stat_reply(payload: &[u8]) -> Option<(bool, u64)> {
-    if payload.len() < 9 { return None; }
-    let is_dir = payload[0] != 0;
+pub fn unpack_rename_req(data: &[u8; 56]) -> (usize, usize, usize, usize) {
+    let mut off = 0;
+    let old_ptr = get_u64(data, &mut off) as usize;
+    let old_len = get_u32(data, &mut off) as usize;
+    let new_ptr = get_u64(data, &mut off) as usize;
+    let new_len = get_u32(data, &mut off) as usize;
+    (old_ptr, old_len, new_ptr, new_len)
+}
+
+// ── Reply builders / parsers ─────────────────────────────────────────────────
+
+pub fn pack_u32_reply(data: &mut [u8; 56], val: u32) {
+    let mut off = 0;
+    put_u32(data, &mut off, val);
+}
+
+pub fn unpack_u32_reply(data: &[u8; 56]) -> u32 {
+    let mut off = 0;
+    get_u32(data, &mut off)
+}
+
+pub fn pack_stat_reply(data: &mut [u8; 56], is_dir: bool, size: u64) {
+    data[0] = if is_dir { 1 } else { 0 };
     let mut off = 1;
-    let size = get_u64(payload, &mut off);
-    Some((is_dir, size))
+    put_u64(data, &mut off, size);
+}
+
+pub fn unpack_stat_reply(data: &[u8; 56]) -> (bool, u64) {
+    let is_dir = data[0] != 0;
+    let mut off = 1;
+    let size = get_u64(data, &mut off);
+    (is_dir, size)
 }

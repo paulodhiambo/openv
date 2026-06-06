@@ -6,25 +6,26 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::global_asm;
-use core::panic::PanicInfo;
 
-pub mod block;
+
 pub mod drivers;
 pub mod errno;
 pub mod ipc;
 pub mod mm;
+pub mod namespace;
 pub mod net;
 pub mod plic;
 pub mod posix;
 pub mod smp;
 pub mod syscall;
 pub mod timer;
+pub mod trace;
 pub mod trap;
+pub mod tty;
 pub mod uart;
-pub mod vfs;
+pub mod initrd;
 pub mod sync;
 
 static mut BOOT_DTB_PTR: usize = 0;
@@ -79,6 +80,9 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // Initialize Memory Management
     mm::init(dtb_ptr);
 
+    // Initialize root namespaces
+    namespace::init();
+
     // Initialize Trap Handler
     trap::init();
 
@@ -96,60 +100,17 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             let end = end_prop.as_usize().unwrap_or(0);
 
             if start > 0 && end > start {
-                crate::println!(
-                    "Found initrd at {:#x} - {:#x} ({} bytes)",
-                    start,
-                    end,
-                    end - start
-                );
+                let initrd_len = end - start;
+                let initrd_slice = unsafe { core::slice::from_raw_parts(start as *const u8, initrd_len) };
+                crate::raw_print!("[HART-ONLY] Found initrd\n");    unsafe { crate::initrd::init(initrd_slice); }
+
                 // Store for sys_initrd_data (syscall 65) so the VFS server can fetch it.
                 INITRD_START.store(start, core::sync::atomic::Ordering::Relaxed);
                 INITRD_LEN.store(end - start, core::sync::atomic::Ordering::Relaxed);
-                let initrd_slice =
-                    unsafe { core::slice::from_raw_parts(start as *const u8, end - start) };
-                let root_fs = vfs::tar::parse_tar(initrd_slice);
-                {
-                    let mut mt = vfs::MOUNT_TABLE.lock();
-                    mt.root = Some(root_fs);
-                    // Mount /proc (ProcFS) and /dev (DevFS)
-                    mt.mounts.push((
-                        alloc::string::String::from("/proc"),
-                        Arc::new(vfs::procfs::ProcRoot),
-                    ));
-                    mt.mounts.push((
-                        alloc::string::String::from("/dev"),
-                        Arc::new(vfs::devfs::DevRoot),
-                    ));
-                }
-                crate::println!("VFS: Mounted MemFS at /, ProcFS at /proc, DevFS at /dev.");
-
-                // Mount persistent OFS filesystem at /mnt if a block device is present.
-                if let Some(ofs_root) = vfs::blockfs::try_mount() {
-                    let mut mt = vfs::MOUNT_TABLE.lock();
-                    // Ensure /mnt exists in the initrd tarfs
-                    mt.mounts.push((
-                        alloc::string::String::from("/mnt"),
-                        ofs_root,
-                    ));
-                    crate::println!("VFS: mounted OFS at /mnt");
-                }
             }
         }
     } else {
         crate::println!("No initrd found in DTB.");
-    }
-
-    // Test VFS reading
-    crate::println!("--- Testing VFS ---");
-    if let Ok(file) = vfs::lookup_path("/dummy.txt") {
-        let mut buf = [0u8; 32];
-        if let Ok(bytes_read) = file.read(0, &mut buf) {
-            if let Ok(s) = core::str::from_utf8(&buf[..bytes_read]) {
-                crate::println!("Successfully read from /dummy.txt: '{}'", s);
-            }
-        }
-    } else {
-        crate::println!("Failed to find /dummy.txt");
     }
 
     // Test the global heap allocator
@@ -195,29 +156,45 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     }
 
     // Test POSIX Process logic
-    crate::raw_print!("[HART-ONLY] kmain: about to create init process\n");
-    let init_pid = posix::process::Process::new(0).expect("Failed to create mock init process").pid; // Mock init process
+    crate::raw_print!("[HART-ONLY] kmain: about to create boot servers\n");
 
     // Start secondary HARTs now that kernel data structures are ready
     smp::start_secondaries();
+    trap::enable_timer(); // Moved here to enable preemption before spawning servers
 
-    // Spawn init (PID 1) which will manage the lifecycle of all user processes
-    crate::raw_print!("[HART-ONLY] kmain: attempting posix_spawn(/init)\n");
-    if let Ok(_init_pid) = posix::spawn::posix_spawn("/init", init_pid) {
-        crate::raw_print!("[HART-ONLY] kmain: /init spawn OK\n");
+    // Spawn boot servers
+    crate::raw_print!("[HART-ONLY] kmain: attempting posix_spawn of boot servers\n");
+    
+    if let Ok(init_pid) = posix::spawn::posix_spawn("/init", 0) {
+        let pm_pid = posix::spawn::posix_spawn("/pm-server", 0).unwrap();
+        let vfs_pid = posix::spawn::posix_spawn("/vfs-server", 0).unwrap();
+        let rs_pid = posix::spawn::posix_spawn("/rs-server", 0).unwrap();
+        
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        if let Some(init_proc) = table.get(&init_pid) {
+            init_proc.caps.store(posix::process::CAP_NONE, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(pm_proc) = table.get(&pm_pid) {
+            pm_proc.caps.store(posix::process::CAP_PROCESS | posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(vfs_proc) = table.get(&vfs_pid) {
+            vfs_proc.caps.store(posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(rs_proc) = table.get(&rs_pid) {
+            rs_proc.caps.store(
+                posix::process::CAP_PROCESS | posix::process::CAP_SYS_ADMIN | posix::process::CAP_DATACOPY, 
+                core::sync::atomic::Ordering::Relaxed
+            );
+        }
+        drop(table);
+        
+        crate::raw_print!("[HART-ONLY] kmain: boot servers + /init spawn OK\n");
         crate::raw_print!("[HART-ONLY] Enabling timer, calling schedule()...\n");
-        trap::enable_timer();
         posix::process::schedule();
         crate::raw_print!("[HART-ONLY] SCHEDULE RETURNED! Hanging forever...\n");
         unsafe { __halt_cpu() };
-    } else if let Ok(_) = posix::spawn::posix_spawn("/sh", init_pid) {
-        crate::raw_print!("[HART-ONLY] kmain: /init FAILED, /sh spawn OK\n");
-        crate::raw_print!("[HART-ONLY] Calling schedule() (fallback)...\n");
-        posix::process::schedule();
-        crate::raw_print!("[HART-ONLY] SCHEDULE RETURNED (fallback)! Hanging forever...\n");
-        unsafe { __halt_cpu() };
-    } else {
-        crate::raw_print!("[HART-ONLY] kmain: BOTH /init AND /sh FAILED\n");
+    } else if let Err(e) = posix::spawn::posix_spawn("/init", 0) {
+        crate::println!("[HART-ONLY] kmain: /init FAILED: {}", e);
     }
 
     crate::raw_print!("[HART-ONLY] kmain: AFTER if-else chain (will test ecall trap)\n");
@@ -230,19 +207,7 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
 }
 
 #[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    crate::raw_print!("KERNEL PANIC: ");
-    if let Some(msg) = info.message().as_str() {
-        crate::uart::write_str(msg);
-    } else {
-        crate::uart::write_str("(formatted message)");
-    }
-    if let Some(loc) = info.location() {
-        crate::uart::write_str(" at ");
-        crate::uart::write_str(loc.file());
-        crate::uart::write_str(":");
-        crate::uart::write_dec(loc.line() as usize);
-    }
-    crate::uart::write_str("\n");
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    crate::println!("KERNEL PANIC: {}", info);
     unsafe { __halt_cpu() };
 }

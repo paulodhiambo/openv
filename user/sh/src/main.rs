@@ -433,7 +433,7 @@ impl Shell {
             return self.complete_path(prefix);
         }
         const BUILTINS: &[&[u8]] = &[
-            b"echo", b"ls", b"cat", b"pwd", b"cd", b"mkdir", b"rm",
+            b"echo", b"ls", b"cat", b"pwd", b"cd", b"mkdir", b"rm", b"touch",
             b"help", b"clear", b"history", b"nano", b"whoami",
             b"hostname", b"uname", b"exit",
         ];
@@ -535,6 +535,7 @@ impl Shell {
                 | b"cd"
                 | b"mkdir"
                 | b"rm"
+                | b"touch"
                 | b"help"
                 | b"?"
                 | b"clear"
@@ -851,6 +852,7 @@ impl Shell {
             b"cd" => self.cmd_cd(&args[1..]),
             b"mkdir" => self.cmd_mkdir(&args[1..]),
             b"rm" => self.cmd_rm(&args[1..]),
+            b"touch" => self.cmd_touch(&args[1..]),
             b"help" | b"?" => self.cmd_help(),
             b"clear" => wrt(CLR),
             b"history" | b".history" => self.cmd_history(),
@@ -911,6 +913,11 @@ impl Shell {
             b"rm" => {
                 wrt(b"Usage: rm <file...>\n");
                 wrt(b"  Remove one or more files.\n");
+            }
+            b"touch" => {
+                wrt(b"Usage: touch <file...>\n");
+                wrt(b"  Create empty files (or update timestamps).\n");
+                wrt(b"  Useful for creating files on /mnt (persistent OFS).\n");
             }
             b"nano" => {
                 wrt(b"Usage: nano <file>\n");
@@ -1075,6 +1082,24 @@ impl Shell {
         }
     }
 
+    fn cmd_touch(&self, args: &[Vec<u8>]) {
+        if args.is_empty() {
+            wrt(b"touch: missing file operand\n");
+            return;
+        }
+        for arg in args {
+            let path = self.resolve(arg);
+            let fd = create(&path);
+            if fd < 0 {
+                wrt(b"touch: cannot create '");
+                wrt(&path);
+                wrt(b"'\n");
+            } else {
+                close(fd);
+            }
+        }
+    }
+
     fn cmd_export(&mut self, args: &[Vec<u8>]) {
         if args.is_empty() {
             self.cmd_env();
@@ -1142,6 +1167,7 @@ impl Shell {
             ("cd [path]",          "Change directory (default /)"),
             ("mkdir <dir>",        "Create directory"),
             ("rm <file>",          "Remove file or directory"),
+            ("touch <file>",       "Create empty file"),
             ("nano <file>",        "Text editor (^O save, ^X exit)"),
             ("export [NAME=VAL]",  "Set/show environment variables"),
             ("unset <NAME>",       "Remove an environment variable"),

@@ -66,6 +66,38 @@ impl PageTable {
 
         Ok(())
     }
+
+    /// Walk the page table to find the physical address and flags for a given virtual address.
+    /// Returns `(physical_address, flags)` or an error if unmapped or not a leaf.
+    pub fn walk_page_table(root_pa: usize, va: usize) -> Result<(usize, usize), &'static str> {
+        let vpn = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
+
+        let mut pt_pa = root_pa;
+        for level in (1..=2).rev() {
+            // SAFETY: `pt_pa` is derived from a valid page table root or PTE.
+            let pt = unsafe { &*(pt_pa as *const PageTable) };
+            let entry = pt.entries[vpn[level]];
+            if entry & PTE_V == 0 {
+                return Err("unmapped");
+            }
+            let is_leaf = (entry & (PTE_R | PTE_X)) != 0;
+            if is_leaf {
+                return Err("huge pages not supported");
+            }
+            pt_pa = ((entry >> 10) << 12) as usize;
+        }
+
+        // SAFETY: `pt_pa` is a valid leaf page table physical address.
+        let pt = unsafe { &*(pt_pa as *const PageTable) };
+        let entry = pt.entries[vpn[0]];
+        if entry & PTE_V == 0 {
+            return Err("unmapped");
+        }
+
+        let pa = ((entry >> 10) << 12) | (va & 0xFFF);
+        let flags = entry & 0x3FF;
+        Ok((pa, flags))
+    }
 }
 
 /// Clone user portions of a parent's page table into a child page table, making pages copy-on-write.
@@ -118,15 +150,20 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
                 let mut flags = entry & 0x3FF; // low 10 bits
 
                 if (flags & PTE_U) != 0 {
-                    // User page: make read-only in both parent and child (COW)
-                    if (flags & PTE_W) != 0 {
-                        // Clear write in parent
-                        let new_parent_entry = (pa >> 12) << 10 | (flags & !PTE_W);
-                        parent_pt.entries[idx] = new_parent_entry;
-                        flags &= !PTE_W;
+                    if crate::mm::pmm::is_managed_page(pa) {
+                        // User page: make read-only in both parent and child (COW)
+                        if (flags & PTE_W) != 0 {
+                            // Clear write in parent
+                            let new_parent_entry = (pa >> 12) << 10 | (flags & !PTE_W);
+                            parent_pt.entries[idx] = new_parent_entry;
+                            flags &= !PTE_W;
+                        }
+                        // Increment refcount for shared page
+                        pmm::incr_ref(pa);
+                    } else {
+                        // Unmanaged user page (like MMIO mapped via sys_phys_map).
+                        // Do not clear PTE_W or increment refcount. Just copy mapping as-is.
                     }
-                    // Increment refcount for shared page
-                    pmm::incr_ref(pa);
                 }
 
                 child_pt.entries[idx] = (pa >> 12) << 10 | (flags & 0x3FF) | PTE_V;
@@ -144,14 +181,8 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
 
 /// Handle store page fault at given virtual address in the currently active page table.
 /// Perform copy-on-write if the page is a user mapping that is currently read-only.
-pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
+pub fn handle_store_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'static str> {
     use crate::mm::pmm;
-    use riscv::register::satp;
-
-    // satp::read() is safe — it merely reads a CSR with no side effects.
-    let satp_val = satp::read().bits() as usize;
-    let ppn = satp_val & 0xFFFFFFFFFFF;
-    let root_pa = ppn << 12;
 
     // Walk to find the leaf PTE
     let vpn = [
@@ -191,6 +222,10 @@ pub fn handle_store_page_fault(fault_va: usize) -> Result<(), &'static str> {
 
     // If page is user and not writable, perform COW
     if (flags & PTE_U) != 0 && (flags & PTE_W) == 0 {
+        if !crate::mm::pmm::is_managed_page(pa) {
+            return Err("Cannot COW an unmanaged physical page (e.g., MMIO)");
+        }
+        
         // Allocate a new page and copy contents
         let new_frame = pmm::alloc_frame().ok_or("OOM in COW")?;
         let new_pa = new_frame.pa();
@@ -243,9 +278,11 @@ unsafe fn destroy_level(pt_pa: usize, level: usize) {
             let flags = entry & 0x3FF;
             if (flags & PTE_U) != 0 {
                 // user page: decrement ref and free if needed
-                let remaining = crate::mm::pmm::decr_ref(pa);
-                if remaining == 0 {
-                    crate::mm::pmm::free_page(pa);
+                if crate::mm::pmm::is_managed_page(pa) {
+                    let remaining = crate::mm::pmm::decr_ref(pa);
+                    if remaining == 0 {
+                        crate::mm::pmm::free_page(pa);
+                    }
                 }
             }
             pt.entries[idx] = 0;
@@ -311,7 +348,7 @@ pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
 }
 
 /// Handle an instruction or load page fault in user space by lazily allocating a zero page.
-pub fn handle_user_page_fault(fault_va: usize) -> Result<(), &'static str> {
+pub fn handle_user_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'static str> {
     use crate::mm::pmm::PAGE_SIZE;
     // Reject anything in the upper canonical half (kernel space in Sv39)
     if fault_va >= 0x0000_8000_0000_0000 {
@@ -325,15 +362,15 @@ pub fn handle_user_page_fault(fault_va: usize) -> Result<(), &'static str> {
     }
     let page_va = fault_va & !(PAGE_SIZE - 1);
 
-    // satp::read() is safe — it merely reads a CSR with no side effects.
-    let satp_val = riscv::register::satp::read().bits() as usize;
-    let ppn = satp_val & 0xFFFFFFFFFFF;
-    let root_pa = ppn << 12;
+    // 2. Check swap first; if a page was previously evicted, restore it.
+    if crate::mm::swap::lookup_swap(root_pa, page_va) {
+        return crate::mm::swap::swap_in(root_pa, page_va);
+    }
 
-    // 2. Allocate a physical page (zeroed by PMM)
+    // 3. Allocate a fresh physical page (zeroed by PMM).
     let frame = crate::mm::pmm::alloc_frame().ok_or("OOM in demand paging")?;
 
-    // 3. Map the new page
+    // 4. Map the new page.
     // SAFETY:
     // Preconditions: `root_pa` is derived from the active `SATP` CSR, ensuring it is the valid root page table.
     // Postconditions: Mutably borrows the active root page table.
@@ -354,6 +391,49 @@ pub fn handle_user_page_fault(fault_va: usize) -> Result<(), &'static str> {
             unsafe { core::arch::asm!("sfence.vma") };
             Ok(())
         }
+    }
+}
+
+/// Unmap all 4 KB pages in `[va_start, va_start+len)` from `root_pa`.
+/// Managed physical pages are freed when their ref-count drops to zero.
+pub fn unmap_range(root_pa: usize, va_start: usize, len: usize) {
+    use crate::mm::pmm;
+    let page_size = pmm::PAGE_SIZE;
+    let end = va_start.saturating_add(len);
+    let mut va = va_start & !(page_size - 1);
+    while va < end {
+        let vpn = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
+        // SAFETY: root_pa comes from the active process SATP and is valid.
+        let root = unsafe { &mut *(root_pa as *mut PageTable) };
+        let l2e = root.entries[vpn[2]];
+        if l2e & PTE_V == 0 || (l2e & (PTE_R | PTE_X)) != 0 {
+            va = va.saturating_add(1 << 30); // skip whole 1 GB region
+            va &= !(page_size - 1);
+            continue;
+        }
+        let l1_pa = (l2e >> 10) << 12;
+        let l1 = unsafe { &mut *(l1_pa as *mut PageTable) };
+        let l1e = l1.entries[vpn[1]];
+        if l1e & PTE_V == 0 || (l1e & (PTE_R | PTE_X)) != 0 {
+            va = va.saturating_add(1 << 21); // skip whole 2 MB region
+            va &= !(page_size - 1);
+            continue;
+        }
+        let l0_pa = (l1e >> 10) << 12;
+        let l0 = unsafe { &mut *(l0_pa as *mut PageTable) };
+        let l0e = l0.entries[vpn[0]];
+        if l0e & PTE_V != 0 {
+            let pa = (l0e >> 10) << 12;
+            let flags = l0e & 0x3FF;
+            if (flags & PTE_U) != 0 && pmm::is_managed_page(pa) {
+                let remaining = pmm::decr_ref(pa);
+                if remaining == 0 {
+                    pmm::free_page(pa);
+                }
+            }
+            l0.entries[vpn[0]] = 0;
+        }
+        va += page_size;
     }
 }
 

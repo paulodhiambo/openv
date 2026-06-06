@@ -2,8 +2,6 @@ use crate::mm::pmm::{alloc_frame, PAGE_SIZE};
 use crate::mm::vmm::{PTE_R, PTE_U, PTE_W};
 use crate::posix::elf::load_elf;
 use crate::posix::process::{PROCESS_TABLE, Pid, Process};
-use crate::vfs::lookup_path;
-use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 pub const USER_STACK_TOP: usize = 0x200000000; // 8GB
@@ -19,40 +17,14 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
         e
     };
 
-    // Read the binary from VFS
-    let vnode = lookup_path(path).map_err(cleanup)?;
-
-    // Check execute permission
-    let proc_ref = {
-        let table = PROCESS_TABLE.lock();
-        table.get(&pid).cloned().ok_or_else(|| cleanup("internal: process table corrupted"))?
+    // Read the binary from the minimal in-memory TAR initrd
+    let file_data = match crate::initrd::kernel_initrd_lookup(path) {
+        Some(data) => data,
+        None => {
+            cleanup_process(pid);
+            return Err("File not found in initrd");
+        }
     };
-    if !crate::vfs::check_access(&proc_ref, &*vnode, crate::vfs::ACCESS_EXEC) {
-        cleanup_process(pid);
-        return Err("Permission denied");
-    }
-
-    let stat = vnode.stat();
-
-    // Setuid / Setgid support
-    {
-        if stat.mode & 0o4000 != 0 {
-            proc.euid.store(stat.uid, Ordering::Relaxed);
-        }
-        if stat.mode & 0o2000 != 0 {
-            proc.egid.store(stat.gid, Ordering::Relaxed);
-        }
-    }
-
-    let size = stat.size;
-    if size == 0 {
-        cleanup_process(pid);
-        return Err("File is empty or not found");
-    }
-
-    let mut file_data = Vec::new();
-    file_data.resize(size, 0);
-    vnode.read(0, &mut file_data).map_err(cleanup)?;
 
     // Get the page table
     let satp_val = proc.satp_val.load(core::sync::atomic::Ordering::Relaxed);
@@ -63,7 +35,9 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     // Load ELF
     let entry_point = load_elf(&file_data, pt).map_err(cleanup)?;
 
-    // Allocate and map user stack
+    // Allocate and map user stack.
+    // The page immediately below the allocated stack region is intentionally left unmapped
+    // to serve as a guard page against stack overflows.
     let stack_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
     for i in 0..USER_STACK_PAGES {
         let va = stack_base + i * PAGE_SIZE;
@@ -90,8 +64,15 @@ fn try_wake_parent(parent: &Process, child_pid: Pid, child_status: i32) {
     let should_wake = {
         let target = parent.wait_target.lock();
         if target.is_none() || *target == Some(child_pid) || *target == Some(-1i32) {
-            *parent.wait_result.lock() = Some((child_pid, child_status));
-            true
+            // Only write if the slot is empty; a concurrent sibling exit may have
+            // already claimed it — don't overwrite and lose the first child's status.
+            let mut result = parent.wait_result.lock();
+            if result.is_none() {
+                *result = Some((child_pid, child_status));
+                true
+            } else {
+                false
+            }
         } else {
             false
         }
@@ -118,8 +99,8 @@ fn try_wake_parent(parent: &Process, child_pid: Pid, child_status: i32) {
 pub fn exit(pid: Pid, status: i32) {
     use crate::posix::process::{PROCESS_TABLE, ProcState};
 
-    // Phase 1: Mark zombie and collect ppid + children list (single lock scope).
-    let (ppid, children) = {
+    // Phase 1: Mark zombie and collect ppid, children, and IPC senders in one lock scope.
+    let (ppid, children, blocked_senders) = {
         let table = PROCESS_TABLE.lock();
         match table.get(&pid) {
             None => return,
@@ -130,10 +111,70 @@ pub fn exit(pid: Pid, status: i32) {
                 proc.fds.lock().close_all();
                 crate::println!("exit: pid {} status {}", pid, status);
                 let children = proc.children.lock().clone();
-                (proc.ppid.load(Ordering::Relaxed), children)
+                // Drain senders while we hold the table lock so we can safely
+                // iterate them in phase 1.5 without risking a second drain.
+                let blocked_senders: alloc::vec::Vec<Pid> =
+                    proc.senders.lock().drain(..).collect();
+                (proc.ppid.load(Ordering::Relaxed), children, blocked_senders)
             }
         }
     };
+
+    // Phase 1.5: Unblock processes that are permanently stuck waiting on the dying
+    // process.  Two categories:
+    //   (a) Processes in IpcState::Sending { target: pid } — in the senders queue.
+    //   (b) Processes in IpcState::ReceivingReply { source: pid } — waiting for a
+    //       sendrec reply that will never come (not in any queue, must scan table).
+    // For both, advance their sepc past the blocked ecall and return ESRCH.
+    for sender_pid in blocked_senders {
+        let table = PROCESS_TABLE.lock();
+        if let Some(proc) = table.get(&sender_pid) {
+            {
+                let mut tf = proc.trap_frame.lock();
+                tf.sepc += 4; // undo the sepc -= 4 that armed the retry
+                tf.regs[10] = crate::errno::ESRCH as usize;
+            }
+            *proc.ipc_state.lock() = crate::posix::process::IpcState::None;
+            let mut st = proc.state.lock();
+            if matches!(*st, ProcState::Stopped) {
+                *st = ProcState::Running;
+                drop(st);
+                crate::posix::process::RUN_QUEUE.lock().push_back(sender_pid);
+            }
+        }
+    }
+    // Scan for sendrec reply-waiters (not in any per-process queue).
+    let reply_waiters: alloc::vec::Vec<Pid> = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter(|(_, p)| {
+                matches!(
+                    *p.ipc_state.lock(),
+                    crate::posix::process::IpcState::ReceivingReply { source, .. }
+                        if source == pid
+                )
+            })
+            .map(|(&p, _)| p)
+            .collect()
+    };
+    for waiter_pid in reply_waiters {
+        let table = PROCESS_TABLE.lock();
+        if let Some(proc) = table.get(&waiter_pid) {
+            {
+                let mut tf = proc.trap_frame.lock();
+                tf.sepc += 4;
+                tf.regs[10] = crate::errno::ESRCH as usize;
+            }
+            *proc.ipc_state.lock() = crate::posix::process::IpcState::None;
+            let mut st = proc.state.lock();
+            if matches!(*st, ProcState::Stopped) {
+                *st = ProcState::Running;
+                drop(st);
+                crate::posix::process::RUN_QUEUE.lock().push_back(waiter_pid);
+            }
+        }
+    }
 
     // Phase 2: Orphan reparenting — give all children to init (PID 1).
     if !children.is_empty() {
@@ -185,6 +226,11 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
     let child_pid = child.pid;
 
     if let Some(parent_proc) = crate::posix::process::PROCESS_TABLE.lock().get(&ppid) {
+        // Acquire parent's trap_frame lock to protect its page table during clone_user_space.
+        // This prevents concurrent modifications to the parent's page table from another HART.
+        // It also ensures a consistent TrapFrame state for copying.
+        let parent_tf_guard = parent_proc.trap_frame.lock(); // Hold lock here
+
         let parent_root_pa = (parent_proc.satp_val.load(core::sync::atomic::Ordering::Relaxed) & 0xFFFFFFFFFFF) << 12;
         let child_root_pa  = (child.satp_val.load(core::sync::atomic::Ordering::Relaxed) & 0xFFFFFFFFFFF) << 12;
 
@@ -200,10 +246,10 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
         unsafe { core::arch::asm!("sfence.vma") };
 
         // Copy trap frame — child resumes past the ecall with a0 = 0.
-        let parent_tf = parent_proc.trap_frame.lock();
+        // Use the already-held parent_tf_guard
         let mut child_tf = child.trap_frame.lock();
         let child_kernel_sp = child_tf.kernel_sp; // preserve child's own kernel stack
-        *child_tf = *parent_tf;
+        *child_tf = *parent_tf_guard; // Copy from the guarded parent_tf
         child_tf.kernel_sp = child_kernel_sp;
         child_tf.regs[10] = 0; // fork() returns 0 in the child
         child_tf.sepc += 4; // advance past the ecall instruction
@@ -221,15 +267,9 @@ pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static 
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = core::str::from_utf8(path_bytes).map_err(|_| "Invalid UTF-8 path")?;
 
-    // Lookup and read file
-    let vnode = crate::vfs::lookup_path(path)?;
-    let stat = vnode.stat();
-    if stat.size == 0 {
-        return Err("Empty binary");
-    }
-    let mut file_data = alloc::vec::Vec::new();
-    file_data.resize(stat.size, 0);
-    vnode.read(0, &mut file_data)?;
+    // Lookup and read file from minimal initrd
+    let file_data = crate::initrd::kernel_initrd_lookup(path)
+        .ok_or("File not found in initrd")?;
 
     // Get current process and its old root
     let proc = crate::posix::process::PROCESS_TABLE
@@ -268,8 +308,11 @@ pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static 
         core::arch::asm!("sfence.vma");
     }
 
-    // Now safe: CPU uses new PT, old space can be freed.
-    crate::mm::vmm::destroy_user_space(old_root_pa)?;
+    // Now safe: CPU uses new PT. Only free old space if this was the last
+    // thread using it (CLONE_VM threads sharing the old PA may still be running).
+    if crate::posix::process::satp_unshare(old_root_pa) {
+        crate::mm::vmm::destroy_user_space(old_root_pa)?;
+    }
 
     // Return entry_point — trap handler sets sepc, sp, sstatus (satp already switched above).
     Ok(entry_point)
@@ -278,7 +321,7 @@ pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static 
 /// Remove a newly-created but not-yet-running process from the system
 /// and free its resources.  Used by posix_spawn when setup fails after
 /// Process::new has been called.
-fn cleanup_process(pid: Pid) {
+pub fn cleanup_process(pid: Pid) {
     // Remove from the parent's children list first.
     {
         let table = PROCESS_TABLE.lock();
@@ -309,7 +352,10 @@ fn cleanup_process(pid: Pid) {
             }
         }
         let root_pa = (satp & 0xFFFFFFFFFFF) << 12;
-        let _ = crate::mm::vmm::destroy_user_space(root_pa);
+        if crate::posix::process::satp_unshare(root_pa) {
+            crate::mm::swap::evict_all(root_pa);
+            let _ = crate::mm::vmm::destroy_user_space(root_pa);
+        }
     }
 
     // Remove from the process table.

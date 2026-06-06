@@ -176,7 +176,15 @@ pub fn alloc_frame() -> Option<PhysFrame> {
 }
 
 pub fn alloc_page() -> Option<usize> {
-    alloc_frame().map(|f| f.into_raw())
+    if let Some(f) = alloc_frame() {
+        return Some(f.into_raw());
+    }
+    // Physical memory exhausted — try to evict a page to swap and retry once.
+    if crate::mm::swap::try_evict_page() {
+        alloc_frame().map(|f| f.into_raw())
+    } else {
+        None
+    }
 }
 
 pub fn free_page(page: usize) {
@@ -208,6 +216,9 @@ pub fn incr_ref(page: usize) {
 
 /// Decrement reference count and return the new count.  Returns 0 if untracked.
 pub fn decr_ref(page: usize) -> usize {
+    if !is_managed_page(page) {
+        return 0;
+    }
     let idx = page_index(page);
     if idx < MAX_PAGES {
         let mut counts = PAGE_REF_COUNTS.lock();
@@ -221,4 +232,10 @@ pub fn decr_ref(page: usize) -> usize {
     } else {
         0
     }
+}
+
+/// Check if a physical address is managed by the PMM.
+pub fn is_managed_page(pa: usize) -> bool {
+    let base = RAM_START.load(core::sync::atomic::Ordering::Relaxed);
+    pa >= base && pa < (base + MAX_PAGES * PAGE_SIZE)
 }

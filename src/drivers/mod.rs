@@ -18,10 +18,6 @@ static DRIVER_TABLE: &[DriverEntry] = &[
         compatible: &["virtio,mmio"],
         probe: crate::net::virtio_mmio::probe_driver,
     },
-    DriverEntry {
-        compatible: &["virtio,mmio"],
-        probe: crate::block::virtio_blk::probe_driver,
-    },
 ];
 
 pub static ACTIVE_DRIVERS: Mutex<Vec<Box<dyn Driver>>> = Mutex::new(Vec::new());

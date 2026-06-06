@@ -28,6 +28,8 @@ pub const EACCES: usize = usize::MAX - 12; // -13
 pub const EFAULT: usize = usize::MAX - 13; // -14
 /// Invalid argument.
 pub const EINVAL: usize = usize::MAX - 21; // -22
+/// Resource temporarily unavailable (non-blocking retry).
+pub const EAGAIN: usize = usize::MAX - 10; // -11
 /// Too many open files.
 pub const EMFILE: usize = usize::MAX - 23; // -24
 /// Function not implemented.

@@ -1,4 +1,4 @@
-use crate::mm::pmm::{PAGE_SIZE, alloc_page};
+use crate::mm::pmm::{PAGE_SIZE, alloc_frame};
 use crate::mm::vmm::{PTE_R, PTE_U, PTE_W, PTE_X, PageTable};
 #[repr(C)]
 struct ElfHeader {
@@ -103,7 +103,10 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
             let mut va = start_va & !(PAGE_SIZE - 1);
 
             while va < end_va {
-                let pa = alloc_page().ok_or("Failed to alloc page for ELF")?;
+                // Use alloc_frame (RAII) so the page is automatically freed if
+                // map_page returns an error — alloc_page().ok_or()? would leak it.
+                let frame = alloc_frame().ok_or("Failed to alloc page for ELF")?;
+                let pa = frame.pa();
 
                 let va_offset = if va >= start_va { va - start_va } else { 0 };
                 let page_offset = if start_va > va { start_va - va } else { 0 };
@@ -125,7 +128,10 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
                     }
                 }
 
+                // map_page success: transfer ownership of the frame to the PTE.
+                // On error: `frame` is dropped here, freeing the physical page.
                 page_table.map_page(va, pa, flags)?;
+                frame.into_raw();
                 va += PAGE_SIZE;
             }
         }

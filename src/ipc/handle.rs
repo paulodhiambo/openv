@@ -8,11 +8,6 @@ use crate::sync::Mutex;
 pub type Koid = u64;
 pub type Handle = u32;
 
-pub struct FileDescription {
-    pub vnode: Arc<dyn crate::vfs::Vnode>,
-    pub offset: Mutex<usize>,
-}
-
 /// Byte-stream pipe read half.  EOF when all write halves are dropped.
 #[derive(Clone)]
 pub struct PipeReadHalf {
@@ -53,10 +48,12 @@ pub fn create_pipe() -> (PipeReadHalf, PipeWriteHalf) {
 pub enum KernelObject {
     Vmo(Arc<Mutex<Vmo>>),
     Channel(Arc<ChannelEndpoint>),
-    Console,
-    File(Arc<FileDescription>),
+    /// Per-session TTY line discipline.  Multiple fds (stdin/stdout/stderr) in
+    /// the same session share one Arc so they all see the same buffer/echo state.
+    Tty(alloc::sync::Arc<crate::tty::TtyState>),
     PipeRead(PipeReadHalf),
     PipeWrite(PipeWriteHalf),
+    VfsFile(u32),
 }
 
 static NEXT_KOID: AtomicU64 = AtomicU64::new(1);

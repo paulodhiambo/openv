@@ -2,6 +2,7 @@ use crate::ipc::handle::{Handle, Koid, generate_koid};
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI32, Ordering};
 use core::task::{Poll, Waker};
 use crate::sync::Mutex;
 
@@ -24,6 +25,8 @@ pub struct ChannelEndpoint {
     koid: Koid,
     state: Mutex<EndpointState>,
     peer: Mutex<Weak<ChannelEndpoint>>,
+    /// PID of a process blocked in a synchronous sys_read on this endpoint (0 = none).
+    pub waiter: AtomicI32,
 }
 
 impl ChannelEndpoint {
@@ -37,6 +40,7 @@ impl ChannelEndpoint {
                 peer_closed: false,
             }),
             peer: Mutex::new(Weak::new()),
+            waiter: AtomicI32::new(0),
         });
 
         let ep2 = Arc::new(Self {
@@ -47,6 +51,7 @@ impl ChannelEndpoint {
                 peer_closed: false,
             }),
             peer: Mutex::new(Arc::downgrade(&ep1)),
+            waiter: AtomicI32::new(0),
         });
 
         *ep1.peer.lock() = Arc::downgrade(&ep2);
@@ -57,13 +62,16 @@ impl ChannelEndpoint {
     pub fn write(&self, msg: Message) -> Result<(), &'static str> {
         let peer_arc = self.peer.lock().upgrade().ok_or("Peer closed")?;
         let mut peer_state = peer_arc.state.lock();
-
         peer_state.queue.push_back(msg);
-
         if let Some(waker) = peer_state.waker.take() {
             waker.wake();
         }
-
+        drop(peer_state);
+        // Wake any synchronous (non-async) reader blocked in sys_read.
+        let waiter = peer_arc.waiter.swap(0, Ordering::Relaxed);
+        if waiter > 0 {
+            crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+        }
         Ok(())
     }
 
@@ -94,6 +102,12 @@ impl Drop for ChannelEndpoint {
             peer_state.peer_closed = true;
             if let Some(waker) = peer_state.waker.take() {
                 waker.wake();
+            }
+            drop(peer_state);
+            // Also wake any synchronous reader so it can observe EOF.
+            let waiter = peer_arc.waiter.swap(0, Ordering::Relaxed);
+            if waiter > 0 {
+                crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
             }
         }
     }
