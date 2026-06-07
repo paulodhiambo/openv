@@ -8,5 +8,5 @@ name = "vfs-server"
 path = "src/main.rs"
 
 [dependencies]
-libos = { path = "../libos" }
+libos = { path = "../libos", features = ["large-heap"] }
 vfs-proto = { path = "../vfs-proto" }

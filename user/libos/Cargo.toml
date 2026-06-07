@@ -3,6 +3,12 @@ name = "libos"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Use an 8 MiB heap instead of the default 2 MiB.  Enable for vfs-server which
+# needs to cache the entire initrd TAR in memory.
+large-heap = []
+
 [dependencies]
 buddy_system_allocator = "0.11.0"
 vfs-proto = { path = "../vfs-proto" }
+pm-proto = { path = "../pm-proto" }

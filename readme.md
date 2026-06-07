@@ -7,7 +7,9 @@
 [![Architecture](https://img.shields.io/badge/arch-RISC--V%2064-blue)](#architecture)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-openv is a **RISC-V 64-bit microkernel** written in Rust. It boots under QEMU via OpenSBI, provides an interactive Unix-like environment, and implements a comprehensive POSIX-compatible kernel from scratch:
+openv is a **RISC-V 64-bit microkernel** written in Rust. It boots under QEMU via OpenSBI, provides an interactive Unix-like environment, and implements a comprehensive POSIX-compatible kernel from scratch.
+
+For detailed technical documentation, see the [Documentation Index](docs/index.md).
 
 - **Preemptive multitasking** — round-robin scheduler, 10 ms SBI timer slices
 - **Virtual memory** — Sv39 paging, COW fork, demand paging (zero-fill on access)
@@ -428,6 +430,7 @@ GitHub Actions runs on every push and pull request to `main`/`master`:
 lint (kernel) ──┐
                 ├─ [both pass] ──► build ──► artifacts
 lint (user)  ──┘
+                                    └─► docs ──► GitHub Pages
 ```
 
 **`lint` job** (parallel matrix — kernel + userspace):
@@ -439,6 +442,10 @@ lint (user)  ──┘
 - Packages `test_root.tar` initrd
 - Reports binary sizes in the GitHub Step Summary via `llvm-size`
 - Uploads artifacts: `openv-kernel-debug`, `openv-kernel-release`, `initrd`
+
+**`docs` job** (depends on build, runs on push and PR):
+- Builds rustdocs with `--document-private-items` and the ayu theme
+- Deploys to GitHub Pages (on push only)
 
 **Release bundle** (push to `main`/`master` only):
 - `openv-<branch>-<sha>/` — kernel + initrd + `BUILD_INFO.txt`, retained 90 days

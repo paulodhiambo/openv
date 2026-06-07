@@ -1,27 +1,83 @@
-//! Network core utilities: ethernet, ARP, IPv4 helpers and checksums.
+//! # Network Core Utilities
+//!
+//! This module provides low-level network protocol utilities, including
+//! Ethernet, ARP, and IPv4 header parsing and serialization, as well as
+//! checksum computation.
+//!
+//! ## Overview
+//!
+//! The module provides:
+//!
+//! - **Ethernet**: [`EthHeader`] for parsing and writing Ethernet headers.
+//!  - **ARP**: [`ArpPacket`] for parsing and writing ARP packets.
+//!  - **IPv4**: [`Ipv4Header`] for parsing IPv4 headers.
+//!  - **Checksums**: [`checksum16`] and [`ipv4_checksum`] for computing
+//!    Internet checksums (RFC 1071).
+//!
+//! ## Protocol Constants
+//!
+//! The module defines common protocol constants:
+//!
+//! - **Ethernet types**: [`ETHERTYPE_IPV4`], [`ETHERTYPE_ARP`], [`ETHERTYPE_IPV6`]
+//!  - **IP protocols**: [`IP_PROTO_ICMP`], [`IP_PROTO_TCP`], [`IP_PROTO_UDP`]
+//!
+//! ## Usage
+//!
+//! These utilities are used by the network stack to parse incoming
+//! packets and construct outgoing packets.
 
+/// A 6-byte MAC address.
 pub type MacAddr = [u8; 6];
 
+/// The broadcast MAC address (`ff:ff:ff:ff:ff:ff`).
 pub const BROADCAST_MAC: MacAddr = [0xff; 6];
 
+/// Ethertype: IPv4.
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
+/// Ethertype: ARP.
 pub const ETHERTYPE_ARP: u16 = 0x0806;
+/// Ethertype: IPv6.
 pub const ETHERTYPE_IPV6: u16 = 0x86DD;
 
+/// IP protocol: ICMP.
 pub const IP_PROTO_ICMP: u8 = 1;
+/// IP protocol: TCP.
 pub const IP_PROTO_TCP: u8 = 6;
+/// IP protocol: UDP.
 pub const IP_PROTO_UDP: u8 = 17;
 
+/// An Ethernet header.
+///
+/// # Fields
+///
+/// * `dst` - Destination MAC address.
+/// * `src` - Source MAC address.
+/// * `ethertype` - EtherType (e.g., [`ETHERTYPE_IPV4`]).
 #[derive(Debug, Clone, Copy)]
 pub struct EthHeader {
+    /// Destination MAC address.
     pub dst: MacAddr,
+    /// Source MAC address.
     pub src: MacAddr,
+    /// EtherType (e.g., [`ETHERTYPE_IPV4`]).
     pub ethertype: u16,
 }
 
 impl EthHeader {
+    /// Length of an Ethernet header in bytes (14).
     pub const LEN: usize = 14;
 
+    /// Parses an Ethernet header from a byte buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The byte buffer to parse.
+    ///
+    /// # Returns
+    ///
+    /// `Some((header, payload))` on success, where `payload` is the
+    /// remaining bytes after the header. Returns `None` if the buffer
+    /// is too short.
     pub fn parse(buf: &[u8]) -> Option<(Self, &[u8])> {
         if buf.len() < Self::LEN {
             return None;
@@ -41,6 +97,16 @@ impl EthHeader {
         ))
     }
 
+    /// Writes the header into a byte buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `dst_buf` - The destination buffer.
+    ///
+    /// # Returns
+    ///
+    /// `Some(bytes_written)` on success, or `None` if the buffer is
+    /// too small.
     pub fn write_into(&self, dst_buf: &mut [u8]) -> Option<usize> {
         if dst_buf.len() < Self::LEN {
             return None;
@@ -52,22 +118,54 @@ impl EthHeader {
     }
 }
 
+/// An ARP packet (fixed-size for IPv4 over Ethernet).
+///
+/// # Fields
+///
+/// * `htype` - Hardware type (1 for Ethernet).
+/// * `ptype` - Protocol type (0x0800 for IPv4).
+/// * `hlen` - Hardware address length (6 for Ethernet).
+/// * `plen` - Protocol address length (4 for IPv4).
+/// * `oper` - Operation (1 for request, 2 for reply).
+/// * `sha` - Sender hardware address.
+/// * `spa` - Sender protocol address.
+/// * `tha` - Target hardware address.
+/// * `tpa` - Target protocol address.
 #[derive(Debug, Clone, Copy)]
 pub struct ArpPacket {
+    /// Hardware type (1 for Ethernet).
     pub htype: u16,
+    /// Protocol type (0x0800 for IPv4).
     pub ptype: u16,
+    /// Hardware address length (6 for Ethernet).
     pub hlen: u8,
+    /// Protocol address length (4 for IPv4).
     pub plen: u8,
+    /// Operation (1 for request, 2 for reply).
     pub oper: u16,
+    /// Sender hardware address.
     pub sha: MacAddr,
+    /// Sender protocol address.
     pub spa: [u8; 4],
+    /// Target hardware address.
     pub tha: MacAddr,
+    /// Target protocol address.
     pub tpa: [u8; 4],
 }
 
 impl ArpPacket {
-    pub const LEN: usize = 28; // fixed for IPv4+Ethernet
+    /// Length of an ARP packet in bytes (28, fixed for IPv4+Ethernet).
+    pub const LEN: usize = 28;
 
+    /// Parses an ARP packet from a byte buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The byte buffer to parse.
+    ///
+    /// # Returns
+    ///
+    /// `Some(packet)` on success, or `None` if the buffer is too short.
     pub fn parse(buf: &[u8]) -> Option<Self> {
         if buf.len() < Self::LEN {
             return None;
@@ -98,6 +196,16 @@ impl ArpPacket {
         })
     }
 
+    /// Writes the packet into a byte buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `out` - The destination buffer.
+    ///
+    /// # Returns
+    ///
+    /// `Some(bytes_written)` on success, or `None` if the buffer is
+    /// too small.
     pub fn write_into(&self, out: &mut [u8]) -> Option<usize> {
         if out.len() < Self::LEN {
             return None;
@@ -115,23 +223,59 @@ impl ArpPacket {
     }
 }
 
+/// An IPv4 header.
+///
+/// # Fields
+///
+/// * `ihl` - Internet Header Length (in 32-bit words).
+/// * `tos` - Type of Service.
+/// * `total_len` - Total length of the IP packet.
+/// * `id` - Identification.
+/// * `flags_fragment` - Flags and fragment offset.
+/// * `ttl` - Time to live.
+/// * `protocol` - Protocol (e.g., [`IP_PROTO_TCP`]).
+/// * `checksum` - Header checksum.
+/// * `src` - Source IP address.
+/// * `dst` - Destination IP address.
 #[derive(Debug, Clone, Copy)]
 pub struct Ipv4Header {
+    /// Internet Header Length (in 32-bit words).
     pub ihl: u8,
+    /// Type of Service.
     pub tos: u8,
+    /// Total length of the IP packet.
     pub total_len: u16,
+    /// Identification.
     pub id: u16,
+    /// Flags and fragment offset.
     pub flags_fragment: u16,
+    /// Time to live.
     pub ttl: u8,
+    /// Protocol (e.g., [`IP_PROTO_TCP`]).
     pub protocol: u8,
+    /// Header checksum.
     pub checksum: u16,
+    /// Source IP address.
     pub src: [u8; 4],
+    /// Destination IP address.
     pub dst: [u8; 4],
 }
 
 impl Ipv4Header {
+    /// Minimum length of an IPv4 header in bytes (20, without options).
     pub const MIN_LEN: usize = 20;
 
+    /// Parses an IPv4 header from a byte buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The byte buffer to parse.
+    ///
+    /// # Returns
+    ///
+    /// `Some((header, payload))` on success, where `payload` is the
+    /// remaining bytes after the header. Returns `None` if the buffer
+    /// is too short or the header is malformed.
     pub fn parse(buf: &[u8]) -> Option<(Self, &[u8])> {
         if buf.len() < Self::MIN_LEN {
             return None;
@@ -176,7 +320,15 @@ impl Ipv4Header {
     }
 }
 
-/// Compute 16-bit ones-complement checksum over data (RFC 1071 style)
+/// Computes the 16-bit ones-complement Internet checksum over data (RFC 1071).
+///
+/// # Arguments
+///
+/// * `data` - The data to checksum.
+///
+/// # Returns
+///
+/// The 16-bit checksum.
 pub fn checksum16(data: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut i = 0usize;
@@ -195,12 +347,33 @@ pub fn checksum16(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// IPv4 header checksum helper
+/// Computes the IPv4 header checksum.
+///
+/// This is a convenience function that calls [`checksum16`].
+///
+/// # Arguments
+///
+/// * `header_bytes` - The IPv4 header bytes.
+///
+/// # Returns
+///
+/// The 16-bit checksum.
 pub fn ipv4_checksum(header_bytes: &[u8]) -> u16 {
     checksum16(header_bytes)
 }
 
-/// Helper to build Ethernet frame header into provided buffer
+/// Helper to build an Ethernet frame header into a provided buffer.
+///
+/// # Arguments
+///
+/// * `dst` - Destination MAC address.
+/// * `src` - Source MAC address.
+/// * `ethertype` - EtherType.
+/// * `out` - The destination buffer.
+///
+/// # Returns
+///
+/// `Some(bytes_written)` on success, or `None` if the buffer is too small.
 pub fn build_eth_header(
     dst: MacAddr,
     src: MacAddr,

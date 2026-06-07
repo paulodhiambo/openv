@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use libos::{
     chdir, close, create, dup, dup2, exec_args, exit, fork, getdents, mkdir, open, pipe, read,
-    set_raw, set_fg_pid, sys_yield, unlink, waitpid, write,
+    set_raw, set_fg_pid, setpgid, sys_yield, unlink, waitpid, write,
 };
 
 const RESET: &[u8] = b"\x1b[0m";
@@ -15,7 +15,7 @@ const REV: &[u8] = b"\x1b[7m";
 const GREEN: &[u8] = b"\x1b[32m";
 const CYAN: &[u8] = b"\x1b[36m";
 const YELLOW: &[u8] = b"\x1b[33m";
-const CLR: &[u8] = b"\x1b[2J\x1b[H";
+const CLR: &[u8] = b"\x1b[0m\x1b[3J\x1b[2J\x1b[H";
 
 fn wrt(s: &[u8]) {
     write(1, s.as_ptr(), s.len());
@@ -433,7 +433,7 @@ impl Shell {
             return self.complete_path(prefix);
         }
         const BUILTINS: &[&[u8]] = &[
-            b"echo", b"ls", b"cat", b"pwd", b"cd", b"mkdir", b"rm",
+            b"echo", b"ls", b"cat", b"pwd", b"cd", b"mkdir", b"rm", b"touch",
             b"help", b"clear", b"history", b"nano", b"whoami",
             b"hostname", b"uname", b"exit",
         ];
@@ -535,6 +535,7 @@ impl Shell {
                 | b"cd"
                 | b"mkdir"
                 | b"rm"
+                | b"touch"
                 | b"help"
                 | b"?"
                 | b"clear"
@@ -750,13 +751,19 @@ impl Shell {
             set_raw(0);
             let pid = fork();
             if pid == 0 {
+                // Child: become its own process group leader before exec so
+                // Ctrl+C (set_fg_pid → FOREGROUND_PID == pgid) reaches it.
+                setpgid(0, 0);
                 self.apply_out_redir(&stage.stdout_file);
                 self.apply_in_redir(&stage.stdin_file);
                 self.exec_child(&stage.args);
             } else if pid > 0 {
+                // Parent: mirror setpgid to close the race window, then hand
+                // over the terminal to the child's new process group.
+                setpgid(pid, pid);
                 let mut status = 0i32;
                 set_fg_pid(pid);
-                waitpid(pid, &mut status as *mut i32);
+                waitpid(pid, &mut status as *mut i32, 0);
                 set_fg_pid(-1);
             } else {
                 wrt(b"sh: fork failed\n");
@@ -783,6 +790,7 @@ impl Shell {
 
             let pid = fork();
             if pid == 0 {
+                setpgid(0, 0);
                 // Wire up pipes
                 if prev_read >= 0 {
                     dup2(prev_read, 0);
@@ -816,6 +824,7 @@ impl Shell {
             }
             prev_read = cur_read;
             if pid > 0 {
+                setpgid(pid, pid);
                 pids.push(pid);
             }
         }
@@ -823,7 +832,7 @@ impl Shell {
         for pid in &pids {
             set_fg_pid(*pid);
             let mut status = 0i32;
-            waitpid(*pid, &mut status as *mut i32);
+            waitpid(*pid, &mut status as *mut i32, 0);
         }
         set_fg_pid(-1);
         set_raw(1);
@@ -851,6 +860,7 @@ impl Shell {
             b"cd" => self.cmd_cd(&args[1..]),
             b"mkdir" => self.cmd_mkdir(&args[1..]),
             b"rm" => self.cmd_rm(&args[1..]),
+            b"touch" => self.cmd_touch(&args[1..]),
             b"help" | b"?" => self.cmd_help(),
             b"clear" => wrt(CLR),
             b"history" | b".history" => self.cmd_history(),
@@ -911,6 +921,11 @@ impl Shell {
             b"rm" => {
                 wrt(b"Usage: rm <file...>\n");
                 wrt(b"  Remove one or more files.\n");
+            }
+            b"touch" => {
+                wrt(b"Usage: touch <file...>\n");
+                wrt(b"  Create empty files (or update timestamps).\n");
+                wrt(b"  Useful for creating files on /mnt (persistent OFS).\n");
             }
             b"nano" => {
                 wrt(b"Usage: nano <file>\n");
@@ -1075,6 +1090,24 @@ impl Shell {
         }
     }
 
+    fn cmd_touch(&self, args: &[Vec<u8>]) {
+        if args.is_empty() {
+            wrt(b"touch: missing file operand\n");
+            return;
+        }
+        for arg in args {
+            let path = self.resolve(arg);
+            let fd = create(&path);
+            if fd < 0 {
+                wrt(b"touch: cannot create '");
+                wrt(&path);
+                wrt(b"'\n");
+            } else {
+                close(fd);
+            }
+        }
+    }
+
     fn cmd_export(&mut self, args: &[Vec<u8>]) {
         if args.is_empty() {
             self.cmd_env();
@@ -1142,6 +1175,7 @@ impl Shell {
             ("cd [path]",          "Change directory (default /)"),
             ("mkdir <dir>",        "Create directory"),
             ("rm <file>",          "Remove file or directory"),
+            ("touch <file>",       "Create empty file"),
             ("nano <file>",        "Text editor (^O save, ^X exit)"),
             ("export [NAME=VAL]",  "Set/show environment variables"),
             ("unset <NAME>",       "Remove an environment variable"),

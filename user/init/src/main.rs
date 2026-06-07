@@ -24,30 +24,20 @@ pub extern "C" fn main() -> ! {
     // ── Service startup lines ─────────────────────────────────────────────────
     ok_line(b"Starting UART console");
 
-    // Start VFS server first — other services may need filesystem access.
-    let vfs_pid = spawn(b"/vfs-server".as_ptr(), 11);
-    if vfs_pid > 0 {
-        ok_line(b"Starting VFS server");
-        // Give the VFS server a chance to register before proceeding.
+    // Wait for VFS server to register
+    wrt(b"[init] Waiting for VFS server to start...\n");
+    loop {
+        libos::vfs_connect();
+        if libos::vfs_pid().is_some() {
+            break;
+        }
         sys_yield();
     }
 
     ok_line(b"Mounting virtual filesystem");
 
-    // Start the network daemon (runs in background; init reaps it if it exits)
-    let net_pid = spawn(b"/net-smoltcp".as_ptr(), 12);
-    if net_pid > 0 {
-        ok_line(b"Starting network daemon (10.0.2.15/24)");
-    }
 
-    // Run fork test
-    let ft_pid = spawn(b"/forktest".as_ptr(), 9);
-    if ft_pid > 0 {
-        let mut status: i32 = 0;
-        waitpid(ft_pid, &mut status as *mut i32);
-    }
-
-    wrt(b"\n");
+    // (Removed forktest)
 
     // ── Login line ────────────────────────────────────────────────────────────
     wrt(b"openv 0.1.0-dev ttyS0\n\n");
@@ -56,6 +46,10 @@ pub extern "C" fn main() -> ! {
     wrt(b"  Type \x1b[1mhelp\x1b[0m for a list of commands.\n\n");
 
     // ── Spawn shell (respawn loop) ────────────────────────────────────────────
+    for _ in 0..50 {
+        sys_yield();
+    }
+
     loop {
         let sh_pid = spawn(b"/sh".as_ptr(), 3);
         if sh_pid < 0 {
@@ -68,7 +62,7 @@ pub extern "C" fn main() -> ! {
         // Reap /sh and any other children that exit while we wait.
         loop {
             let mut status: i32 = 0;
-            let reaped = waitpid(-1, &mut status as *mut i32);
+            let reaped = waitpid(-1, &mut status as *mut i32, 0);
             if reaped == sh_pid {
                 // Shell exited — break inner loop to respawn.
                 break;

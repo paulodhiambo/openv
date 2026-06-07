@@ -1,11 +1,41 @@
-//! VirtIO MMIO network driver (legacy, device-id=1).
+//! # VirtIO MMIO Network Driver
 //!
-//! Queue layout (QUEUE_ALIGN=4 so everything fits in one 4 KB page per queue):
-//!   queue 0 = RX (device writes received frames here)
-//!   queue 1 = TX (driver writes outgoing frames here)
+//! This module provides a VirtIO MMIO network device driver for OpenV.
+//! VirtIO is a standardized interface for virtual I/O devices, commonly
+//! used in virtual machines and emulated environments.
 //!
-//! Each RX descriptor is a single 4 KB page (10-byte virtio-net header + ≤1514 B packet).
-//! Each TX submission is a single 4 KB page (10-byte virtio-net header + packet data).
+//! ## Overview
+//!
+//! This driver supports the legacy VirtIO MMIO specification with
+//! `device-id=1` (network device). It uses two virtqueues:
+//!
+//! - **Queue 0 (RX)**: The device writes received frames into buffers
+//!    provided by the driver.
+//!  - **Queue 1 (TX)**: The driver writes outgoing frames for the
+//!    device to transmit.
+//!
+//! Each RX descriptor is a single 4 KB page (10-byte virtio-net header
+//! + ≤1514 B packet). Each TX submission is a single 4 KB page
+//! (10-byte virtio-net header + packet data).
+//!
+//! ## Queue Layout
+//!
+//! The queue size is 64, with `QUEUE_ALIGN=4` so everything fits in one
+//! 4 KB page per queue.
+//!
+//! ## Initialization
+//!
+//! The driver can be initialized in two ways:
+//!
+//! 1. **Direct FDT scan**: [`probe_and_init`] walks the DTB looking for
+//!    VirtIO MMIO network devices.
+//! 2. **Driver framework**: [`probe_driver`] is called by the driver
+//!    framework when it finds a `virtio,mmio` node in the FDT.
+//!
+//! ## Public API
+//!
+//! - [`try_dequeue_rx`]: Dequeue one raw received frame. Called by
+//!    `sys_net_recv`.
 
 use crate::net::NetDevice;
 use crate::net::virtqueue::VirtQueue;
@@ -14,6 +44,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use crate::sync::Mutex;
 
+/// Global storage for the active VirtIO driver instance.
 static DRIVER_GLOBAL: Mutex<Option<&'static VirtioDriver>> = Mutex::new(None);
 
 // ── MMIO register offsets (legacy spec) ──────────────────────────────────────
@@ -35,10 +66,15 @@ const OFF_QUEUE_NOTIFY: usize   = 0x050;
 const OFF_ISR: usize            = 0x060;
 const OFF_STATUS: usize         = 0x070;
 
-const VIRTIO_MAGIC: u32               = 0x7472_6976; // "virt"
+/// VirtIO device magic value ("virt" in little-endian).
+const VIRTIO_MAGIC: u32               = 0x7472_6976;
+/// VirtIO device ID for network devices.
 const VIRTIO_DEVICE_NET: u32          = 1;
+/// VirtIO status: ACKNOWLEDGE.
 const VIRTIO_STATUS_ACKNOWLEDGE: u32  = 1;
+/// VirtIO status: DRIVER.
 const VIRTIO_STATUS_DRIVER: u32       = 2;
+/// VirtIO status: DRIVER_OK.
 const VIRTIO_STATUS_DRIVER_OK: u32    = 4;
 
 // virtio-net header (legacy, no VIRTIO_NET_F_MRG_RXBUF)
@@ -51,35 +87,79 @@ const QUEUE_SIZE: usize = 64;
 
 // ── Driver struct ──────────────────────────────────────────────────────────────
 
+/// The VirtIO network driver.
+///
+/// # Fields
+///
+/// * `base` - The MMIO base address.
+/// * `rx_vq` - The RX virtqueue, protected by a [`Mutex`].
+/// * `tx_vq` - The TX virtqueue, protected by a [`Mutex`].
+/// * `irq` - The interrupt request number.
+///
+/// # Safety
+///
+/// `VirtioDriver` is `Send` and `Sync` because all access to the MMIO
+/// registers and virtqueues is serialized via the contained mutexes.
 struct VirtioDriver {
+    /// The MMIO base address.
     base:   usize,
+    /// The RX virtqueue, protected by a [`Mutex`].
     rx_vq:  Mutex<VirtQueue>,
+    /// The TX virtqueue, protected by a [`Mutex`].
     tx_vq:  Mutex<VirtQueue>,
+    /// The interrupt request number.
     irq:    u32,
 }
 
+// SAFETY: See field-level documentation.
 unsafe impl Send for VirtioDriver {}
 unsafe impl Sync for VirtioDriver {}
 
 // ── MMIO helpers ──────────────────────────────────────────────────────────────
 
+/// Reads a 32-bit value from an MMIO register.
+///
+/// # Arguments
+///
+/// * `base` - The MMIO base address.
+/// * `offset` - The register offset.
+///
+/// # Returns
+///
+/// The 32-bit value read from the register.
+///
+/// # Safety
+///
+/// `base` must be a valid MMIO physical address that is identity-mapped
+/// by the kernel. The function uses `read_volatile` to prevent the
+/// compiler from eliding or reordering the hardware register read.
 fn mmio_read32(base: usize, offset: usize) -> u32 {
-    // SAFETY: `base` is a MMIO physical address obtained from the DTB and
-    // identity-mapped by the kernel. read_volatile prevents the compiler
-    // from eliding or reordering the hardware register read.
+    // SAFETY: see function documentation.
     unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
 }
 
+/// Writes a 32-bit value to an MMIO register.
+///
+/// # Arguments
+///
+/// * `base` - The MMIO base address.
+/// * `offset` - The register offset.
+/// * `v` - The value to write.
+///
+/// # Safety
+///
+/// `base` must be a valid MMIO physical address that is identity-mapped
+/// by the kernel. The function uses `write_volatile` to prevent the
+/// compiler from eliding or reordering the hardware register write.
 fn mmio_write32(base: usize, offset: usize, v: u32) {
-    // SAFETY: `base` is a MMIO physical address obtained from the DTB and
-    // identity-mapped by the kernel. write_volatile prevents the compiler
-    // from eliding or reordering the hardware register write.
+    // SAFETY: see function documentation.
     unsafe { core::ptr::write_volatile((base + offset) as *mut u32, v) }
 }
 
 // ── Initialization ────────────────────────────────────────────────────────────
 
 impl VirtioDriver {
+    /// Creates a new [`VirtioDriver`] instance.
     fn new(base: usize, rx_pa: usize, tx_pa: usize, qsize: usize, irq: u32) -> Self {
         VirtioDriver {
             base,
@@ -89,6 +169,13 @@ impl VirtioDriver {
         }
     }
 
+    /// Sets up a single virtqueue in the device.
+    ///
+    /// # Arguments
+    ///
+    /// * `sel` - The queue selector (0 for RX, 1 for TX).
+    /// * `pa` - The physical address of the queue's memory.
+    /// * `size` - The requested queue size.
     fn setup_queue_mmio(&self, sel: u32, pa: usize, size: usize) {
         mmio_write32(self.base, OFF_QUEUE_SEL, sel);
         // Ensure device supports the requested size
@@ -100,6 +187,17 @@ impl VirtioDriver {
         mmio_write32(self.base, OFF_QUEUE_PFN, (pa >> 12) as u32);
     }
 
+    /// Initializes the device.
+    ///
+    /// This function:
+    /// 1. Resets the device.
+/// 2. Sets the ACKNOWLEDGE and DRIVER status bits.
+/// 3. Negotiates zero optional features.
+/// 4. Sets the guest page size.
+/// 5. Sets up the RX and TX queues.
+/// 6. Signals DRIVER_OK to make the device live.
+/// 7. Pre-fills the RX queue with buffers.
+/// 8. Notifies the device that new RX buffers are available.
     fn init_device(&self, rx_pa: usize, tx_pa: usize, qsize: usize) {
         // Reset
         mmio_write32(self.base, OFF_STATUS, 0);
@@ -131,6 +229,11 @@ impl VirtioDriver {
 // ── NetDevice impl ────────────────────────────────────────────────────────────
 
 impl NetDevice for VirtioDriver {
+    /// Sends a packet over the network.
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - The packet data to send.
     fn send(&self, packet: &[u8]) {
         // Free any TX buffers completed by the device since last call
         let done_pages: Vec<usize> = {
@@ -179,6 +282,15 @@ impl NetDevice for VirtioDriver {
         }
     }
 
+    /// Receives a packet from the network.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer to store the received packet.
+    ///
+    /// # Returns
+    ///
+    /// The number of bytes received, or 0 if no packet is available.
     fn recv(&self, buf: &mut [u8]) -> usize {
         // Poll RX used ring for a completed receive
         let (rx_pa, rx_len) = {
@@ -222,11 +334,21 @@ impl NetDevice for VirtioDriver {
 // ── Driver framework integration ──────────────────────────────────────────────
 
 impl crate::drivers::Driver for VirtioDriver {
+    /// Handles a device interrupt.
+    ///
+    /// # Arguments
+    ///
+    /// * `irq` - The interrupt request number.
     fn on_interrupt(&self, irq: usize) {
         handle_interrupt(irq as u32);
     }
 }
 
+/// Handles a device interrupt.
+///
+/// # Arguments
+///
+/// * `irq` - The interrupt request number.
 pub fn handle_interrupt(irq: u32) {
     let guard = DRIVER_GLOBAL.lock();
     if let Some(drv) = *guard {
@@ -241,7 +363,15 @@ pub fn handle_interrupt(irq: u32) {
 
 // ── Public probe entry-points ─────────────────────────────────────────────────
 
-/// Called from `net::init()` via direct FDT scan (used before driver framework is wired).
+/// Probes the DTB for a VirtIO MMIO network device and initializes it.
+///
+/// # Returns
+///
+/// `true` if a device was found and initialized, `false` otherwise.
+///
+/// # Safety
+///
+/// This function reads from the DTB, which must be a valid DTB address.
 pub fn probe_and_init() -> bool {
     let dtb_ptr = boot_dtb_ptr();
     if dtb_ptr == 0 {
@@ -264,12 +394,11 @@ pub fn probe_and_init() -> bool {
 
         // Parse base address
         let mut base = node.property("reg").and_then(|p| p.as_usize()).unwrap_or(0);
-        if base == 0 {
-            if let Some(idx) = node.name.rfind('@') {
-                if let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16) {
-                    base = x;
-                }
-            }
+        if base == 0
+            && let Some(idx) = node.name.rfind('@')
+            && let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16)
+        {
+            base = x;
         }
         if base == 0 {
             continue;
@@ -297,7 +426,20 @@ pub fn probe_and_init() -> bool {
     false
 }
 
-/// Called by the driver framework when it finds a virtio,mmio node in the FDT.
+/// Probes a specific MMIO base address for a VirtIO network device.
+///
+/// This is called by the driver framework when it finds a `virtio,mmio`
+/// node in the FDT.
+///
+/// # Arguments
+///
+/// * `base` - The MMIO base address.
+/// * `irq` - The interrupt request number.
+///
+/// # Returns
+///
+/// `Some(Box<dyn Driver>)` if a device was found and initialized,
+/// `None` otherwise.
 pub fn probe_driver(base: usize, irq: usize) -> Option<Box<dyn crate::drivers::Driver>> {
     if base == 0 { return None; }
     if mmio_read32(base, OFF_MAGIC) != VIRTIO_MAGIC { return None; }
@@ -312,6 +454,17 @@ pub fn probe_driver(base: usize, irq: usize) -> Option<Box<dyn crate::drivers::D
 
 // ── Internal helper ───────────────────────────────────────────────────────────
 
+/// Initializes a VirtIO network device at the given MMIO base address.
+///
+/// # Arguments
+///
+/// * `base` - The MMIO base address.
+/// * `irq` - The interrupt request number.
+///
+/// # Returns
+///
+/// `Some(&'static VirtioDriver)` on success, `None` if memory
+/// allocation fails.
 fn init_net_device(base: usize, irq: u32) -> Option<&'static VirtioDriver> {
     let qsize = {
         // Read supported queue size; use the smaller of QUEUE_SIZE and device max
@@ -336,18 +489,33 @@ fn init_net_device(base: usize, irq: u32) -> Option<&'static VirtioDriver> {
     Some(Box::leak(Box::new(drv)))
 }
 
+/// A wrapper that implements [`crate::drivers::Driver`] for a static
+/// reference to a [`VirtioDriver`].
 struct VirtioDriverRef(&'static VirtioDriver);
+// SAFETY: Delegates to the inner VirtioDriver's safety guarantees.
 unsafe impl Send for VirtioDriverRef {}
 unsafe impl Sync for VirtioDriverRef {}
 impl crate::drivers::Driver for VirtioDriverRef {
     fn on_interrupt(&self, irq: usize) { self.0.on_interrupt(irq); }
 }
 
+/// Returns the DTB pointer from the global storage.
 fn boot_dtb_ptr() -> usize {
     crate::boot_dtb_ptr()
 }
 
-/// Kernel API: dequeue one raw received frame (called by sys_net_recv).
+/// Dequeues one raw received frame.
+///
+/// This is called by `sys_net_recv` to provide network data to user-space.
+///
+/// # Arguments
+///
+/// * `buf` - The buffer to store the received frame.
+///
+/// # Returns
+///
+/// `Some(n)` with the number of bytes received, or `None` if no frame
+/// is available.
 pub fn try_dequeue_rx(buf: &mut [u8]) -> Option<usize> {
     let guard = DRIVER_GLOBAL.lock();
     let drv = (*guard)?;

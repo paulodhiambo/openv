@@ -1,14 +1,60 @@
+//! # Process Spawning, Fork, Exec, and Exit
+//!
+//! This module provides the core process lifecycle functions: spawning
+//! new processes, forking, exec, and exiting.
+//!
+//! ## Overview
+//!
+//! - [`posix_spawn`]: Creates a new process from a path in the initrd.
+//!  - [`exit`]: Terminates a process, transitions it to a zombie, and
+//!    wakes the parent.
+//!  - [`sys_fork`]: Creates a child process with a copy-on-write (COW)
+//!    clone of the parent's address space.
+//!  - [`sys_exec`]: Replaces the current process image with a new ELF
+//!    binary.
+//!  - [`cleanup_process`]: Removes a partially-initialized process and
+//!    frees its resources.
+//!
+//! ## User Stack
+//!
+//! Each user process has a user stack of [`USER_STACK_PAGES`] pages
+//! (32 KB) starting at [`USER_STACK_TOP`] - 32 KB and ending at
+//! [`USER_STACK_TOP`] (8 GB). The page immediately below the stack is
+//! intentionally left unmapped to serve as a guard page against stack
+//! overflows.
+
 use crate::mm::pmm::{alloc_frame, PAGE_SIZE};
 use crate::mm::vmm::{PTE_R, PTE_U, PTE_W};
 use crate::posix::elf::load_elf;
 use crate::posix::process::{PROCESS_TABLE, Pid, Process};
-use crate::vfs::lookup_path;
-use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
+/// Top of the user stack virtual address space (8 GB).
 pub const USER_STACK_TOP: usize = 0x200000000; // 8GB
+/// Number of pages allocated for the user stack (32 KB total).
 pub const USER_STACK_PAGES: usize = 8; // 32 KB — enough for smoltcp + daemon stacks in debug builds
 
+/// Spawns a new process from a path in the initrd.
+///
+/// This function:
+/// 1. Creates a new [`Process`] with the given parent PID.
+/// 2. Looks up the binary in the initrd.
+/// 3. Loads the ELF binary into the process's page table.
+/// 4. Allocates and maps the user stack.
+/// 5. Configures the trap frame for user-mode entry.
+/// 6. Adds the new process to the run queue.
+///
+/// # Arguments
+///
+/// * `path` - The path of the binary in the initrd.
+/// * `ppid` - The parent process ID, or 0 for init.
+///
+/// # Returns
+///
+/// `Ok(pid)` with the new process's PID on success, or an error if:
+/// - The file is not found in the initrd.
+/// - Memory allocation fails.
+/// - ELF loading fails.
 pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     let proc = Process::new(ppid)?;
     let pid = proc.pid;
@@ -19,40 +65,14 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
         e
     };
 
-    // Read the binary from VFS
-    let vnode = lookup_path(path).map_err(cleanup)?;
-
-    // Check execute permission
-    let proc_ref = {
-        let table = PROCESS_TABLE.lock();
-        table.get(&pid).cloned().ok_or_else(|| cleanup("internal: process table corrupted"))?
+    // Read the binary from the minimal in-memory TAR initrd
+    let file_data = match crate::initrd::kernel_initrd_lookup(path) {
+        Some(data) => data,
+        None => {
+            cleanup_process(pid);
+            return Err("File not found in initrd");
+        }
     };
-    if !crate::vfs::check_access(&proc_ref, &*vnode, crate::vfs::ACCESS_EXEC) {
-        cleanup_process(pid);
-        return Err("Permission denied");
-    }
-
-    let stat = vnode.stat();
-
-    // Setuid / Setgid support
-    {
-        if stat.mode & 0o4000 != 0 {
-            proc.euid.store(stat.uid, Ordering::Relaxed);
-        }
-        if stat.mode & 0o2000 != 0 {
-            proc.egid.store(stat.gid, Ordering::Relaxed);
-        }
-    }
-
-    let size = stat.size;
-    if size == 0 {
-        cleanup_process(pid);
-        return Err("File is empty or not found");
-    }
-
-    let mut file_data = Vec::new();
-    file_data.resize(size, 0);
-    vnode.read(0, &mut file_data).map_err(cleanup)?;
 
     // Get the page table
     let satp_val = proc.satp_val.load(core::sync::atomic::Ordering::Relaxed);
@@ -61,9 +81,11 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     let pt = unsafe { &mut *(pt_pa as *mut crate::mm::vmm::PageTable) };
 
     // Load ELF
-    let entry_point = load_elf(&file_data, pt).map_err(cleanup)?;
+    let entry_point = load_elf(file_data, pt).map_err(cleanup)?;
 
-    // Allocate and map user stack
+    // Allocate and map user stack.
+    // The page immediately below the allocated stack region is intentionally left unmapped
+    // to serve as a guard page against stack overflows.
     let stack_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
     for i in 0..USER_STACK_PAGES {
         let va = stack_base + i * PAGE_SIZE;
@@ -86,40 +108,61 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     Ok(pid)
 }
 
+/// Attempts to wake a parent process when a child exits.
+///
+/// This is a helper function used by [`exit`]. It checks if the parent
+/// is waiting for the exiting child (or any child), and if so, queues
+/// the exit status and wakes the parent.
 fn try_wake_parent(parent: &Process, child_pid: Pid, child_status: i32) {
-    let should_wake = {
+    // Only enqueue if this child matches what the parent is waiting for, or if
+    // the parent is not yet blocked (it will find the result via pop_front on its
+    // next waitpid call rather than needing a table scan).
+    let matches = {
         let target = parent.wait_target.lock();
-        if target.is_none() || *target == Some(child_pid) || *target == Some(-1i32) {
-            *parent.wait_result.lock() = Some((child_pid, child_status));
-            true
-        } else {
-            false
+        match *target {
+            None => true,          // parent not blocked yet; queue so next waitpid is fast
+            Some(-1) => true,      // waiting for any child
+            Some(t) => t == child_pid,
         }
     };
 
-    if should_wake {
-        let was_stopped = {
-            let mut state = parent.state.lock();
-            if matches!(*state, crate::posix::process::ProcState::Stopped) {
-                *state = crate::posix::process::ProcState::Running;
-                true
-            } else {
-                false
-            }
-        };
-        if was_stopped {
-            crate::posix::process::RUN_QUEUE
-                .lock()
-                .push_back(parent.pid);
-        }
+    if !matches {
+        // Parent is waiting for a specific different child; this zombie will be
+        // found by the PROCESS_TABLE scan in sys_waitpid when the target changes.
+        return;
+    }
+
+    // Push unconditionally — VecDeque never loses a result when siblings race.
+    parent.wait_result.lock().push_back((child_pid, child_status));
+
+    // Wake the parent if it is blocked in waitpid.
+    let mut state = parent.state.lock();
+    if matches!(*state, crate::posix::process::ProcState::Stopped) {
+        *state = crate::posix::process::ProcState::Running;
+        drop(state);
+        crate::posix::process::RUN_QUEUE.lock().push_back(parent.pid);
     }
 }
 
+/// Terminates a process, transitioning it to a zombie state.
+///
+/// This function:
+/// 1. Marks the process as a zombie with the given exit status.
+/// 2. Closes all file descriptors (so pipe readers can observe EOF).
+/// 3. Unblocks processes that are stuck sending to or waiting for replies
+///    from this process.
+/// 4. Reparents all children to init (PID 1).
+/// 5. Wakes the parent if it is blocked in `waitpid`.
+///
+/// # Arguments
+///
+/// * `pid` - The PID of the process to terminate.
+/// * `status` - The exit status code.
 pub fn exit(pid: Pid, status: i32) {
     use crate::posix::process::{PROCESS_TABLE, ProcState};
 
-    // Phase 1: Mark zombie and collect ppid + children list (single lock scope).
-    let (ppid, children) = {
+    // Phase 1: Mark zombie and collect ppid, children, and IPC senders in one lock scope.
+    let (ppid, children, blocked_senders) = {
         let table = PROCESS_TABLE.lock();
         match table.get(&pid) {
             None => return,
@@ -128,12 +171,71 @@ pub fn exit(pid: Pid, status: i32) {
                 // POSIX: close all fds on exit so pipe-write ends drop immediately,
                 // allowing blocked readers to see EOF without waiting for reap.
                 proc.fds.lock().close_all();
-                crate::println!("exit: pid {} status {}", pid, status);
                 let children = proc.children.lock().clone();
-                (proc.ppid.load(Ordering::Relaxed), children)
+                // Drain senders while we hold the table lock so we can safely
+                // iterate them in phase 1.5 without risking a second drain.
+                let blocked_senders: alloc::vec::Vec<Pid> =
+                    proc.senders.lock().drain(..).collect();
+                (proc.ppid.load(Ordering::Relaxed), children, blocked_senders)
             }
         }
     };
+
+    // Phase 1.5: Unblock processes that are permanently stuck waiting on the dying
+    // process.  Two categories:
+    //   (a) Processes in IpcState::Sending { target: pid } — in the senders queue.
+    //   (b) Processes in IpcState::ReceivingReply { source: pid } — waiting for a
+    //       sendrec reply that will never come (not in any queue, must scan table).
+    // For both, advance their sepc past the blocked ecall and return ESRCH.
+    for sender_pid in blocked_senders {
+        let table = PROCESS_TABLE.lock();
+        if let Some(proc) = table.get(&sender_pid) {
+            {
+                let mut tf = proc.trap_frame.lock();
+                tf.sepc += 4; // undo the sepc -= 4 that armed the retry
+                tf.regs[10] = crate::errno::ESRCH;
+            }
+            *proc.ipc_state.lock() = crate::posix::process::IpcState::None;
+            let mut st = proc.state.lock();
+            if matches!(*st, ProcState::Stopped) {
+                *st = ProcState::Running;
+                drop(st);
+                crate::posix::process::RUN_QUEUE.lock().push_back(sender_pid);
+            }
+        }
+    }
+    // Scan for sendrec reply-waiters (not in any per-process queue).
+    let reply_waiters: alloc::vec::Vec<Pid> = {
+        let table = PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter(|(_, p)| {
+                matches!(
+                    *p.ipc_state.lock(),
+                    crate::posix::process::IpcState::ReceivingReply { source, .. }
+                        if source == pid
+                )
+            })
+            .map(|(&p, _)| p)
+            .collect()
+    };
+    for waiter_pid in reply_waiters {
+        let table = PROCESS_TABLE.lock();
+        if let Some(proc) = table.get(&waiter_pid) {
+            {
+                let mut tf = proc.trap_frame.lock();
+                tf.sepc += 4;
+                tf.regs[10] = crate::errno::ESRCH;
+            }
+            *proc.ipc_state.lock() = crate::posix::process::IpcState::None;
+            let mut st = proc.state.lock();
+            if matches!(*st, ProcState::Stopped) {
+                *st = ProcState::Running;
+                drop(st);
+                crate::posix::process::RUN_QUEUE.lock().push_back(waiter_pid);
+            }
+        }
+    }
 
     // Phase 2: Orphan reparenting — give all children to init (PID 1).
     if !children.is_empty() {
@@ -173,18 +275,27 @@ pub fn exit(pid: Pid, status: i32) {
     }
 }
 
-/// sys_fork — create a child process with copy-on-write address space.
+/// `sys_fork` — create a child process with copy-on-write address space.
 ///
 /// The child receives a cloned page table where all writable user pages
-/// are marked read-only and shared with the parent.  The first write by
-/// either process triggers handle_store_page_fault which allocates a
+/// are marked read-only and shared with the parent. The first write by
+/// either process triggers `handle_store_page_fault` which allocates a
 /// private copy (COW).
+///
+/// # Returns
+///
+/// `Ok(child_pid)` on success, or an error if memory allocation fails.
 pub fn sys_fork() -> Result<Pid, &'static str> {
     let ppid = crate::posix::process::current_pid();
     let child = crate::posix::process::Process::new(ppid)?;
     let child_pid = child.pid;
 
     if let Some(parent_proc) = crate::posix::process::PROCESS_TABLE.lock().get(&ppid) {
+        // Acquire parent's trap_frame lock to protect its page table during clone_user_space.
+        // This prevents concurrent modifications to the parent's page table from another HART.
+        // It also ensures a consistent TrapFrame state for copying.
+        let parent_tf_guard = parent_proc.trap_frame.lock(); // Hold lock here
+
         let parent_root_pa = (parent_proc.satp_val.load(core::sync::atomic::Ordering::Relaxed) & 0xFFFFFFFFFFF) << 12;
         let child_root_pa  = (child.satp_val.load(core::sync::atomic::Ordering::Relaxed) & 0xFFFFFFFFFFF) << 12;
 
@@ -200,10 +311,10 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
         unsafe { core::arch::asm!("sfence.vma") };
 
         // Copy trap frame — child resumes past the ecall with a0 = 0.
-        let parent_tf = parent_proc.trap_frame.lock();
+        // Use the already-held parent_tf_guard
         let mut child_tf = child.trap_frame.lock();
         let child_kernel_sp = child_tf.kernel_sp; // preserve child's own kernel stack
-        *child_tf = *parent_tf;
+        *child_tf = *parent_tf_guard; // Copy from the guarded parent_tf
         child_tf.kernel_sp = child_kernel_sp;
         child_tf.regs[10] = 0; // fork() returns 0 in the child
         child_tf.sepc += 4; // advance past the ecall instruction
@@ -213,23 +324,29 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
     Ok(child.pid)
 }
 
-/// Replace current process image with new ELF (execve-like minimal).
-/// Returns the entry point VA so the trap handler can install it into sepc.
-/// arg0: path_ptr, arg1: path_len
-pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static str> {
+/// Replaces the current process image with a new ELF (execve-like minimal).
+///
+/// # Safety
+///
+/// `path_ptr` must point to a valid, readable buffer of at least `path_len` bytes.
+///
+/// # Arguments
+///
+/// * `path_ptr` - Pointer to a byte slice containing the path string.
+/// * `path_len` - Length of the path string.
+///
+/// # Returns
+///
+/// `Ok(entry_point)` with the virtual address of the new entry point on
+/// success. The trap handler uses this to set `sepc`, `sp`, and `sstatus`.
+pub unsafe fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static str> {
     let ppid = crate::posix::process::current_pid();
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = core::str::from_utf8(path_bytes).map_err(|_| "Invalid UTF-8 path")?;
 
-    // Lookup and read file
-    let vnode = crate::vfs::lookup_path(path)?;
-    let stat = vnode.stat();
-    if stat.size == 0 {
-        return Err("Empty binary");
-    }
-    let mut file_data = alloc::vec::Vec::new();
-    file_data.resize(stat.size, 0);
-    vnode.read(0, &mut file_data)?;
+    // Lookup and read file from minimal initrd
+    let file_data = crate::initrd::kernel_initrd_lookup(path)
+        .ok_or("File not found in initrd")?;
 
     // Get current process and its old root
     let proc = crate::posix::process::PROCESS_TABLE
@@ -249,7 +366,7 @@ pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static 
     // If we destroyed the old space first, PMM could reuse its root page for a
     // new mapping while the CPU still page-walks via the old satp — corruption.
     let new_pt = unsafe { &mut *(new_root_pa as *mut crate::mm::vmm::PageTable) };
-    let entry_point = crate::posix::elf::load_elf(&file_data, new_pt)?;
+    let entry_point = crate::posix::elf::load_elf(file_data, new_pt)?;
 
     let stack_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
     for i in 0..USER_STACK_PAGES {
@@ -268,26 +385,33 @@ pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static 
         core::arch::asm!("sfence.vma");
     }
 
-    // Now safe: CPU uses new PT, old space can be freed.
-    crate::mm::vmm::destroy_user_space(old_root_pa)?;
+    // Now safe: CPU uses new PT. Only free old space if this was the last
+    // thread using it (CLONE_VM threads sharing the old PA may still be running).
+    if crate::posix::process::satp_unshare(old_root_pa) {
+        crate::mm::vmm::destroy_user_space(old_root_pa)?;
+    }
 
     // Return entry_point — trap handler sets sepc, sp, sstatus (satp already switched above).
     Ok(entry_point)
 }
 
-/// Remove a newly-created but not-yet-running process from the system
-/// and free its resources.  Used by posix_spawn when setup fails after
-/// Process::new has been called.
-fn cleanup_process(pid: Pid) {
+/// Removes a newly-created but not-yet-running process from the system
+/// and frees its resources. Used by [`posix_spawn`] when setup fails
+/// after `Process::new` has been called.
+///
+/// # Arguments
+///
+/// * `pid` - The PID of the process to clean up.
+pub fn cleanup_process(pid: Pid) {
     // Remove from the parent's children list first.
     {
         let table = PROCESS_TABLE.lock();
         if let Some(proc) = table.get(&pid) {
             let ppid = proc.ppid.load(Ordering::Relaxed);
-            if ppid != 0 {
-                if let Some(parent) = table.get(&ppid) {
-                    parent.children.lock().retain(|&c| c != pid);
-                }
+            if ppid != 0
+                && let Some(parent) = table.get(&ppid)
+            {
+                parent.children.lock().retain(|&c| c != pid);
             }
         }
     }
@@ -309,7 +433,10 @@ fn cleanup_process(pid: Pid) {
             }
         }
         let root_pa = (satp & 0xFFFFFFFFFFF) << 12;
-        let _ = crate::mm::vmm::destroy_user_space(root_pa);
+        if crate::posix::process::satp_unshare(root_pa) {
+            crate::mm::swap::evict_all(root_pa);
+            let _ = crate::mm::vmm::destroy_user_space(root_pa);
+        }
     }
 
     // Remove from the process table.

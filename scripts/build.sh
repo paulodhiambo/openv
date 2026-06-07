@@ -11,7 +11,7 @@ set -e
 
 cd "$(dirname "$0")/.."
 
-BINS="${BINS:-init sh ls cat hello producer consumer doexec forktest net-smoltcp}"
+BINS="${BINS:-init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server echo-server pm-server rs-server virtio-blk-driver net-client}"
 USER_BUILD_DIR="debug"
 KERNEL_FLAGS=""
 USER_FLAGS=""
@@ -43,8 +43,9 @@ done
 echo "Hello from initrd TAR!" > test_root/dummy.txt
 
 cd test_root
-# Build tar from all entries, respecting subdirectories (proc/, dev/)
-tar -cf ../test_root.tar .
+# Build tar from all entries, respecting subdirectories (proc/, dev/).
+# COPYFILE_DISABLE suppresses macOS ._<file> resource-fork entries.
+COPYFILE_DISABLE=1 tar -cf ../test_root.tar .
 cd ..
 echo "  initrd: test_root.tar ($(du -sh test_root.tar | cut -f1))"
 

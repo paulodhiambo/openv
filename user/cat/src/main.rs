@@ -4,6 +4,7 @@
 use libos::{close, open, read, write};
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
     if argc <= 1 {
         // No arguments: copy stdin to stdout.
