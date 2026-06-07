@@ -56,9 +56,9 @@ pub extern "C" fn main() -> i32 {
 
         let mut status = 0;
         waitpid(child, &mut status, 0);
-        return 0;
+        0
     } else {
         wrt(b"ipc_test: fork failed\n");
-        return 1;
+        1
     }
 }

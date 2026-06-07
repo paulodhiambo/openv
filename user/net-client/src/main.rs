@@ -54,8 +54,6 @@ pub extern "C" fn main() -> i32 {
         let n = recv(fd, buf.as_mut_ptr(), buf.len(), 0);
         if n > 0 {
             write(1, buf.as_ptr(), n as usize);
-        } else if n == 0 {
-            break;
         } else {
             break;
         }
