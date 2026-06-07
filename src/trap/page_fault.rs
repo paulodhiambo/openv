@@ -46,16 +46,33 @@ use crate::trap::TrapFrame;
 /// A pointer to the (possibly modified) trap frame.
 pub fn handle_page_fault(cause: usize, _sepc: usize, stval: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
     match cause {
-        // Instruction or load page fault — demand paging
-        12 | 13 => {
+        // Instruction page fault — demand page with R+W+X+U so the CPU can re-execute
+        12 => {
+            use crate::mm::vmm::PTE_X;
             use riscv::register::satp;
             let fault_va = stval;
             let root_pa = (satp::read().bits() as usize & 0xFFFFFFFFFFF) << 12;
-            match crate::mm::vmm::handle_user_page_fault(root_pa, fault_va) {
+            match crate::mm::vmm::handle_user_page_fault(root_pa, fault_va, PTE_X) {
                 Ok(()) => tf as *mut _,
                 Err(e) => {
                     let pid = crate::posix::process::current_pid();
-                    crate::println!("Segfault pid {}: {} at va={:#x}", pid, e, fault_va);
+                    crate::println!("Segfault pid {}: instr {} at va={:#x}", pid, e, fault_va);
+                    crate::posix::spawn::exit(pid, -11);
+                    crate::posix::process::schedule();
+                    unsafe { crate::trap::halt_cpu() }
+                }
+            }
+        }
+        // Load page fault — demand page with R+W+U
+        13 => {
+            use riscv::register::satp;
+            let fault_va = stval;
+            let root_pa = (satp::read().bits() as usize & 0xFFFFFFFFFFF) << 12;
+            match crate::mm::vmm::handle_user_page_fault(root_pa, fault_va, 0) {
+                Ok(()) => tf as *mut _,
+                Err(e) => {
+                    let pid = crate::posix::process::current_pid();
+                    crate::println!("Segfault pid {}: load {} at va={:#x}", pid, e, fault_va);
                     crate::posix::spawn::exit(pid, -11);
                     crate::posix::process::schedule();
                     unsafe { crate::trap::halt_cpu() }
@@ -72,7 +89,7 @@ pub fn handle_page_fault(cause: usize, _sepc: usize, stval: usize, tf: &mut Trap
                 Ok(()) => tf as *mut _,
                 Err(_) => {
                     // Not a COW page — try demand paging (stack growth or lazy alloc).
-                    match crate::mm::vmm::handle_user_page_fault(root_pa, fault_va) {
+                    match crate::mm::vmm::handle_user_page_fault(root_pa, fault_va, 0) {
                         Ok(()) => tf as *mut _,
                         Err(e) => {
                             let pid = crate::posix::process::current_pid();

@@ -558,7 +558,7 @@ pub fn sys_datacopy(
             }
             Err(_) => {
                 // Not mapped, try to fault it in
-                if crate::mm::vmm::handle_user_page_fault(src_root_pa, current_src_va).is_err() {
+                if crate::mm::vmm::handle_user_page_fault(src_root_pa, current_src_va, 0).is_err() {
                     tf.regs[10] = usize::MAX; // EFAULT
                     return;
                 }
@@ -595,7 +595,7 @@ pub fn sys_datacopy(
             }
             Err(_) => {
                 // Not mapped, try to fault it in
-                if crate::mm::vmm::handle_user_page_fault(dst_root_pa, current_dst_va).is_err() {
+                if crate::mm::vmm::handle_user_page_fault(dst_root_pa, current_dst_va, 0).is_err() {
                     tf.regs[10] = usize::MAX; // EFAULT
                     return;
                 }

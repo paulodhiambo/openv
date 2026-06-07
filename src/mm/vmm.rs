@@ -557,7 +557,7 @@ pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
 ///
 /// The caller must ensure that `root_pa` is a valid page table root
 /// physical address (typically read from the active `SATP` CSR).
-pub fn handle_user_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'static str> {
+pub fn handle_user_page_fault(root_pa: usize, fault_va: usize, extra_flags: usize) -> Result<(), &'static str> {
     use crate::mm::pmm::PAGE_SIZE;
     // Reject anything in the upper canonical half (kernel space in Sv39)
     if fault_va >= 0x0000_8000_0000_0000 {
@@ -571,20 +571,20 @@ pub fn handle_user_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'s
     }
     let page_va = fault_va & !(PAGE_SIZE - 1);
 
-    // 2. Check swap first; if a page was previously evicted, restore it.
+    // Check swap first; if a page was previously evicted, restore it.
     if crate::mm::swap::lookup_swap(root_pa, page_va) {
         return crate::mm::swap::swap_in(root_pa, page_va);
     }
 
-    // 3. Allocate a fresh physical page (zeroed by PMM).
+    // Allocate a fresh physical page (zeroed by PMM).
     let frame = crate::mm::pmm::alloc_frame().ok_or("OOM in demand paging")?;
 
-    // 4. Map the new page.
-    // SAFETY:
-    // Preconditions: `root_pa` is derived from the active `SATP` CSR, ensuring it is the valid root page table.
-    // Postconditions: Mutably borrows the active root page table.
+    // Map the new page with base R/W/U permissions plus any caller-supplied flags
+    // (e.g. PTE_X for instruction-fetch faults so the CPU can re-execute).
+    // SAFETY: `root_pa` is derived from the active SATP CSR.
     let pt = unsafe { &mut *(root_pa as *mut PageTable) };
-    match pt.map_page(page_va, frame.pa(), PTE_R | PTE_W | PTE_U) {
+    let flags = PTE_R | PTE_W | PTE_U | extra_flags;
+    match pt.map_page(page_va, frame.pa(), flags) {
         Ok(()) => {
             frame.into_raw(); // Ownership transferred to PTE
             // Flush local TLB then IPI all other HARTs.

@@ -82,9 +82,11 @@ pub fn poll_uart_into_linedisc() {
             uart.put_char(b'C');
             uart.put_char(b'\n');
             if fg > 0 {
-                // Send SIGINT to the foreground process group and wake any
-                // processes that are blocked in a blocking syscall so the
-                // signal is checked on their next return to user mode.
+                // Send SIGINT to the foreground process group.  Do NOT touch
+                // tty.ctrlc here — that flag is only for the case where the
+                // shell itself is blocked in sys_read.  Setting it now would
+                // poison the shell's first read after the foreground process
+                // exits, making sys_read return 0 (EOF) and killing the shell.
                 let table = crate::posix::process::PROCESS_TABLE.lock();
                 for (pid, proc) in table.iter() {
                     if proc.pgid.load(Ordering::Relaxed) == fg {
@@ -97,15 +99,12 @@ pub fn poll_uart_into_linedisc() {
                     }
                 }
                 drop(table);
-                // Also interrupt any TTY waiter (process blocked in sys_read).
-                tty.ctrlc.store(true, Ordering::Relaxed);
-                let waiter = tty.waiter.swap(0, Ordering::Relaxed);
-                if waiter > 0 {
-                    crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
-                }
             } else {
-                // No external fg process — push 0x03 into the TTY buf so the
-                // shell receives it as a printable Ctrl-C byte in raw mode.
+                // No external fg process — the shell itself is reading stdin.
+                // Set ctrlc so sys_read returns 0 (the shell can cancel the
+                // current input line), and push 0x03 into the TTY buffer so
+                // raw-mode readers also see it.
+                tty.ctrlc.store(true, Ordering::Relaxed);
                 let mut buf = tty.buf.lock();
                 buf.push_back(0x03);
                 drop(buf);
