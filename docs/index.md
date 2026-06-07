@@ -10,7 +10,7 @@ Welcome to the openv technical documentation. Start with the [README](../readme.
 | [architecture.md](architecture.md) | Kernel developers | Deep-dive: boot, MM, traps, VFS, IPC, net, SMP — 1,900+ lines |
 | [syscalls.md](syscalls.md) | Userspace / libos developers | Every syscall: number, signature, return, semantics |
 | [ROADMAP.md](ROADMAP.md) | Contributors / planners | What is done, in progress, and planned |
-| [../CONTRIBUTING.md](../CONTRIBUTING.md) | Contributors | Dev setup, coding standards, PR guide, good first issues |
+| [../CONTRIBUTING.md](CONTRIBUTING.md) | Contributors | Dev setup, coding standards, PR guide, good first issues |
 
 ---
 

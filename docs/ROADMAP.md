@@ -84,4 +84,4 @@ This document tracks what has been implemented, what is in progress, and what is
 
 ## Contributing
 
-See [CONTRIBUTING.md](../CONTRIBUTING.md) for how to help, especially the **Known Issues to Fix** table which lists good first contributions.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to help, especially the **Known Issues to Fix** table which lists good first contributions.
