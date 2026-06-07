@@ -451,7 +451,6 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                 let pending = proc.pending_signals.load(core::sync::atomic::Ordering::Relaxed);
                 let blocked = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
                 let deliverable = pending & !blocked;
-                
                 if deliverable != 0 {
                     // Find first set bit (the signal number)
                     let sig = deliverable.trailing_zeros();

@@ -82,11 +82,6 @@ pub fn poll_uart_into_linedisc() {
             uart.put_char(b'C');
             uart.put_char(b'\n');
             if fg > 0 {
-                // Send SIGINT to the foreground process group.  Do NOT touch
-                // tty.ctrlc here — that flag is only for the case where the
-                // shell itself is blocked in sys_read.  Setting it now would
-                // poison the shell's first read after the foreground process
-                // exits, making sys_read return 0 (EOF) and killing the shell.
                 let table = crate::posix::process::PROCESS_TABLE.lock();
                 for (pid, proc) in table.iter() {
                     if proc.pgid.load(Ordering::Relaxed) == fg {
@@ -193,11 +188,29 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
                 let pid = crate::posix::process::current_pid();
                 let should_preempt = !crate::posix::process::RUN_QUEUE.lock().is_empty();
                 if should_preempt {
-                    if pid != 0 {
-                        crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                    // Do NOT preempt a process that has deliverable signals — return to
+                    // the signal check instead so the signal is delivered immediately.
+                    let has_signal = if pid != 0 {
+                        let table = crate::posix::process::PROCESS_TABLE.lock();
+                        if let Some(p) = table.get(&pid) {
+                            let pending = p.pending_signals.load(core::sync::atomic::Ordering::Relaxed);
+                            let blocked = p.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+                            (pending & !blocked) != 0
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if has_signal {
+                        tf as *mut _
+                    } else {
+                        if pid != 0 {
+                            crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                        }
+                        crate::posix::process::schedule();
+                        unsafe { crate::trap::halt_cpu() }
                     }
-                    crate::posix::process::schedule();
-                    unsafe { crate::trap::halt_cpu() }
                 } else {
                     tf as *mut _
                 }
@@ -218,9 +231,12 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
             let hart = crate::smp::current_hartid();
             let irq = crate::plic::claim(hart as usize);
             if irq != 0 {
-                // If it's UART (10), dispatch locally for now to keep console working
+                // If it's UART (10), drain the FIFO into the line discipline first.
+                // The UART is level-triggered: if we complete the PLIC ack without
+                // consuming the byte, the interrupt re-fires immediately, starving
+                // the timer ISR and preventing poll_uart_into_linedisc from running.
                 if irq == 10 {
-                    crate::drivers::dispatch_interrupt(irq as usize);
+                    poll_uart_into_linedisc();
                     crate::plic::complete(hart as usize, irq);
                 } else {
                     let mut handled_in_userspace = false;
