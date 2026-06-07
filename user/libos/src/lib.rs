@@ -212,28 +212,22 @@ pub fn create(path: &[u8]) -> i32 {
 }
 
 pub fn mkdir(path: &[u8]) -> i32 {
-    if vfs_pid().is_some() {
-        if vfs_mkdir(path) == 0 {
-            return 0;
-        }
+    if vfs_pid().is_some() && vfs_mkdir(path) == 0 {
+        return 0;
     }
     syscall(27, path.as_ptr() as usize, path.len(), 0) as i32
 }
 
 pub fn unlink(path: &[u8]) -> i32 {
-    if vfs_pid().is_some() {
-        if vfs_unlink(path) == 0 {
-            return 0;
-        }
+    if vfs_pid().is_some() && vfs_unlink(path) == 0 {
+        return 0;
     }
     syscall(28, path.as_ptr() as usize, path.len(), 0) as i32
 }
 
 pub fn rename(old: &[u8], new: &[u8]) -> i32 {
-    if vfs_pid().is_some() {
-        if vfs_rename(old, new) == 0 {
-            return 0;
-        }
+    if vfs_pid().is_some() && vfs_rename(old, new) == 0 {
+        return 0;
     }
     syscall4(
         29,

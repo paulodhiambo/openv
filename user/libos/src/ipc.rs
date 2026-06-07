@@ -22,5 +22,11 @@ impl Message {
     }
 }
 
+impl Default for Message {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // Assert that Message is exactly 64 bytes
 const _: () = assert!(size_of::<Message>() == 64);

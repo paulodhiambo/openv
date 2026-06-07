@@ -52,11 +52,11 @@ impl Vfs {
 
     fn exists(&self, path: &str) -> bool {
         if is_virtual_path(path) { return true; }
-        if path.starts_with("/mnt") {
-            if let Some(ofs) = get_blockfs() {
-                let p = if path == "/mnt" { "/" } else { &path[4..] };
-                return ofs.lookup_path(p).is_some();
-            }
+        if let Some(stripped) = path.strip_prefix("/mnt")
+            && let Some(ofs) = get_blockfs()
+        {
+            let p = if stripped.is_empty() { "/" } else { stripped };
+            return ofs.lookup_path(p).is_some();
         }
         self.nodes.contains_key(path)
     }
@@ -79,34 +79,33 @@ impl Vfs {
     }
 
     fn mkdir(&mut self, path: &str) -> bool {
-        if path.starts_with("/mnt") {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
             if let Some(ofs) = get_blockfs() {
-                let p = if path == "/mnt" { "/" } else { &path[4..] };
-                if let Some((parent, name)) = Self::parent_and_name(p) {
-                    if let Some((dir_ino, etype)) = ofs.lookup_path(&parent) {
-                        if etype == blockfs::ITYPE_DIR_ENTRY {
-                            let child_ino = match ofs.alloc_inode() {
-                                Some(i) => i,
-                                None => return false,
-                            };
-                            let new_inode = blockfs::RawInode {
-                                itype: blockfs::ITYPE_DIR,
-                                _pad: [0; 3],
-                                size: 0,
-                                nlink: 1,
-                                used_blocks: 0,
-                                direct: [0u32; 12],
-                                indirect: 0,
-                                _reserved: [0u32; 15],
-                            };
-                            ofs.write_inode(child_ino, &new_inode);
-                            if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_DIR_ENTRY) {
-                                ofs.free_inode(child_ino);
-                                return false;
-                            }
-                            return true;
-                        }
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                if let Some((parent, name)) = Self::parent_and_name(p)
+                    && let Some((dir_ino, etype)) = ofs.lookup_path(&parent)
+                    && etype == blockfs::ITYPE_DIR_ENTRY
+                {
+                    let child_ino = match ofs.alloc_inode() {
+                        Some(i) => i,
+                        None => return false,
+                    };
+                    let new_inode = blockfs::RawInode {
+                        itype: blockfs::ITYPE_DIR,
+                        _pad: [0; 3],
+                        size: 0,
+                        nlink: 1,
+                        used_blocks: 0,
+                        direct: [0u32; 12],
+                        indirect: 0,
+                        _reserved: [0u32; 15],
+                    };
+                    ofs.write_inode(child_ino, &new_inode);
+                    if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_DIR_ENTRY) {
+                        ofs.free_inode(child_ino);
+                        return false;
                     }
+                    return true;
                 }
             }
             return false;
@@ -133,43 +132,42 @@ impl Vfs {
     }
 
     fn create(&mut self, path: &str) -> bool {
-        if path.starts_with("/mnt") {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
             if let Some(ofs) = get_blockfs() {
-                let p = if path == "/mnt" { "/" } else { &path[4..] };
-                if let Some((parent, name)) = Self::parent_and_name(p) {
-                    if let Some((dir_ino, etype)) = ofs.lookup_path(&parent) {
-                        if etype == blockfs::ITYPE_DIR_ENTRY {
-                            // If it exists, truncate it instead of failing
-                            if let Some((child_ino, ctype)) = ofs.lookup_path(p) {
-                                if ctype == blockfs::ITYPE_FILE_ENTRY {
-                                    ofs.file_truncate(child_ino);
-                                    return true;
-                                }
-                                return false; // Is a directory
-                            }
-
-                            let child_ino = match ofs.alloc_inode() {
-                                Some(i) => i,
-                                None => return false,
-                            };
-                            let new_inode = blockfs::RawInode {
-                                itype: blockfs::ITYPE_FILE,
-                                _pad: [0; 3],
-                                size: 0,
-                                nlink: 1,
-                                used_blocks: 0,
-                                direct: [0u32; 12],
-                                indirect: 0,
-                                _reserved: [0u32; 15],
-                            };
-                            ofs.write_inode(child_ino, &new_inode);
-                            if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_FILE_ENTRY) {
-                                ofs.free_inode(child_ino);
-                                return false;
-                            }
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                if let Some((parent, name)) = Self::parent_and_name(p)
+                    && let Some((dir_ino, etype)) = ofs.lookup_path(&parent)
+                    && etype == blockfs::ITYPE_DIR_ENTRY
+                {
+                    // If it exists, truncate it instead of failing
+                    if let Some((child_ino, ctype)) = ofs.lookup_path(p) {
+                        if ctype == blockfs::ITYPE_FILE_ENTRY {
+                            ofs.file_truncate(child_ino);
                             return true;
                         }
+                        return false; // Is a directory
                     }
+
+                    let child_ino = match ofs.alloc_inode() {
+                        Some(i) => i,
+                        None => return false,
+                    };
+                    let new_inode = blockfs::RawInode {
+                        itype: blockfs::ITYPE_FILE,
+                        _pad: [0; 3],
+                        size: 0,
+                        nlink: 1,
+                        used_blocks: 0,
+                        direct: [0u32; 12],
+                        indirect: 0,
+                        _reserved: [0u32; 15],
+                    };
+                    ofs.write_inode(child_ino, &new_inode);
+                    if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_FILE_ENTRY) {
+                        ofs.free_inode(child_ino);
+                        return false;
+                    }
+                    return true;
                 }
             }
             return false;
@@ -186,15 +184,14 @@ impl Vfs {
     }
 
     fn unlink(&mut self, path: &str) -> bool {
-        if path.starts_with("/mnt") {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
             if let Some(ofs) = get_blockfs() {
-                let p = if path == "/mnt" { "/" } else { &path[4..] };
-                if let Some((parent, name)) = Self::parent_and_name(p) {
-                    if let Some((dir_ino, etype)) = ofs.lookup_path(&parent) {
-                        if etype == blockfs::ITYPE_DIR_ENTRY {
-                            return ofs.dir_unlink(dir_ino, &name);
-                        }
-                    }
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                if let Some((parent, name)) = Self::parent_and_name(p)
+                    && let Some((dir_ino, etype)) = ofs.lookup_path(&parent)
+                    && etype == blockfs::ITYPE_DIR_ENTRY
+                {
+                    return ofs.dir_unlink(dir_ino, &name);
                 }
             }
             return false;
@@ -222,23 +219,23 @@ impl Vfs {
 
         // Virtual /proc files
         if let Some(rest) = path.strip_prefix("/proc/") {
-            if let Some((pid_str, "status")) = rest.split_once('/') {
-                if let Ok(pid) = pid_str.parse::<i32>() {
-                    return virtual_proc_read_status(pid, offset, buf);
-                }
+            if let Some((pid_str, "status")) = rest.split_once('/')
+                && let Ok(pid) = pid_str.parse::<i32>()
+            {
+                return virtual_proc_read_status(pid, offset, buf);
             }
             return None;
         }
 
-        if path.starts_with("/mnt") {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
             if let Some(ofs) = get_blockfs() {
-                let p = if path == "/mnt" { "/" } else { &path[4..] };
-                if let Some((ino, etype)) = ofs.lookup_path(p) {
-                    if etype == blockfs::ITYPE_FILE_ENTRY {
-                        match ofs.file_read(ino, offset as usize, buf) {
-                            Ok(n) => return Some(n),
-                            Err(_) => return None,
-                        }
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                if let Some((ino, etype)) = ofs.lookup_path(p)
+                    && etype == blockfs::ITYPE_FILE_ENTRY
+                {
+                    match ofs.file_read(ino, offset as usize, buf) {
+                        Ok(n) => return Some(n),
+                        Err(_) => return None,
                     }
                 }
             }
@@ -265,15 +262,15 @@ impl Vfs {
     }
 
     fn write(&mut self, path: &str, offset: u64, data: &[u8]) -> Option<usize> {
-        if path.starts_with("/mnt") {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
             if let Some(ofs) = get_blockfs() {
-                let p = if path == "/mnt" { "/" } else { &path[4..] };
-                if let Some((ino, etype)) = ofs.lookup_path(p) {
-                    if etype == blockfs::ITYPE_FILE_ENTRY {
-                        match ofs.file_write(ino, offset as usize, data) {
-                            Ok(n) => return Some(n),
-                            Err(_) => return None,
-                        }
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                if let Some((ino, etype)) = ofs.lookup_path(p)
+                    && etype == blockfs::ITYPE_FILE_ENTRY
+                {
+                    match ofs.file_write(ino, offset as usize, data) {
+                        Ok(n) => return Some(n),
+                        Err(_) => return None,
                     }
                 }
             }
@@ -320,24 +317,24 @@ impl Vfs {
         if path == "/proc" {
             return Some(virtual_proc_list());
         }
-        if let Some(pid_str) = path.strip_prefix("/proc/") {
-            if pid_str.parse::<i32>().is_ok() {
-                return Some(alloc::vec![String::from("status")]);
-            }
+        if let Some(pid_str) = path.strip_prefix("/proc/")
+            && pid_str.parse::<i32>().is_ok()
+        {
+            return Some(alloc::vec![String::from("status")]);
         }
 
-        if path.starts_with("/mnt") {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
             if let Some(ofs) = get_blockfs() {
-                let p = if path == "/mnt" { "/" } else { &path[4..] };
-                if let Some((dir_ino, etype)) = ofs.lookup_path(p) {
-                    if etype == blockfs::ITYPE_DIR_ENTRY {
-                        let entries = ofs.dir_readall(dir_ino);
-                        let mut children = Vec::new();
-                        for (name, _, _) in entries {
-                            children.push(name);
-                        }
-                        return Some(children);
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                if let Some((dir_ino, etype)) = ofs.lookup_path(p)
+                    && etype == blockfs::ITYPE_DIR_ENTRY
+                {
+                    let entries = ofs.dir_readall(dir_ino);
+                    let mut children = Vec::new();
+                    for (name, _, _) in entries {
+                        children.push(name);
                     }
+                    return Some(children);
                 }
             }
             return None;
@@ -355,7 +352,7 @@ impl Vfs {
             return Some((false, 0));
         }
         if let Some(rest) = path.strip_prefix("/proc/") {
-            let (pid_part, sub) = rest.split_once('/').map(|(a, b)| (a, b)).unwrap_or((rest, ""));
+            let (pid_part, sub) = rest.split_once('/').unwrap_or((rest, ""));
             if pid_part.parse::<i32>().is_ok() {
                 if sub.is_empty() { return Some((true, 0)); }
                 if sub == "status" { return Some((false, 256)); }
@@ -363,9 +360,9 @@ impl Vfs {
             return None;
         }
 
-        if path.starts_with("/mnt") {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
             if let Some(ofs) = get_blockfs() {
-                let p = if path == "/mnt" { "/" } else { &path[4..] };
+                let p = if stripped.is_empty() { "/" } else { stripped };
                 if let Some((ino, etype)) = ofs.lookup_path(p) {
                     if etype == blockfs::ITYPE_DIR_ENTRY {
                         return Some((true, 0));

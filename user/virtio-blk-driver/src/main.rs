@@ -83,7 +83,7 @@ impl VirtioBlk {
             (*hdr).blk_type = if is_read { VIRTIO_BLK_T_IN } else { VIRTIO_BLK_T_OUT };
             (*hdr).reserved = 0;
             (*hdr).sector = sector;
-            *(stat_ptr as *mut u8) = 0xFF;
+            *stat_ptr = 0xFF;
         }
 
         let chain: &[(u64, u32, bool)] = &[

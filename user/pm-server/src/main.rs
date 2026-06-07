@@ -2,6 +2,7 @@
 #![no_main]
 
 extern crate alloc;
+use alloc::collections::btree_map::Entry;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use libos::{msg_receive, msg_send};
@@ -207,7 +208,6 @@ fn handle_exit(sender: i32, msg: &mut Message) {
                 wrt("PM: waitpid reply sent, reaping\n");
                 reap_process(sender);
                 wrt("PM: process reaped\n");
-                return;
             }
         }
     }
@@ -240,8 +240,8 @@ fn handle_exec(sender: i32, msg: &mut Message) {
 
 fn ensure_process_exists(pid: i32) {
     let table = get_table();
-    if !table.contains_key(&pid) {
-        table.insert(pid, Process {
+    if let Entry::Vacant(e) = table.entry(pid) {
+        e.insert(Process {
             pid,
             ppid: 1, // default parent is init
             state: ProcState::Running,

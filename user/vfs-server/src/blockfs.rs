@@ -340,7 +340,7 @@ impl OfsState {
         let inode = self.read_inode(dir_ino)?;
         if inode.itype != ITYPE_DIR { return None; }
         let name_bytes   = name.as_bytes();
-        let total_entries = (inode.size as usize + DIRENTRY_SIZE - 1) / DIRENTRY_SIZE;
+        let total_entries = (inode.size as usize).div_ceil(DIRENTRY_SIZE);
         let mut seen = 0;
 
         'outer: for block_idx in 0..12 {
@@ -384,7 +384,7 @@ impl OfsState {
         let name_bytes = name.as_bytes();
         if name_bytes.len() > 55 { return false; }
 
-        let total_entries = (inode.size as usize + DIRENTRY_SIZE - 1) / DIRENTRY_SIZE;
+        let total_entries = (inode.size as usize).div_ceil(DIRENTRY_SIZE);
 
         // Scan for an empty slot in existing blocks.
         for block_idx in 0..12usize {
@@ -411,7 +411,7 @@ impl OfsState {
         }
 
         // Append to end — allocate a new block if needed.
-        let next_block_idx = (inode.size as usize + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        let next_block_idx = (inode.size as usize).div_ceil(BLOCK_SIZE);
         if next_block_idx >= 12 { return false; }
 
         let blk = if inode.direct[next_block_idx] != 0 {
@@ -434,7 +434,7 @@ impl OfsState {
         let mut result = Vec::new();
         let inode = match self.read_inode(dir_ino) { Some(i) => i, None => return result };
         if inode.itype != ITYPE_DIR { return result; }
-        let total_entries = (inode.size as usize + DIRENTRY_SIZE - 1) / DIRENTRY_SIZE;
+        let total_entries = (inode.size as usize).div_ceil(DIRENTRY_SIZE);
         let mut seen = 0;
         for block_idx in 0..12 {
             if seen >= total_entries { break; }
@@ -500,8 +500,8 @@ impl OfsState {
             let blk = self.get_file_block(&mut inode, ino, block_idx, true)
                 .ok_or("OOM: no free block")?;
             let mut blk_buf = [0u8; BLOCK_SIZE];
-            if block_off != 0 || chunk < BLOCK_SIZE {
-                if !self.read_blk(blk, &mut blk_buf) { return Err("block read error"); }
+            if (block_off != 0 || chunk < BLOCK_SIZE) && !self.read_blk(blk, &mut blk_buf) {
+                return Err("block read error");
             }
             blk_buf[block_off..block_off + chunk].copy_from_slice(&data[done..done + chunk]);
             if !self.write_blk(blk, &blk_buf) { return Err("block write error"); }
@@ -542,7 +542,7 @@ impl OfsState {
     pub fn dir_unlink(&mut self, dir_ino: u32, name: &str) -> bool {
         let inode = match self.read_inode(dir_ino) { Some(i) => i, None => return false };
         let name_bytes    = name.as_bytes();
-        let total_entries = (inode.size as usize + DIRENTRY_SIZE - 1) / DIRENTRY_SIZE;
+        let total_entries = (inode.size as usize).div_ceil(DIRENTRY_SIZE);
         let mut seen = 0;
 
         for block_idx in 0..12usize {
