@@ -292,6 +292,166 @@ pub fn set_fg_pid(pid: i32) {
     syscall(60, pid as usize, 0, 0);
 }
 
+// ── IPC primitives ────────────────────────────────────────────────────────────
+
+/// Send up to 4096 bytes to `to_pid`'s mailbox. Returns 0 on success, -1 on error.
+pub fn ipc_send(to_pid: i32, buf: &[u8]) -> i32 {
+    syscall(61, to_pid as usize, buf.as_ptr() as usize, buf.len()) as i32
+}
+
+/// Block until a message arrives in this process's mailbox.
+/// Returns bytes copied; writes sender PID into `*from`.
+pub fn ipc_recv(buf: &mut [u8], from: &mut i32) -> usize {
+    syscall(62, buf.as_mut_ptr() as usize, buf.len(), from as *mut i32 as usize)
+}
+
+/// Register the calling process as the global VFS server.
+pub fn vfs_register() {
+    syscall(63, 0, 0, 0);
+}
+
+/// Return the PID of the registered VFS server, or -1 if not yet started.
+pub fn get_vfs_pid() -> i32 {
+    let v = syscall(64, 0, 0, 0);
+    if v == usize::MAX { -1 } else { v as i32 }
+}
+
+// ── VFS client (talks to vfs-server via IPC) ──────────────────────────────────
+
+use core::sync::atomic::{AtomicI32, Ordering as AtomicOrdering};
+
+static VFS_SERVER_PID: AtomicI32 = AtomicI32::new(0);
+
+/// Cache the VFS server PID; must be called once at startup after the server is running.
+pub fn vfs_connect() {
+    let pid = get_vfs_pid();
+    if pid > 0 {
+        VFS_SERVER_PID.store(pid, AtomicOrdering::Relaxed);
+    }
+}
+
+fn vfs_pid() -> Option<i32> {
+    let pid = VFS_SERVER_PID.load(AtomicOrdering::Relaxed);
+    if pid > 0 { Some(pid) } else { None }
+}
+
+fn vfs_call(req: &[u8], reply: &mut [u8]) -> usize {
+    let server = match vfs_pid() { Some(p) => p, None => return 0 };
+    ipc_send(server, req);
+    let mut from = 0i32;
+    ipc_recv(reply, &mut from)
+}
+
+/// Open a file on the VFS server. Returns vfs_fd (≥1) or -1 on error.
+pub fn vfs_open(path: &[u8], flags: u32) -> i32 {
+    let mut req = [0u8; vfs_proto::MAX_MSG];
+    let n = vfs_proto::build_open(&mut req, flags, path);
+    let mut reply = [0u8; vfs_proto::MAX_MSG];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK {
+        vfs_proto::parse_open_reply(payload).map(|fd| fd as i32).unwrap_or(-1)
+    } else { -1 }
+}
+
+/// Create or truncate a file on the VFS server. Returns vfs_fd or -1.
+pub fn vfs_create(path: &[u8]) -> i32 {
+    let mut req = [0u8; vfs_proto::MAX_MSG];
+    let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_CREATE, path);
+    let mut reply = [0u8; vfs_proto::MAX_MSG];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK {
+        vfs_proto::parse_open_reply(payload).map(|fd| fd as i32).unwrap_or(-1)
+    } else { -1 }
+}
+
+/// Read up to `buf.len()` bytes from a VFS file at `offset`. Returns bytes read or -1.
+/// Pass `offset = u64::MAX` to use the server's tracked sequential offset.
+pub fn vfs_read(vfs_fd: u32, offset: u64, buf: &mut [u8]) -> isize {
+    let want = (buf.len() as u32).min((vfs_proto::MAX_MSG - 1) as u32);
+    let mut req = [0u8; 17]; // 1+4+8+4
+    let n = vfs_proto::build_read(&mut req, vfs_fd, offset, want);
+    let mut reply = [0u8; vfs_proto::MAX_MSG];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK {
+        let data = vfs_proto::parse_read_reply(payload);
+        let copy = data.len().min(buf.len());
+        buf[..copy].copy_from_slice(&data[..copy]);
+        copy as isize
+    } else { -1 }
+}
+
+/// Write `data` to a VFS file at `offset`. Returns bytes written or -1.
+/// Pass `offset = u64::MAX` to append at the server's tracked sequential offset.
+pub fn vfs_write(vfs_fd: u32, offset: u64, data: &[u8]) -> isize {
+    let mut req = [0u8; vfs_proto::MAX_MSG];
+    let n = vfs_proto::build_write(&mut req, vfs_fd, offset, data);
+    let mut reply = [0u8; vfs_proto::MAX_MSG];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK {
+        vfs_proto::parse_write_reply(payload) as isize
+    } else { -1 }
+}
+
+/// Close a VFS fd. Returns 0 on success, -1 on error.
+pub fn vfs_close(vfs_fd: u32) -> i32 {
+    let mut req = [0u8; 5];
+    let n = vfs_proto::build_close(&mut req, vfs_fd);
+    let mut reply = [0u8; 4];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, _) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+/// List directory entries on the VFS server. Returns null-separated names in `buf`.
+pub fn vfs_getdents(path: &[u8], buf: &mut [u8]) -> isize {
+    let mut req = [0u8; vfs_proto::MAX_MSG];
+    let n = vfs_proto::build_getdents(&mut req, path);
+    let mut reply = [0u8; vfs_proto::MAX_MSG];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK {
+        let copy = payload.len().min(buf.len());
+        buf[..copy].copy_from_slice(&payload[..copy]);
+        copy as isize
+    } else { -1 }
+}
+
+/// Create a directory on the VFS server. Returns 0 on success, -1 on error.
+pub fn vfs_mkdir(path: &[u8]) -> i32 {
+    let mut req = [0u8; vfs_proto::MAX_MSG];
+    let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_MKDIR, path);
+    let mut reply = [0u8; 4];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, _) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+/// Remove a file or directory on the VFS server. Returns 0 on success, -1 on error.
+pub fn vfs_unlink(path: &[u8]) -> i32 {
+    let mut req = [0u8; vfs_proto::MAX_MSG];
+    let n = vfs_proto::build_path_op(&mut req, vfs_proto::OP_UNLINK, path);
+    let mut reply = [0u8; 4];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, _) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+/// Stat a path on the VFS server. Returns `(is_dir, size)` or `None` on error.
+pub fn vfs_stat(path: &[u8]) -> Option<(bool, u64)> {
+    let mut req = [0u8; vfs_proto::MAX_MSG];
+    let n = vfs_proto::build_stat(&mut req, path);
+    let mut reply = [0u8; vfs_proto::MAX_MSG];
+    let rlen = vfs_call(&req[..n], &mut reply);
+    let (status, payload) = vfs_proto::parse_reply(&reply, rlen);
+    if status == vfs_proto::REPLY_OK {
+        vfs_proto::parse_stat_reply(payload)
+    } else { None }
+}
+
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     exit(1);

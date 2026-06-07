@@ -22,8 +22,17 @@ pub extern "C" fn main() -> ! {
     wrt(b"RISC-V 64-bit Microkernel OS\n\n");
 
     // ── Service startup lines ─────────────────────────────────────────────────
-    ok_line(b"Mounting virtual filesystem");
     ok_line(b"Starting UART console");
+
+    // Start VFS server first — other services may need filesystem access.
+    let vfs_pid = spawn(b"/vfs-server".as_ptr(), 11);
+    if vfs_pid > 0 {
+        ok_line(b"Starting VFS server");
+        // Give the VFS server a chance to register before proceeding.
+        sys_yield();
+    }
+
+    ok_line(b"Mounting virtual filesystem");
 
     // Start the network daemon (runs in background; init reaps it if it exits)
     let net_pid = spawn(b"/net-smoltcp".as_ptr(), 12);

@@ -10,6 +10,9 @@ unsafe extern "C" {
 use crate::sync::Mutex;
 use core::sync::atomic::{AtomicBool, AtomicI32};
 
+/// PID of the registered VFS server process (0 = not yet started).
+pub static VFS_SERVER_PID: AtomicI32 = AtomicI32::new(0);
+
 static LINE_DISC_BUFFER: Mutex<Vec<u8>> = Mutex::new(Vec::new());
 static ECHO_ENABLED: Mutex<bool> = Mutex::new(true);
 static RAW_MODE: Mutex<bool> = Mutex::new(false);
@@ -1501,6 +1504,83 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                     crate::posix::process::FOREGROUND_PID
                         .store(pid, Ordering::Relaxed);
                     tf.regs[10] = 0;
+                }
+                61 => {
+                    // sys_ipc_send(to_pid, buf_ptr, buf_len) → 0 or -1
+                    let to_pid = arg0 as i32;
+                    let buf_ptr = arg1;
+                    let buf_len = arg2;
+
+                    if buf_len > 4096 {
+                        tf.regs[10] = usize::MAX; // message too large
+                    } else {
+                        let data = unsafe {
+                            core::slice::from_raw_parts(buf_ptr as *const u8, buf_len).to_vec()
+                        };
+                        let sender = crate::posix::process::current_pid();
+                        let target = crate::posix::process::PROCESS_TABLE
+                            .lock()
+                            .get(&to_pid)
+                            .cloned();
+                        if let Some(tp) = target {
+                            tp.mailbox.lock().push_back((sender, data));
+                            // Wake if blocked in sys_ipc_recv.
+                            let w = tp.mailbox_waiter.swap(0, Ordering::Relaxed);
+                            if w != 0 {
+                                crate::posix::process::RUN_QUEUE.lock().push_back(to_pid);
+                            }
+                            tf.regs[10] = 0;
+                        } else {
+                            tf.regs[10] = usize::MAX; // no such pid
+                        }
+                    }
+                }
+                62 => {
+                    // sys_ipc_recv(buf_ptr, max_len, from_pid_ptr) → bytes_received
+                    let buf_ptr = arg0;
+                    let max_len = arg1;
+                    let from_pid_ptr = arg2;
+
+                    let pid = crate::posix::process::current_pid();
+                    let msg = crate::posix::process::PROCESS_TABLE
+                        .lock()
+                        .get(&pid)
+                        .and_then(|p| p.mailbox.lock().pop_front());
+
+                    if let Some((sender, data)) = msg {
+                        let len = core::cmp::min(max_len, data.len());
+                        unsafe {
+                            core::slice::from_raw_parts_mut(buf_ptr as *mut u8, len)
+                                .copy_from_slice(&data[..len]);
+                            if from_pid_ptr != 0 {
+                                *(from_pid_ptr as *mut i32) = sender;
+                            }
+                        }
+                        tf.regs[10] = len;
+                    } else {
+                        // Block — set waiter flag and rewind ecall so it retries on wakeup.
+                        tf.sepc -= 4;
+                        if let Some(p) = crate::posix::process::PROCESS_TABLE
+                            .lock()
+                            .get(&pid)
+                        {
+                            p.mailbox_waiter.store(pid, Ordering::Relaxed);
+                        }
+                        crate::posix::process::schedule();
+                        unsafe { __halt_cpu() }
+                    }
+                }
+                63 => {
+                    // sys_vfs_register() — caller becomes the global VFS server
+                    let pid = crate::posix::process::current_pid();
+                    VFS_SERVER_PID.store(pid, Ordering::Relaxed);
+                    crate::println!("VFS server registered: pid {}", pid);
+                    tf.regs[10] = 0;
+                }
+                64 => {
+                    // sys_get_vfs_pid() → VFS server pid, or -1 if not registered
+                    let pid = VFS_SERVER_PID.load(Ordering::Relaxed);
+                    tf.regs[10] = if pid > 0 { pid as usize } else { usize::MAX };
                 }
                 _ => {
                     // Unknown syscall — return ENOSYS rather than crashing the kernel.

@@ -140,6 +140,9 @@ image: $(KERNEL) $(INITRD)
 image-release: $(KERNEL_REL) $(INITRD)
 	KERNEL=$(KERNEL_REL) ./scripts/build_image.sh
 
+sd_write:
+	sudo dd if=openv.img of=/dev/sdX bs=4M status=progress
+
 # ── Quality ────────────────────────────────────────────────────────────────────
 
 check:

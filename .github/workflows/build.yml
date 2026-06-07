@@ -110,12 +110,11 @@ jobs:
         working-directory: user
         run: cargo build --release
 
-      # ── Initrd ────────────────────────────────────────────────────────────
-      - name: Package initrd
+      # ── Debug initrd (used for dev/testing artifacts) ──────────────────────
+      - name: Package debug initrd
         run: |
           mkdir -p test_root/proc test_root/dev
-
-          for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp; do
+          for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server; do
             src="user/target/riscv64gc-unknown-none-elf/debug/$bin"
             if [ -f "$src" ]; then
               cp "$src" "test_root/$bin"
@@ -124,10 +123,26 @@ jobs:
               echo "  (skipping $bin — not found)"
             fi
           done
-
           echo "Hello from initrd TAR!" > test_root/dummy.txt
           cd test_root && tar -cf ../test_root.tar .
-          echo "initrd size: $(du -sh ../test_root.tar | cut -f1)"
+          echo "debug initrd: $(du -sh ../test_root.tar | cut -f1)"
+
+      # ── Release initrd (used for the bootable disk image) ─────────────────
+      - name: Package release initrd
+        run: |
+          mkdir -p test_root_rel/proc test_root_rel/dev
+          for bin in init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server; do
+            src="user/target/riscv64gc-unknown-none-elf/release/$bin"
+            if [ -f "$src" ]; then
+              cp "$src" "test_root_rel/$bin"
+              echo "  copied $bin"
+            else
+              echo "  (skipping $bin — not found)"
+            fi
+          done
+          echo "Hello from initrd TAR!" > test_root_rel/dummy.txt
+          cd test_root_rel && tar -cf ../test_root_release.tar .
+          echo "release initrd: $(du -sh ../test_root_release.tar | cut -f1)"
 
       # ── Kernel ────────────────────────────────────────────────────────────
       - name: Build kernel (debug)
@@ -135,6 +150,16 @@ jobs:
 
       - name: Build kernel (release)
         run: cargo build --release
+
+      # ── Disk image (release kernel + release initrd) ───────────────────────
+      - name: Build disk image
+        run: |
+          # Use llvm-objcopy from the installed llvm-tools-preview component
+          LLVM_OBJCOPY="$(rustup which --toolchain nightly llvm-objcopy 2>/dev/null || true)"
+          KERNEL=target/riscv64gc-unknown-none-elf/release/openv \
+          INITRD=test_root_release.tar \
+          LLVM_OBJCOPY="$LLVM_OBJCOPY" \
+            bash scripts/build_image.sh
 
       # ── Binary size report ────────────────────────────────────────────────
       - name: Report binary sizes
@@ -147,7 +172,10 @@ jobs:
           for f in \
             "target/riscv64gc-unknown-none-elf/debug/openv" \
             "target/riscv64gc-unknown-none-elf/release/openv" \
-            "test_root.tar";
+            "test_root.tar" \
+            "test_root_release.tar" \
+            "openv.img" \
+            "openv.bin";
           do
             if [ -f "$f" ]; then
               sz=$(du -sh "$f" | cut -f1)
@@ -156,11 +184,10 @@ jobs:
           done
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "#### Section breakdown (debug kernel)" >> $GITHUB_STEP_SUMMARY
+          echo "#### Section breakdown (release kernel)" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          # Use llvm-size from the installed llvm-tools-preview component
           LLVM_SIZE="$(rustup which --toolchain nightly llvm-size 2>/dev/null || echo 'size')"
-          "$LLVM_SIZE" target/riscv64gc-unknown-none-elf/debug/openv >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
+          "$LLVM_SIZE" target/riscv64gc-unknown-none-elf/release/openv >> $GITHUB_STEP_SUMMARY 2>/dev/null || true
           echo '```' >> $GITHUB_STEP_SUMMARY
 
       # ── Artifacts ─────────────────────────────────────────────────────────
@@ -178,23 +205,55 @@ jobs:
           path: target/riscv64gc-unknown-none-elf/release/openv
           if-no-files-found: error
 
-      - name: Upload initrd
+      - name: Upload debug initrd
         uses: actions/upload-artifact@v4
         with:
-          name: initrd
+          name: initrd-debug
           path: test_root.tar
           if-no-files-found: error
 
-      # ── Release assets (only on push to main/master) ──────────────────────
+      - name: Upload disk image
+        uses: actions/upload-artifact@v4
+        with:
+          name: openv-disk-image
+          path: |
+            openv.img
+            openv.bin
+          if-no-files-found: error
+
+      # ── Release bundle (push to main/master only) ─────────────────────────
       - name: Create release bundle
         if: github.event_name == 'push'
         run: |
           mkdir -p release-bundle
+          # Kernel ELF (release)
           cp target/riscv64gc-unknown-none-elf/release/openv release-bundle/openv-kernel
-          cp test_root.tar release-bundle/initrd.tar
-          echo "Built from commit ${{ github.sha }}" > release-bundle/BUILD_INFO.txt
-          echo "Branch: ${{ github.ref_name }}" >> release-bundle/BUILD_INFO.txt
-          echo "Date: $(date -u)" >> release-bundle/BUILD_INFO.txt
+          # Initrd archives
+          cp test_root.tar         release-bundle/initrd-debug.tar
+          cp test_root_release.tar release-bundle/initrd-release.tar
+          # Bootable disk image
+          cp openv.img             release-bundle/openv.img
+          # Flat binary (for U-Boot / OpenSBI direct load), if objcopy succeeded
+          [ -f openv.bin ] && cp openv.bin release-bundle/openv.bin || true
+          # Build metadata
+          cat > release-bundle/BUILD_INFO.txt <<EOF
+          Commit : ${{ github.sha }}
+          Branch : ${{ github.ref_name }}
+          Date   : $(date -u)
+
+          Image layout (openv.img, raw 64 MiB):
+            Offset  1 MiB : kernel ELF
+            Offset 32 MiB : release initrd
+
+          Boot (QEMU, full image):
+            qemu-system-riscv64 -machine virt -bios default -nographic \\
+              -drive file=openv.img,format=raw,if=none,id=d0 \\
+              -device virtio-blk-device,drive=d0
+
+          Boot (QEMU, direct kernel):
+            qemu-system-riscv64 -machine virt -bios default -nographic \\
+              -kernel openv-kernel -initrd initrd-release.tar
+          EOF
 
       - name: Upload release bundle
         if: github.event_name == 'push'
