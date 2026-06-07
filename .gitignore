@@ -2,10 +2,23 @@
 /target
 /user/target
 /test_root
+/test_root_rel
 /test_root.tar
+/test_root_release.tar
 /openv.img
 /openv.bin
 /disk.img
+
+# Stray compiled binaries and libraries at repo root
+*.rlib
+*.a
+/init
+/sh
+/ls
+/cat
+
+# Cargo release packages
+*.crate
 
 # IDE
 .claude
