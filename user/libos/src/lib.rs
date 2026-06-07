@@ -33,7 +33,9 @@ pub extern "C" fn libos_init() {
     if kver != LIBOS_ABI_VERSION {
         // Kernel ABI mismatch — abort immediately with a distinctive exit code.
         syscall(1, usize::MAX, 0, 0);
-        loop {}
+        loop {
+            core::arch::asm!("wfi");
+        }
     }
 }
 
@@ -87,7 +89,14 @@ pub fn syscall4(sys_num: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usi
 }
 
 #[inline]
-pub fn syscall5(sys_num: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> usize {
+pub fn syscall5(
+    sys_num: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+) -> usize {
     let mut ret: usize;
     unsafe {
         asm!(
@@ -133,7 +142,9 @@ pub extern "C" fn write(fd: usize, buf: *const u8, len: usize) -> isize {
     let res = syscall(81, fd, 6, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
-        return vfs_write(vfs_fd, u64::MAX, unsafe { core::slice::from_raw_parts(buf, len) });
+        return vfs_write(vfs_fd, u64::MAX, unsafe {
+            core::slice::from_raw_parts(buf, len)
+        });
     }
     syscall(2, fd, buf as usize, len) as isize
 }
@@ -149,7 +160,9 @@ pub extern "C" fn read(fd: usize, buf: *mut u8, len: usize) -> isize {
     let res = syscall(81, fd, 6, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
-        return vfs_read(vfs_fd, u64::MAX, unsafe { core::slice::from_raw_parts_mut(buf, len) });
+        return vfs_read(vfs_fd, u64::MAX, unsafe {
+            core::slice::from_raw_parts_mut(buf, len)
+        });
     }
     syscall(5, fd, buf as usize, len) as isize
 }
@@ -178,7 +191,9 @@ pub extern "C" fn getdents(
     if vfs_pid().is_some() {
         let path = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
         let ret = vfs_getdents(path, unsafe { core::slice::from_raw_parts_mut(buf, len) });
-        if ret >= 0 { return ret; }
+        if ret >= 0 {
+            return ret;
+        }
     }
     syscall4(12, path_ptr as usize, path_len, buf as usize, len) as isize
 }
@@ -195,21 +210,27 @@ pub fn create(path: &[u8]) -> i32 {
 
 pub fn mkdir(path: &[u8]) -> i32 {
     if vfs_pid().is_some() {
-        if vfs_mkdir(path) == 0 { return 0; }
+        if vfs_mkdir(path) == 0 {
+            return 0;
+        }
     }
     syscall(27, path.as_ptr() as usize, path.len(), 0) as i32
 }
 
 pub fn unlink(path: &[u8]) -> i32 {
     if vfs_pid().is_some() {
-        if vfs_unlink(path) == 0 { return 0; }
+        if vfs_unlink(path) == 0 {
+            return 0;
+        }
     }
     syscall(28, path.as_ptr() as usize, path.len(), 0) as i32
 }
 
 pub fn rename(old: &[u8], new: &[u8]) -> i32 {
     if vfs_pid().is_some() {
-        if vfs_rename(old, new) == 0 { return 0; }
+        if vfs_rename(old, new) == 0 {
+            return 0;
+        }
     }
     syscall4(
         29,
@@ -239,11 +260,11 @@ pub extern "C" fn spawn(path_ptr: *const u8, path_len: usize) -> i32 {
     syscall(6, path_ptr as usize, path_len, 0) as i32
 }
 
-pub const CAP_NONE: u64      = 0;
-pub const CAP_MMIO: u64      = 1 << 0;
-pub const CAP_DATACOPY: u64  = 1 << 1;
-pub const CAP_NET_RAW: u64   = 1 << 2;
-pub const CAP_PROCESS: u64   = 1 << 3;
+pub const CAP_NONE: u64 = 0;
+pub const CAP_MMIO: u64 = 1 << 0;
+pub const CAP_DATACOPY: u64 = 1 << 1;
+pub const CAP_NET_RAW: u64 = 1 << 2;
+pub const CAP_PROCESS: u64 = 1 << 3;
 pub const CAP_INTERRUPT: u64 = 1 << 4;
 pub const CAP_SYS_ADMIN: u64 = 1 << 5;
 
@@ -321,9 +342,9 @@ pub extern "C" fn set_echo(enabled: u32) -> i32 {
     syscall(37, enabled as usize, 0, 0) as i32
 }
 
+pub mod ipc;
 pub mod net_adapter;
 pub mod smoltcp_device;
-pub mod ipc;
 
 pub const IPC_ANY: i32 = -1;
 
@@ -490,7 +511,12 @@ pub fn ipc_send(to_pid: i32, buf: &[u8]) -> i32 {
 }
 
 pub fn ipc_recv(buf: &mut [u8], from: &mut i32) -> usize {
-    syscall(62, buf.as_mut_ptr() as usize, buf.len(), from as *mut i32 as usize)
+    syscall(
+        62,
+        buf.as_mut_ptr() as usize,
+        buf.len(),
+        from as *mut i32 as usize,
+    )
 }
 
 pub fn vfs_register() {
@@ -502,8 +528,21 @@ pub fn get_vfs_pid() -> i32 {
     if v == usize::MAX { -1 } else { v as i32 }
 }
 
-pub fn datacopy(src_pid: i32, src_addr: *const u8, dst_pid: i32, dst_addr: *mut u8, len: usize) -> isize {
-    syscall5(93, src_pid as usize, src_addr as usize, dst_pid as usize, dst_addr as usize, len) as isize
+pub fn datacopy(
+    src_pid: i32,
+    src_addr: *const u8,
+    dst_pid: i32,
+    dst_addr: *mut u8,
+    len: usize,
+) -> isize {
+    syscall5(
+        93,
+        src_pid as usize,
+        src_addr as usize,
+        dst_pid as usize,
+        dst_addr as usize,
+        len,
+    ) as isize
 }
 
 // ── VFS client (talks to vfs-server via IPC) ──────────────────────────────────
@@ -530,7 +569,10 @@ pub fn vfs_pid() -> Option<i32> {
 }
 
 fn vfs_call(msg: &mut ipc::Message) -> bool {
-    let server = match vfs_pid() { Some(p) => p, None => return false };
+    let server = match vfs_pid() {
+        Some(p) => p,
+        None => return false,
+    };
     msg_sendrec(server, msg) == 0
 }
 
@@ -540,7 +582,9 @@ pub fn vfs_open(path: &[u8], flags: u32) -> i32 {
     vfs_proto::pack_path_req(&mut msg.data, flags, path.as_ptr() as usize, path.len());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as i32
-    } else { -1 }
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_create(path: &[u8]) -> i32 {
@@ -549,62 +593,110 @@ pub fn vfs_create(path: &[u8]) -> i32 {
     vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as i32
-    } else { -1 }
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_read(vfs_fd: u32, offset: u64, buf: &mut [u8]) -> isize {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_READ;
-    vfs_proto::pack_rw_req(&mut msg.data, vfs_fd, offset, buf.as_mut_ptr() as usize, buf.len());
+    vfs_proto::pack_rw_req(
+        &mut msg.data,
+        vfs_fd,
+        offset,
+        buf.as_mut_ptr() as usize,
+        buf.len(),
+    );
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as isize
-    } else { -1 }
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_write(vfs_fd: u32, offset: u64, data: &[u8]) -> isize {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_WRITE;
-    vfs_proto::pack_rw_req(&mut msg.data, vfs_fd, offset, data.as_ptr() as usize, data.len());
+    vfs_proto::pack_rw_req(
+        &mut msg.data,
+        vfs_fd,
+        offset,
+        data.as_ptr() as usize,
+        data.len(),
+    );
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as isize
-    } else { -1 }
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_close(vfs_fd: u32) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_CLOSE;
     vfs_proto::pack_close_req(&mut msg.data, vfs_fd);
-    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        0
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_getdents(path: &[u8], buf: &mut [u8]) -> isize {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_GETDENTS;
-    vfs_proto::pack_getdents_req(&mut msg.data, path.as_ptr() as usize, path.len(), buf.as_mut_ptr() as usize, buf.len());
+    vfs_proto::pack_getdents_req(
+        &mut msg.data,
+        path.as_ptr() as usize,
+        path.len(),
+        buf.as_mut_ptr() as usize,
+        buf.len(),
+    );
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as isize
-    } else { -1 }
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_mkdir(path: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_MKDIR;
     vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
-    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        0
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_unlink(path: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_UNLINK;
     vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
-    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        0
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_rename(old: &[u8], new: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_RENAME;
-    vfs_proto::pack_rename_req(&mut msg.data, old.as_ptr() as usize, old.len(), new.as_ptr() as usize, new.len());
-    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+    vfs_proto::pack_rename_req(
+        &mut msg.data,
+        old.as_ptr() as usize,
+        old.len(),
+        new.as_ptr() as usize,
+        new.len(),
+    );
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        0
+    } else {
+        -1
+    }
 }
 
 pub fn vfs_stat(path: &[u8]) -> Option<(bool, u64)> {
@@ -613,7 +705,9 @@ pub fn vfs_stat(path: &[u8]) -> Option<(bool, u64)> {
     vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         Some(vfs_proto::unpack_stat_reply(&msg.data))
-    } else { None }
+    } else {
+        None
+    }
 }
 
 pub fn vfs_dup(vfs_fd: u32) -> Option<u32> {
@@ -622,7 +716,9 @@ pub fn vfs_dup(vfs_fd: u32) -> Option<u32> {
     vfs_proto::pack_u32_reply(&mut msg.data, vfs_fd); // reuse u32 pack for the single fd
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         Some(vfs_proto::unpack_u32_reply(&msg.data))
-    } else { None }
+    } else {
+        None
+    }
 }
 
 #[panic_handler]
@@ -675,7 +771,11 @@ pub fn read_res(fd: usize, buf: *mut u8, len: usize) -> Result<usize, Errno> {
 
 pub fn open_res(path_ptr: *const u8, path_len: usize, flags: u32) -> Result<i32, Errno> {
     let ret = open(path_ptr, path_len, flags);
-    if ret < 0 { Err(Errno::UNKNOWN) } else { Ok(ret) }
+    if ret < 0 {
+        Err(Errno::UNKNOWN)
+    } else {
+        Ok(ret)
+    }
 }
 
 pub fn fork_res() -> Result<i32, Errno> {
@@ -723,7 +823,7 @@ pub fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32 {
 
 // ── Thread support ─────────────────────────────────────────────────────────────
 
-pub const CLONE_VM:     u32 = 0x0000_0100;
+pub const CLONE_VM: u32 = 0x0000_0100;
 pub const CLONE_THREAD: u32 = 0x0001_0000;
 pub const CLONE_SETTLS: u32 = 0x0008_0000;
 
@@ -768,7 +868,11 @@ pub fn vfs_fsync(vfs_fd: u32) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_FSYNC;
     vfs_proto::pack_close_req(&mut msg.data, vfs_fd);
-    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        0
+    } else {
+        -1
+    }
 }
 
 /// Flush all pending writes for `fd` to durable storage.
@@ -787,15 +891,15 @@ pub fn fdatasync(fd: i32) -> i32 {
 
 // ── mmap / munmap / brk ───────────────────────────────────────────────────────
 
-pub const PROT_NONE:  u32 = 0;
-pub const PROT_READ:  u32 = 1;
+pub const PROT_NONE: u32 = 0;
+pub const PROT_READ: u32 = 1;
 pub const PROT_WRITE: u32 = 2;
-pub const PROT_EXEC:  u32 = 4;
+pub const PROT_EXEC: u32 = 4;
 
-pub const MAP_SHARED:    u32 = 0x01;
-pub const MAP_PRIVATE:   u32 = 0x02;
+pub const MAP_SHARED: u32 = 0x01;
+pub const MAP_PRIVATE: u32 = 0x02;
 pub const MAP_ANONYMOUS: u32 = 0x20;
-pub const MAP_FAILED: usize  = usize::MAX;
+pub const MAP_FAILED: usize = usize::MAX;
 
 /// Map `len` bytes of anonymous memory.  Returns the virtual address, or
 /// `MAP_FAILED` on error.  Physical pages are demand-allocated on first touch.
