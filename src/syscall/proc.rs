@@ -1,3 +1,22 @@
+//! # POSIX Process / Thread Syscalls
+//!
+//! This module implements the POSIX-style process and thread
+//! management syscalls (numbers 0, 1, 6, 7, 50–54, 59, 60, 82–89,
+//! 120–122, 135–139). High-level operations like spawn, fork, exec,
+//! wait, and signal handling are defined here.
+//!
+//! ## Process Model
+//!
+//! OpenV has a 1:1 thread model — a [`Process`] is both a process
+//! and a thread. There is no separate `Thread` struct. `tgid` is
+//! the thread group ID, set to the process's own PID by default
+//! (so `gettid() == getpid()`).
+//!
+//! ## Signal Delivery
+//!
+//! Signals are queued in `proc.pending_signals` and delivered on
+//! return to user-space by [`crate::trap::rust_trap_handler`].
+
 use crate::trap::TrapFrame;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -6,6 +25,10 @@ unsafe extern "C" {
     fn __halt_cpu() -> !;
 }
 
+/// Yields the CPU to the next runnable process.
+///
+/// If the run queue is non-empty, the current process is pushed to
+/// the back and [`crate::posix::process::schedule`] is called.
 pub fn sys_yield(_tf: &mut TrapFrame) {
     let mut rq = crate::posix::process::RUN_QUEUE.lock();
     if !rq.is_empty() {
@@ -16,13 +39,28 @@ pub fn sys_yield(_tf: &mut TrapFrame) {
     }
 }
 
+/// Exits the current process with the given status.
+///
+/// Calls [`crate::posix::spawn::exit`] which marks the process as a
+/// zombie, reparents children to init, wakes the parent, and unblocks
+/// any senders. Then schedules the next process.
 pub fn sys_exit(status: usize, _tf: &mut TrapFrame) {
-    crate::println!("Process {} exited with code {}", crate::posix::process::current_pid(), status);
     crate::posix::spawn::exit(crate::posix::process::current_pid(), status as i32);
     crate::posix::process::schedule();
     unsafe { __halt_cpu() }
 }
 
+/// Spawns a new process from a path.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Pointer to a UTF-8 path string in user-space.
+/// * `arg1` (`a1`) - Length of the path string.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// The new child's PID on success, `usize::MAX` on failure.
 pub fn sys_spawn(path_ptr: usize, path_len: usize, tf: &mut TrapFrame) {
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
     if let Ok(path) = core::str::from_utf8(path_bytes) {
@@ -38,6 +76,10 @@ pub fn sys_spawn(path_ptr: usize, path_len: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Spawns a new process with explicit capabilities.
+///
+/// Requires `CAP_SYS_ADMIN`. The child is created with the given
+/// capabilities bitmask instead of inheriting the parent's.
 pub fn sys_spawn_with_caps(path_ptr: usize, path_len: usize, caps: u64, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_SYS_ADMIN == 0 {
@@ -68,6 +110,9 @@ pub fn sys_spawn_with_caps(path_ptr: usize, path_len: usize, caps: u64, tf: &mut
     }
 }
 
+/// Sets the capabilities of a target process.
+///
+/// Requires `CAP_SYS_ADMIN`.
 pub fn sys_privctl(pid: usize, caps: u64, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_SYS_ADMIN == 0 {
@@ -88,8 +133,14 @@ pub fn sys_privctl(pid: usize, caps: u64, tf: &mut TrapFrame) {
     }
 }
 
-
-
+/// Registers a user-space handler for an IRQ.
+///
+/// When the given IRQ fires, the kernel masks it at the PLIC and
+/// sends a hardware interrupt message (source/type = -2) to the
+/// registered PID. The user-space driver is expected to acknowledge
+/// by re-enabling the IRQ via [`sys_irq_enable`].
+///
+/// Requires `CAP_INTERRUPT`.
 pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_INTERRUPT == 0 {
@@ -107,6 +158,9 @@ pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     tf.regs[10] = 0;
 }
 
+/// Re-enables an IRQ at the PLIC for the current HART.
+///
+/// Requires `CAP_INTERRUPT`.
 pub fn sys_irq_enable(arg0: usize, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_INTERRUPT == 0 {
@@ -124,6 +178,9 @@ pub fn sys_irq_enable(arg0: usize, tf: &mut TrapFrame) {
     tf.regs[10] = 0;
 }
 
+/// Forks the current process.
+///
+/// Returns the child's PID in the parent and 0 in the child.
 pub fn sys_fork(tf: &mut TrapFrame) {
     match crate::posix::spawn::sys_fork() {
         Ok(child_pid) => {
@@ -135,6 +192,17 @@ pub fn sys_fork(tf: &mut TrapFrame) {
     }
 }
 
+/// Sets up a user stack with `argv` strings and a pointer array.
+///
+/// Allocates space on the user stack for the argv strings (each
+/// null-terminated), then writes an array of pointers followed by a
+/// NULL terminator. Aligns the stack to 16 bytes.
+///
+/// # Returns
+///
+/// `(argc, argv_ptr, new_sp)` where `argv_ptr` is the address of the
+/// pointer array and `new_sp` is the new stack pointer (with 16-byte
+/// alignment and 16 bytes of extra slack).
 fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
     use crate::posix::spawn::USER_STACK_TOP;
 
@@ -185,6 +253,19 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
     (argc, argv_ptr, sp)
 }
 
+/// Replaces the current process image with a new executable.
+///
+/// Loads the ELF file at `path_ptr`/`path_len` and sets `sepc` to
+/// the entry point. Closes file descriptors with `O_CLOEXEC`. Resets
+/// POSIX signal handlers to `SIG_DFL` per POSIX semantics.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Pointer to a UTF-8 path string.
+/// * `arg1` (`a1`) - Length of the path string.
+/// * `arg2` (`a2`) - Pointer to a NUL-separated argv buffer.
+/// * `arg3` (`a3`) - Argv buffer length (in `tf.regs[13]`).
+/// * `tf` - Caller's trap frame.
 pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: usize, tf: &mut TrapFrame) {
     let argv_buf_len = tf.regs[13]; // a3
 
@@ -208,7 +289,7 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
             {
                 let table = crate::posix::process::PROCESS_TABLE.lock();
                 if let Some(proc) = table.get(&pid) {
-                    *proc.wait_result.lock() = None;
+                    proc.wait_result.lock().clear();
                     *proc.wait_target.lock() = None;
                     // POSIX: user-installed signal handlers are reset to SIG_DFL on exec.
                     // A handler pointer from the old image is unmapped and would fault.
@@ -243,11 +324,16 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
     }
 }
 
+/// `waitpid` option: do not block if no child has exited.
 pub const WNOHANG: usize = 1;
+/// `waitpid` option: report stopped children too.
 pub const WUNTRACED: usize = 2;
 
-/// Free a zombie process's resources, unlink it from the parent's children list,
-/// write the exit status to userspace, and set tf.regs[10] to the reaped PID.
+/// Frees a zombie process's resources, unlinks it from the parent's
+/// children list, writes the exit status to user-space, and sets
+/// `tf.regs[10]` to the reaped PID.
+///
+/// Called from [`sys_waitpid`] when a zombie is found.
 fn reap_zombie(
     zpid: crate::posix::process::Pid,
     zstatus: i32,
@@ -279,7 +365,8 @@ fn reap_zombie(
             }
         }
         let root_pa = (zombie_satp & 0xFFFFFFFFFFF) << 12;
-        if root_pa != 0 {
+        if root_pa != 0 && crate::posix::process::satp_unshare(root_pa) {
+            crate::mm::swap::evict_all(root_pa);
             let _ = crate::mm::vmm::destroy_user_space(root_pa);
         }
     }
@@ -289,6 +376,21 @@ fn reap_zombie(
     tf.regs[10] = zpid as usize;
 }
 
+/// Waits for a child process to exit.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Target: `>0` for a specific PID, `0` for any in
+///   the same process group, `-1` for any child, `<-1` for the
+///   process group `-pid`.
+/// * `arg1` (`a1`) - Pointer to write the exit status to (or null).
+/// * `arg2` (`a2`) - Options: [`WNOHANG`], [`WUNTRACED`].
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// The reaped PID on success, 0 if `WNOHANG` and no child is ready,
+/// or `-1` (`ECHILD`) if there are no matching children.
 pub fn sys_waitpid(target: usize, status_ptr: usize, options: usize, tf: &mut TrapFrame) {
     let target = target as i32;
     let status_ptr = status_ptr as *mut i32;
@@ -296,7 +398,7 @@ pub fn sys_waitpid(target: usize, status_ptr: usize, options: usize, tf: &mut Tr
 
     let delivered = {
         let table = crate::posix::process::PROCESS_TABLE.lock();
-        table.get(&ppid).and_then(|p| p.wait_result.lock().take())
+        table.get(&ppid).and_then(|p| p.wait_result.lock().pop_front())
     };
 
     if let Some((zpid, zstatus)) = delivered {
@@ -377,11 +479,60 @@ pub fn sys_waitpid(target: usize, status_ptr: usize, options: usize, tf: &mut Tr
                 if let Some(proc) = proc_arc {
                     *proc.wait_target.lock() = Some(target);
                     *proc.wait_status_ptr.lock() = Some(status_ptr as usize);
-                    tf.sepc -= 4; 
-                    *proc.state.lock() = crate::posix::process::ProcState::Stopped;
-                    drop(proc);
-                    crate::posix::process::schedule();
-                    unsafe { __halt_cpu() }
+
+                    // TOCTOU double-check: a child may have exited in the window between
+                    // our zombie scan above and setting wait_target just now.  In that
+                    // window exit() saw wait_target==None and skipped the queue push, so
+                    // the zombie is only in the PROCESS_TABLE — find it here before we
+                    // sleep so we never miss an exit.
+                    let raced = {
+                        // First try the queue (exit() may have pushed if it ran *after*
+                        // we set wait_target but before this line).
+                        let q = proc.wait_result.lock().pop_front();
+                        if q.is_some() {
+                            q
+                        } else {
+                            // Fall back to a fresh zombie scan.
+                            let table = crate::posix::process::PROCESS_TABLE.lock();
+                            let mut found = None;
+                            if let Some(parent) = table.get(&ppid) {
+                                let children: alloc::vec::Vec<_> = parent.children.lock().clone();
+                                for child_pid in children {
+                                    let matches = if target > 0 {
+                                        target == child_pid
+                                    } else {
+                                        true // -1 or pgid — accept any
+                                    };
+                                    if matches {
+                                        if let Some(child) = table.get(&child_pid) {
+                                            if let crate::posix::process::ProcState::Zombie(st) =
+                                                *child.state.lock()
+                                            {
+                                                found = Some((child_pid, st));
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            found
+                        }
+                    };
+
+                    if let Some((zpid, zstatus)) = raced {
+                        // Found a zombie in the race window — clear the wait fields
+                        // we just set and reap immediately without sleeping.
+                        *proc.wait_target.lock() = None;
+                        *proc.wait_status_ptr.lock() = None;
+                        drop(proc);
+                        reap_zombie(zpid, zstatus, ppid, status_ptr, tf);
+                    } else {
+                        tf.sepc -= 4;
+                        *proc.state.lock() = crate::posix::process::ProcState::Stopped;
+                        drop(proc);
+                        crate::posix::process::schedule();
+                        unsafe { __halt_cpu() }
+                    }
                 } else {
                     tf.regs[10] = usize::MAX;
                 }
@@ -390,16 +541,20 @@ pub fn sys_waitpid(target: usize, status_ptr: usize, options: usize, tf: &mut Tr
     }
 }
 
+/// Returns the current process's PID.
 pub fn sys_getpid(tf: &mut TrapFrame) {
     tf.regs[10] = crate::posix::process::current_pid() as usize;
 }
 
+/// Returns the parent PID of the current process.
 pub fn sys_getppid(tf: &mut TrapFrame) {
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     tf.regs[10] = proc.ppid.load(Ordering::Relaxed) as usize;
 }
 
+/// Sets the foreground process group and routes the UART ISR to
+/// the target process's controlling TTY.
 pub fn sys_set_fg_pid(arg0: usize, tf: &mut TrapFrame) {
     let pid = arg0 as i32;
     crate::posix::process::FOREGROUND_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
@@ -416,20 +571,28 @@ pub fn sys_set_fg_pid(arg0: usize, tf: &mut TrapFrame) {
     tf.regs[10] = 0;
 }
 
+/// `timeval` structure (seconds + microseconds).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TimeVal {
+    /// Seconds since epoch (CLINT clock at 10 MHz, no real epoch).
     pub tv_sec: i64,
+    /// Microseconds.
     pub tv_usec: i64,
 }
 
+/// `timespec` structure (seconds + nanoseconds).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TimeSpec {
+    /// Seconds.
     pub tv_sec: i64,
+    /// Nanoseconds.
     pub tv_nsec: i64,
 }
 
+/// Returns the current time in CLINT ticks, converted to
+/// seconds/microseconds. The CLINT clock is 10 MHz.
 pub fn sys_gettimeofday(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
     // CLINT clock is 10 MHz: 10,000,000 ticks per second
     let ticks = riscv::register::time::read() as u64;
@@ -444,6 +607,11 @@ pub fn sys_gettimeofday(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
     tf.regs[10] = 0;
 }
 
+/// Sleeps for the given duration, with the wakeup time added to
+/// [`crate::posix::process::SLEEP_QUEUE`].
+///
+/// The current process is marked `Stopped` and the next process
+/// is scheduled.
 pub fn sys_nanosleep(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
     if arg0 == 0 {
         tf.regs[10] = usize::MAX;
@@ -477,6 +645,7 @@ pub fn sys_nanosleep(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
     unsafe { __halt_cpu() }
 }
 
+/// Sets the process group ID of the current process (or child).
 pub fn sys_setpgid(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let mut pid = arg0 as i32;
     let mut pgid = arg1 as i32;
@@ -497,6 +666,7 @@ pub fn sys_setpgid(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Returns the process group ID of the current process.
 pub fn sys_getpgid(arg0: usize, tf: &mut TrapFrame) {
     let mut pid = arg0 as i32;
     crate::get_current_proc_or_esrch!(tf);
@@ -511,6 +681,8 @@ pub fn sys_getpgid(arg0: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Creates a new session with the current process as the leader
+/// and allocates a fresh TTY for the new session.
 pub fn sys_setsid(tf: &mut TrapFrame) {
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
@@ -537,19 +709,37 @@ pub fn sys_setsid(tf: &mut TrapFrame) {
     tf.regs[10] = pid as usize;
 }
 
+/// `sigaction` structure: POSIX signal handler descriptor.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SigAction {
+    /// Signal handler address (`0` for `SIG_DFL`, `1` for `SIG_IGN`).
     pub sa_handler: usize,
+    /// Flags (currently unused).
     pub sa_flags: usize,
+    /// Additional signals to mask during handler execution.
     pub sa_mask: u32,
+    /// Address of the signal restorer trampoline.
     pub sa_restorer: usize,
 }
 
+/// `SIGKILL` signal number (9) — cannot be caught or ignored.
 pub const SIGKILL: usize = 9;
+/// `SIGINT` signal number (2) — terminal interrupt (Ctrl-C).
 pub const SIGINT: usize = 2;
+/// `SIGTERM` signal number (15) — termination request.
 pub const SIGTERM: usize = 15;
 
+/// Sends a signal to a process or process group.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Target: `>0` for a specific PID, `0` for the
+///   caller's process group, `-1` for all processes except init
+///   and self, `<-1` for the process group `-pid`.
+/// * `arg1` (`a1`) - Signal number (0..31). `0` is a permission
+///   check that does not actually deliver.
+/// * `tf` - Caller's trap frame.
 pub fn sys_kill(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     let sig = arg1 as u32;
@@ -590,6 +780,9 @@ pub fn sys_kill(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Sets or queries the signal handler for a given signal.
+///
+/// `SIGKILL` and `SIGSTOP` cannot be caught — returns `EINVAL`.
 pub fn sys_sigaction(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let sig = arg0;
     if sig >= 32 || sig == SIGKILL {
@@ -618,6 +811,12 @@ pub fn sys_sigaction(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
     tf.regs[10] = 0;
 }
 
+/// Returns from a signal handler, restoring the saved trap frame
+/// and signal mask.
+///
+/// `sp` is expected to point at a [`crate::trap::SignalFrame`] that
+/// was pushed by [`crate::trap::rust_trap_handler`] when the signal
+/// was delivered.
 pub fn sys_sigreturn(tf: &mut TrapFrame) {
     // sp points to the SignalFrame we pushed during signal delivery.
     let frame = unsafe { core::ptr::read(tf.regs[2] as *const crate::trap::SignalFrame) };
@@ -637,14 +836,26 @@ pub fn sys_sigreturn(tf: &mut TrapFrame) {
 
 // ── Thread support ─────────────────────────────────────────────────────────────
 
-const CLONE_VM:     u32 = 0x0000_0100; // share address space with parent
-const CLONE_THREAD: u32 = 0x0001_0000; // join parent's thread group
-const CLONE_SETTLS: u32 = 0x0008_0000; // set tp to tls argument
+/// `clone` flag: share address space with parent.
+const CLONE_VM:     u32 = 0x0000_0100;
+/// `clone` flag: join parent's thread group.
+const CLONE_THREAD: u32 = 0x0001_0000;
+/// `clone` flag: set `tp` to the TLS argument.
+const CLONE_SETTLS: u32 = 0x0008_0000;
 
-/// Create a new thread or process.
-/// arg0 = flags (CLONE_VM | CLONE_THREAD | CLONE_SETTLS combinations)
-/// arg1 = new stack pointer for child (0 = inherit parent sp)
-/// arg2 = TLS value loaded into tp (only when CLONE_SETTLS is set)
+/// Creates a new thread or process.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Flags (combinations of `CLONE_VM`, `CLONE_THREAD`,
+///   `CLONE_SETTLS`, and namespace flags).
+/// * `arg1` (`a1`) - New stack pointer for child (`0` = inherit parent sp).
+/// * `arg2` (`a2`) - TLS value loaded into `tp` (only when `CLONE_SETTLS`).
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// The new thread/process PID in the parent, 0 in the child.
 pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     use core::sync::atomic::Ordering;
     let flags = arg0 as u32;
@@ -732,18 +943,29 @@ pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     tf.regs[10] = child_pid as usize;
 }
 
-/// Return the calling thread's TID (equal to its PID in this kernel).
+/// Returns the calling thread's TID (equal to its PID in this kernel).
 pub fn sys_gettid(tf: &mut TrapFrame) {
     tf.regs[10] = crate::posix::process::current_pid() as usize;
 }
 
+/// `futex` op: wait until `*uaddr == val`, atomically.
 const FUTEX_WAIT: usize = 0;
+/// `futex` op: wake up to `val` waiters.
 const FUTEX_WAKE: usize = 1;
 
-/// Minimal futex: FUTEX_WAIT and FUTEX_WAKE.
-/// arg0 = uaddr (user VA of a u32 word)
-/// arg1 = op    (0 = WAIT, 1 = WAKE)
-/// arg2 = val   (for WAIT: expected value; for WAKE: max threads to wake)
+/// Minimal futex implementation supporting `FUTEX_WAIT` and `FUTEX_WAKE`.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - User VA of a `u32` word.
+/// * `arg1` (`a1`) - Op: 0 = `FUTEX_WAIT`, 1 = `FUTEX_WAKE`.
+/// * `arg2` (`a2`) - For `WAIT`: expected value; for `WAKE`: max waiters.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// For `WAIT`: 0 on wake, `EAGAIN` if value mismatch.
+/// For `WAKE`: number of waiters woken.
 pub fn sys_futex(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let uaddr = arg0;
     let op    = arg1;
@@ -801,13 +1023,25 @@ pub fn sys_futex(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
 
 // ── Memory-mapping syscalls (B4) ───────────────────────────────────────────────
 
+/// `mmap` flag: anonymous mapping.
 const MAP_ANONYMOUS: usize = 0x20;
 
-/// syscall 135 — mmap(addr, len, prot, flags, fd, offset)
-/// arg0 = addr, arg1 = len, arg2 = prot, arg3 = flags
-/// fd   = tf.regs[14], offset = tf.regs[15]
+/// Allocates a virtual memory region.
 ///
-/// Supports MAP_ANONYMOUS (fd = -1).  Demand paging fills zero pages on first access.
+/// Supports `MAP_ANONYMOUS` (fd = -1). Demand paging fills zero
+/// pages on first access.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Hint address (or 0 to let the kernel choose).
+/// * `arg1` (`a1`) - Length in bytes.
+/// * `arg2` (`a2`) - Protection flags (currently unused).
+/// * `arg3` (`a3`) - Mapping flags.
+/// * `tf` - Caller's trap frame (fd is in `regs[14]`).
+///
+/// # Returns
+///
+/// The mapped VA on success, `EINVAL` on invalid args.
 pub fn sys_mmap(arg0: usize, arg1: usize, _arg2: usize, arg3: usize, tf: &mut TrapFrame) {
     let len   = arg1;
     let flags = arg3;
@@ -840,7 +1074,13 @@ pub fn sys_mmap(arg0: usize, arg1: usize, _arg2: usize, arg3: usize, tf: &mut Tr
     tf.regs[10] = result_va;
 }
 
-/// syscall 136 — munmap(addr, len)
+/// Unmaps a range of pages.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Address (page-aligned).
+/// * `arg1` (`a1`) - Length in bytes.
+/// * `tf` - Caller's trap frame.
 pub fn sys_munmap(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let addr = arg0;
     let len  = arg1;
@@ -861,8 +1101,16 @@ pub fn sys_munmap(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     tf.regs[10] = 0;
 }
 
-/// syscall 137 — brk(addr)
-/// Returns new program break.  arg0 = 0 queries the current break.
+/// Sets or queries the program break (end of heap).
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - New break, or 0 to query.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// The new break value.
 pub fn sys_brk(arg0: usize, tf: &mut TrapFrame) {
     let proc = match crate::posix::process::get_current_proc() {
         Some(p) => p,
@@ -876,18 +1124,23 @@ pub fn sys_brk(arg0: usize, tf: &mut TrapFrame) {
 
 // ── ABI versioning (C5) ───────────────────────────────────────────────────────
 
-/// Kernel ABI version.  Increment on any incompatible syscall table change.
+/// Kernel ABI version. Increment on any incompatible syscall table change.
 pub const KERNEL_ABI_VERSION: usize = 1;
 
-/// syscall 138 — return the kernel ABI version so user-space can detect mismatches.
+/// Returns the kernel ABI version so user-space can detect mismatches.
 pub fn sys_abi_version(tf: &mut TrapFrame) {
     tf.regs[10] = KERNEL_ABI_VERSION;
 }
 
 // ── Namespace unshare (C3) ────────────────────────────────────────────────────
 
-/// syscall 139 — unshare(flags): detach one or more namespaces from the current process.
-/// Supported flags: CLONE_NEWNS (0x00020000), CLONE_NEWPID (0x20000000), CLONE_NEWNET (0x40000000).
+/// Detaches one or more namespaces from the current process.
+///
+/// Supported flags: `CLONE_NEWNS` (0x00020000), `CLONE_NEWPID`
+/// (0x20000000), `CLONE_NEWNET` (0x40000000).
+///
+/// Currently this is a no-op that records the intent. Full
+/// isolation requires making `Process::ns` a `Mutex<NsSet>`.
 pub fn sys_unshare(arg0: usize, tf: &mut TrapFrame) {
     let _flags = arg0 as u32;
     // Namespace objects are stored inside Process::ns which is not behind a Mutex,

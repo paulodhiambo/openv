@@ -151,15 +151,26 @@ pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                     tf.regs[10] = len;
                 } else {
                     if half.write_open.strong_count() == 0 {
-                        tf.regs[10] = 0; // EOF
+                        tf.regs[10] = 0; // EOF — all write ends already closed
                     } else {
-                        half.waiter.store(crate::posix::process::current_pid(), Ordering::Relaxed);
-                        drop(data);
-                        drop(fds);
-                        drop(proc);
-                        tf.sepc -= 4;
-                        crate::posix::process::schedule();
-                        unsafe { crate::trap::__halt_cpu() }
+                        let pid = crate::posix::process::current_pid();
+                        half.waiter.store(pid, Ordering::Relaxed);
+                        // TOCTOU double-check: the last write half may have been dropped
+                        // in the window between the strong_count check above and the
+                        // waiter registration just now.  If so, the Drop impl saw
+                        // waiter==0 and couldn't wake us — we must detect that here
+                        // rather than sleeping forever.
+                        if half.write_open.strong_count() == 0 {
+                            half.waiter.store(0, Ordering::Relaxed);
+                            tf.regs[10] = 0; // EOF
+                        } else {
+                            drop(data);
+                            drop(fds);
+                            drop(proc);
+                            tf.sepc -= 4;
+                            crate::posix::process::schedule();
+                            unsafe { crate::trap::__halt_cpu() }
+                        }
                     }
                 }
             }

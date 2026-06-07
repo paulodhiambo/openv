@@ -19,6 +19,12 @@ pub fn sys_pipe(arg0: usize, tf: &mut TrapFrame) {
         fds.insert_at(h, crate::ipc::handle::KernelObject::PipeWrite(wh));
         h
     };
+
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const [u32; 2], 1) {
+        tf.regs[10] = usize::MAX;
+        return;
+    }
+
     unsafe {
         let arr = arg0 as *mut [u32; 2];
         (*arr)[0] = h_r;
@@ -70,9 +76,14 @@ pub fn sys_mailbox_send(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFram
         return;
     }
 
-    let mut buf = alloc::vec::Vec::with_capacity(len);
+    // Add bounds checking for ptr
+    if !crate::mm::vmm::is_user_pointer_valid(tf, ptr, len) {
+        tf.regs[10] = usize::MAX;
+        return;
+    }
+
+    let mut buf = alloc::vec![0u8; len];
     unsafe {
-        buf.set_len(len);
         core::ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), len);
     }
 
@@ -101,14 +112,21 @@ pub fn sys_mailbox_receive(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
 
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
-
+    
     let msg = {
         let mut mb = proc.mailbox.lock();
         mb.pop_front()
     };
-
+    
     if let Some((sender, buf)) = msg {
         let copy_len = core::cmp::min(max_len, buf.len());
+
+        // Add bounds checking for ptr
+        if !crate::mm::vmm::is_user_pointer_valid(tf, ptr, copy_len) {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
+
         unsafe {
             core::ptr::copy_nonoverlapping(buf.as_ptr(), ptr, copy_len);
             if !from_ptr.is_null() {
@@ -124,6 +142,7 @@ pub fn sys_mailbox_receive(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
         unsafe { __halt_cpu() }
     }
 }
+
 
 pub fn kernel_send_msg(target_pid: i32, msg: crate::ipc::msg::Message) {
     let table = crate::posix::process::PROCESS_TABLE.lock();
@@ -166,6 +185,13 @@ pub fn sys_ipc_send(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 
     // Read message from userspace
     let mut local_msg: crate::ipc::msg::Message = unsafe { core::mem::zeroed() };
+
+    // Add bounds checking for msg_ptr
+    if !crate::mm::vmm::is_user_pointer_valid(tf, msg_ptr as *const crate::ipc::msg::Message, 1) {
+        tf.regs[10] = usize::MAX;
+        return;
+    }
+
     unsafe {
         core::ptr::copy_nonoverlapping(msg_ptr as *const crate::ipc::msg::Message, &mut local_msg, 1);
     }
@@ -219,6 +245,13 @@ pub fn sys_ipc_receive(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         let mut state = receiver.ipc_state.lock();
         if let crate::posix::process::IpcState::MessageAvailable { msg } = *state {
             let sender_pid = msg.source;
+
+            // Add bounds checking for msg_ptr
+            if !crate::mm::vmm::is_user_pointer_valid(tf, msg_ptr as *mut crate::ipc::msg::Message, 1) {
+                tf.regs[10] = usize::MAX;
+                return;
+            }
+
             unsafe {
                 core::ptr::copy_nonoverlapping(&msg, msg_ptr as *mut crate::ipc::msg::Message, 1);
             }
@@ -239,6 +272,13 @@ pub fn sys_ipc_receive(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         if let Some(pos) = pending.iter().position(|m| from_pid == -1 || from_pid == m.source) {
             let msg = pending.remove(pos).unwrap();
             let sender_pid = msg.source;
+
+            // Add bounds checking for msg_ptr
+            if !crate::mm::vmm::is_user_pointer_valid(tf, msg_ptr as *mut crate::ipc::msg::Message, 1) {
+                tf.regs[10] = usize::MAX;
+                return;
+            }
+
             unsafe {
                 core::ptr::copy_nonoverlapping(&msg, msg_ptr as *mut crate::ipc::msg::Message, 1);
             }
@@ -246,7 +286,7 @@ pub fn sys_ipc_receive(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
             return;
         }
     }
-
+    
     let mut senders = receiver.senders.lock();
     
     // Find a matching sender
@@ -257,7 +297,7 @@ pub fn sys_ipc_receive(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
             break;
         }
     }
-
+    
     if let Some(idx) = found_idx {
         // We have a pending sender!
         let sender_pid = senders.remove(idx).unwrap();
@@ -266,6 +306,13 @@ pub fn sys_ipc_receive(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         
         if let crate::posix::process::IpcState::Sending { msg, reply_msg_ptr, .. } = *sender_state {
             let sender_pid_actual = msg.source; // Should be sender_pid
+
+            // Add bounds checking for msg_ptr
+            if !crate::mm::vmm::is_user_pointer_valid(tf, msg_ptr as *mut crate::ipc::msg::Message, 1) {
+                tf.regs[10] = usize::MAX;
+                return;
+            }
+
             // Copy message to our userspace
             unsafe {
                 core::ptr::copy_nonoverlapping(&msg, msg_ptr as *mut crate::ipc::msg::Message, 1);
@@ -302,6 +349,7 @@ pub fn sys_ipc_receive(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     }
 }
 
+
 pub fn sys_ipc_sendrec(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let to_pid = arg0 as i32;
     let msg_ptr = arg1;
@@ -320,8 +368,7 @@ pub fn sys_ipc_sendrec(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
                 core::ptr::copy_nonoverlapping(&msg, msg_ptr as *mut crate::ipc::msg::Message, 1);
             }
             *state = crate::posix::process::IpcState::None;
-            tf.regs[10] = 0; // Success
-            return;
+            tf.regs[10] = 0;
         }
         crate::posix::process::IpcState::ReceivingReply { .. } => {
             // Spurious wakeup, go back to sleep

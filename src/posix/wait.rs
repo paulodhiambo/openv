@@ -1,8 +1,29 @@
+//! # Wait/Exit Handling
+//!
+//! This module provides wait/exit handling for processes. The
+//! [`poll_waitpid`] function polls for the exit status of a child
+//! process, reaping zombies when they become available.
+
 use crate::posix::process::{PROCESS_TABLE, Pid, ProcState};
 use core::task::{Poll, Waker};
 
 /// Polls for the exit status of a child process.
-/// If `pid` is -1, it waits for any child.
+///
+/// If `target_pid` is `-1`, this function waits for any child. Otherwise,
+/// it waits for the specific child with the given PID.
+///
+/// # Arguments
+///
+/// * `ppid` - The parent process ID.
+/// * `target_pid` - The child PID to wait for, or `-1` for any child.
+/// * `_waker` - A waker for async/await integration (unused in the
+///   current implementation).
+///
+/// # Returns
+///
+/// - `Poll::Ready(Ok((pid, status)))` if a zombie child is found and reaped.
+/// - `Poll::Pending` if no zombie is available yet.
+/// - `Poll::Ready(Err("Parent not found"))` if the parent process doesn't exist.
 pub fn poll_waitpid(
     ppid: Pid,
     target_pid: Pid,
@@ -44,7 +65,23 @@ pub fn poll_waitpid(
     }
 }
 
-/// A fully synchronous waitpid for testing the mock system in kmain.
+/// A fully synchronous `waitpid` for testing the mock system in `kmain`.
+///
+/// # Arguments
+///
+/// * `ppid` - The parent process ID.
+/// * `target_pid` - The child PID to wait for, or `-1` for any child.
+///
+/// # Returns
+///
+/// `Ok((pid, status))` if a zombie child is found and reaped, or
+/// `Err("...")` if no zombie is available.
+///
+/// # Note
+///
+/// This function is intended for testing only. In a real system, the
+/// process would sleep and be woken up by the scheduler when a child
+/// exits.
 pub fn waitpid_sync(ppid: Pid, target_pid: Pid) -> Result<(Pid, i32), &'static str> {
     loop {
         // We simulate polling. In a real system, we'd sleep and be woken up.

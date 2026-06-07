@@ -9,10 +9,16 @@ extern crate alloc;
 use alloc::vec::Vec;
 use device::SmolDevice;
 use smoltcp_adapter::SmolPhyDevice;
-use libos::{sys_yield, try_recv};
+use libos::{gettimeofday, sys_yield, try_recv, TimeVal};
 
 mod allocator;
 use allocator::init_allocator;
+
+fn now_ms() -> i64 {
+    let mut tv = TimeVal { tv_sec: 0, tv_usec: 0 };
+    gettimeofday(&mut tv as *mut TimeVal, core::ptr::null_mut());
+    tv.tv_sec * 1000 + tv.tv_usec / 1000
+}
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::socket::tcp;
@@ -49,7 +55,7 @@ pub extern "C" fn main() -> i32 {
     let mut phy = SmolPhyDevice::new(SmolDevice::new(), 1500);
 
     let config = Config::new(EthernetAddress(OUR_MAC).into());
-    let mut iface = Interface::new(config, &mut phy, Instant::ZERO);
+    let mut iface = Interface::new(config, &mut phy, Instant::from_millis(now_ms()));
     iface.update_ip_addrs(|addrs| {
         addrs.push(IpCidr::new(IpAddress::v4(10, 0, 2, 15), 24)).ok();
     });
@@ -142,7 +148,7 @@ pub extern "C" fn main() -> i32 {
         }
 
         // Poll smoltcp: handles ARP replies, ICMP echo replies, TCP handshakes, TX/RX
-        iface.poll(Instant::ZERO, &mut phy, &mut sockets);
+        iface.poll(Instant::from_millis(now_ms()), &mut phy, &mut sockets);
 
         // Process TX queues for established connections
         for i in 0..proxies.len() {

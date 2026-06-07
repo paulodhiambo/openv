@@ -1,39 +1,127 @@
+//! # VirtIO Virtqueue Implementation
+//!
+//! This module provides a VirtIO virtqueue implementation. Virtqueues
+//! are the mechanism by which the driver and device exchange buffers.
+//!
+//! ## Overview
+//!
+//! A virtqueue consists of three parts:
+//!
+//! - **Descriptor table**: An array of descriptors, each describing a
+//!    buffer (address, length, flags).
+//!  - **Available ring**: A ring of descriptor indices that the driver
+//!    has made available to the device.
+//!  - **Used ring**: A ring of descriptor indices that the device has
+//!    processed and returned to the driver.
+//!
+//! ## Memory Layout
+//!
+//! All three parts are packed into a single 4 KB page (per queue).
+//! The layout is:
+//!
+//! ```text
+//! Descriptor table: size * 16 bytes at offset 0
+//! Available ring:   u16 flags, u16 idx, u16 ring[size], u16 used_event
+//! Used ring:        u32 flags, u32 idx, UsedElem ring[size], u16 avail_event
+//! ```
+//!
+//! ## Concurrency
+//!
+//! The virtqueue uses [`Mutex`] to protect the free list. Raw pointers
+//! are used to reference the shared virtqueue memory, which is
+//! intentionally shared with device hardware. Access is synchronized
+//! by kernel-side locks and the memory region is stable for the
+//! kernel lifetime.
+//!
+//! [`Mutex`]: ../../sync/struct.Mutex.html
+
 use alloc::vec::Vec;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{Ordering, fence};
 use crate::sync::Mutex;
 
+/// Descriptor flag: NEXT. If set, the descriptor chains to the next descriptor.
 const VIRTQ_DESC_F_NEXT: u16 = 1;
+/// Descriptor flag: WRITE. If set, the buffer is writable (device writes to it).
 const VIRTQ_DESC_F_WRITE: u16 = 2;
 
+/// A virtqueue descriptor.
+///
+/// # Fields
+///
+/// * `addr` - Physical address of the buffer.
+/// * `len` - Length of the buffer in bytes.
+/// * `flags` - Descriptor flags ([`VIRTQ_DESC_F_NEXT`], [`VIRTQ_DESC_F_WRITE`]).
+/// * `next` - Index of the next descriptor in the chain (if `F_NEXT` is set).
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Descriptor {
+    /// Physical address of the buffer.
     pub addr: u64,
+    /// Length of the buffer in bytes.
     pub len: u32,
+    /// Descriptor flags.
     pub flags: u16,
+    /// Index of the next descriptor in the chain.
     pub next: u16,
 }
 
+/// A used ring element, written by the device to signal completion.
+///
+/// # Fields
+///
+/// * `id` - Index of the descriptor that was used.
+/// * `len` - Number of bytes written to the buffer.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct UsedElem {
+    /// Index of the descriptor that was used.
     pub id: u32,
+    /// Number of bytes written to the buffer.
     pub len: u32,
 }
 
+/// A virtqueue.
+///
+/// # Fields
+///
+/// * `size` - The number of descriptors in the queue (power-of-two).
+/// * `desc` - Pointer to the descriptor table.
+/// * `avail_flags` - Pointer to the available ring flags.
+/// * `avail_idx` - Pointer to the available ring index.
+/// * `avail_ring` - Pointer to the available ring array.
+/// * `used_flags` - Pointer to the used ring flags.
+/// * `used_idx` - Pointer to the used ring index.
+/// * `used_ring` - Pointer to the used ring array.
+/// * `free_list` - List of free descriptor indices, protected by a [`Mutex`].
+/// * `last_used_idx` - The last used index observed by the driver.
+///
+/// # Safety
+///
+/// `VirtQueue` is `Send` and `Sync` because all access to the shared
+/// memory is synchronized by the contained mutex and the raw pointers
+/// are valid for the kernel lifetime.
 #[allow(dead_code)]
 pub struct VirtQueue {
+    /// The number of descriptors in the queue (power-of-two).
     pub size: usize,
+    /// Pointer to the descriptor table.
     desc: *mut Descriptor,
+    /// Pointer to the available ring flags.
     avail_flags: *mut u16,
+    /// Pointer to the available ring index.
     avail_idx: *mut u16,
+    /// Pointer to the available ring array.
     avail_ring: *mut u16,
-    // Used ring: flags and idx are u16 (not u32) per the virtio spec.
+    /// Pointer to the used ring flags.
     used_flags: *mut u16,
+    /// Pointer to the used ring index.
     used_idx: *mut u16,
+    /// Pointer to the used ring array.
     used_ring: *mut UsedElem,
+    /// List of free descriptor indices, protected by a [`Mutex`].
     free_list: Mutex<Vec<u16>>,
+    /// The last used index observed by the driver.
     last_used_idx: u32,
 }
 
@@ -45,8 +133,16 @@ unsafe impl Send for VirtQueue {}
 unsafe impl Sync for VirtQueue {}
 
 impl VirtQueue {
-    /// Initialize a VirtQueue structure using a page allocated at `page_pa`.
-    /// `size` should be power-of-two and <= 32768.
+    /// Initializes a virtqueue structure using a page allocated at `page_pa`.
+    ///
+    /// # Arguments
+    ///
+    /// * `page_pa` - The physical address of a 4 KB page to use for the queue.
+/// * `size` - The number of descriptors. Should be a power of two and ≤ 32768.
+    ///
+    /// # Returns
+    ///
+    /// A new [`VirtQueue`] instance.
     pub fn new(page_pa: usize, size: usize) -> Self {
         // Layout per legacy virtio spec within a single page:
         // Descriptor table: size * 16 bytes at offset 0
@@ -93,15 +189,33 @@ impl VirtQueue {
         }
     }
 
-    /// Return the descriptor's physical address for a given descriptor index.
+    /// Returns the descriptor's physical address for a given descriptor index.
+    ///
+    /// # Arguments
+    ///
+    /// * `idx` - The descriptor index.
+    ///
+    /// # Returns
+    ///
+    /// The physical address of the buffer described by the descriptor.
     pub fn desc_addr(&self, idx: u16) -> u64 {
         // SAFETY: `self.desc` points to the descriptor table of a PMM-allocated
         // virtqueue page. `idx` is always a valid free-list index (0..size).
         unsafe { (*self.desc.add(idx as usize)).addr }
     }
 
-    /// Enqueue a chain of buffers. Buffers is a slice of (pa, len, write).
-    /// Returns head descriptor index on success.
+    /// Enqueues a chain of buffers.
+    ///
+    /// # Arguments
+    ///
+    /// * `buffers` - A slice of `(physical_address, length, write)` tuples.
+    ///   `write` is `true` for device-writable buffers (RX) and `false` for
+    ///   device-readable buffers (TX).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(head_descriptor_index)` on success, or `Err(())` if there
+    /// are not enough free descriptors.
     pub fn enqueue_chain(&self, buffers: &[(u64, u32, bool)]) -> Result<u16, ()> {
         let mut free = self.free_list.lock();
         if free.len() < buffers.len() {
@@ -149,15 +263,33 @@ impl VirtQueue {
         Ok(ids[0])
     }
 
-    /// Convenience single-buffer enqueue kept for backward compat.
+    /// Convenience single-buffer enqueue kept for backward compatibility.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf_pa` - Physical address of the buffer.
+/// * `len` - Length of the buffer.
+/// * `write` - Whether the buffer is device-writable.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(head_descriptor_index)` on success, or `Err(())` if there
+    /// are not enough free descriptors.
     pub fn enqueue(&self, buf_pa: u64, len: u32, write: bool) -> Result<u16, ()> {
         self.enqueue_chain(&[(buf_pa, len, write)])
     }
 
-    /// Check used ring and pop any completed entries; returns list of (id,len)
-    /// Note: this does NOT free descriptor chain entries — caller should call
-    /// `free_chain` to return descriptors to the free list after handling buffer
-    /// contents.
+    /// Checks the used ring and pops any completed entries.
+    ///
+    /// Note: this does NOT free descriptor chain entries — the caller
+    /// should call [`free_chain`] to return descriptors to the free
+    /// list after handling buffer contents.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(id, len)` tuples for each completed entry.
+    ///
+    /// [`free_chain`]: #method.free_chain
     pub fn pop_used(&mut self) -> Vec<(u16, u32)> {
         // Ensure we observe device writes
         fence(Ordering::Acquire);
@@ -177,8 +309,16 @@ impl VirtQueue {
         out
     }
 
-    /// Walk a descriptor chain starting at `start` and return list of descriptor
-    /// indices in the chain. Also returns vector of (pa,len) for buffers.
+    /// Walks a descriptor chain starting at `start` and returns the list of
+    /// `(physical_address, length)` pairs for each buffer in the chain.
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - The head descriptor index of the chain.
+    ///
+    /// # Returns
+    ///
+    /// A vector of `(physical_address, length)` tuples.
     pub fn read_chain(&self, start: u16) -> Vec<(u64, u32)> {
         let mut out = Vec::new();
         let mut cur = start;
@@ -195,8 +335,16 @@ impl VirtQueue {
         out
     }
 
-    /// Free all descriptors in the chain starting at `start` and return the
+    /// Frees all descriptors in the chain starting at `start` and returns the
     /// list of freed indices.
+    ///
+    /// # Arguments
+    ///
+    /// * `start` - The head descriptor index of the chain.
+    ///
+    /// # Returns
+    ///
+    /// A vector of freed descriptor indices.
     pub fn free_chain(&self, start: u16) -> Vec<u16> {
         let mut freed = Vec::new();
         let mut cur = start;

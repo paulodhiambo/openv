@@ -262,3 +262,69 @@ jobs:
           name: openv-${{ github.ref_name }}-${{ github.sha }}
           path: release-bundle/
           retention-days: 90
+
+  # ── Rustdoc → GitHub Pages (push to main/master only) ───────────────────────
+  docs:
+    name: Rustdocs
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push'
+
+    permissions:
+      pages: write      # deploy to GitHub Pages
+      id-token: write   # OIDC token required by deploy-pages
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        run: rustup show
+
+      - name: Restore Cargo build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-build-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-build-
+
+      # cargo doc picks up .cargo/config.toml automatically, which sets the
+      # riscv64gc-unknown-none-elf target and -Z build-std=core,alloc.
+      - name: Build rustdocs
+        run: |
+          cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: "--default-theme=ayu --cfg docsrs"
+
+      # GitHub Pages needs a root index.html; redirect to the crate entry point.
+      - name: Add root redirect
+        run: |
+          cat > target/riscv64gc-unknown-none-elf/doc/index.html <<'EOF'
+          <!doctype html>
+          <html>
+            <head>
+              <meta charset="utf-8">
+              <meta http-equiv="refresh" content="0; url=openv/index.html">
+              <title>openv docs</title>
+            </head>
+            <body>
+              <p>Redirecting to <a href="openv/index.html">openv docs</a>…</p>
+            </body>
+          </html>
+          EOF
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/riscv64gc-unknown-none-elf/doc
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4

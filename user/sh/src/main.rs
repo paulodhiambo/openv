@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use libos::{
     chdir, close, create, dup, dup2, exec_args, exit, fork, getdents, mkdir, open, pipe, read,
-    set_raw, set_fg_pid, sys_yield, unlink, waitpid, write,
+    set_raw, set_fg_pid, setpgid, sys_yield, unlink, waitpid, write,
 };
 
 const RESET: &[u8] = b"\x1b[0m";
@@ -751,10 +751,16 @@ impl Shell {
             set_raw(0);
             let pid = fork();
             if pid == 0 {
+                // Child: become its own process group leader before exec so
+                // Ctrl+C (set_fg_pid → FOREGROUND_PID == pgid) reaches it.
+                setpgid(0, 0);
                 self.apply_out_redir(&stage.stdout_file);
                 self.apply_in_redir(&stage.stdin_file);
                 self.exec_child(&stage.args);
             } else if pid > 0 {
+                // Parent: mirror setpgid to close the race window, then hand
+                // over the terminal to the child's new process group.
+                setpgid(pid, pid);
                 let mut status = 0i32;
                 set_fg_pid(pid);
                 waitpid(pid, &mut status as *mut i32, 0);
@@ -784,6 +790,7 @@ impl Shell {
 
             let pid = fork();
             if pid == 0 {
+                setpgid(0, 0);
                 // Wire up pipes
                 if prev_read >= 0 {
                     dup2(prev_read, 0);
@@ -817,6 +824,7 @@ impl Shell {
             }
             prev_read = cur_read;
             if pid > 0 {
+                setpgid(pid, pid);
                 pids.push(pid);
             }
         }

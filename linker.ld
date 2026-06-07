@@ -27,8 +27,12 @@ SECTIONS
         PROVIDE(_bss_end = .);
     }
 
-    /* Stack memory space (start aligned to 16 bytes for RISC-V ABI) */
-    . = ALIGN(16);
+    /* Primary HART kernel stack with guard page below it.
+     * Stack grows downward toward _stack_start; _stack_guard is a 4KB canary
+     * region that is checked on each scheduler switch to detect overflow. */
+    . = ALIGN(4096);
+    PROVIDE(_stack_guard_start = .);
+    . += 0x1000; /* 4KB guard region */
     PROVIDE(_stack_start = .);
     . += 0x8000; /* 32KB stack */
     PROVIDE(_stack_end = .);

@@ -1,24 +1,126 @@
+//! # Virtual Memory Manager (VMM)
+//!
+//! This module provides the virtual memory manager (VMM) for OpenV.
+//! The VMM is responsible for setting up and managing the RISC-V
+//! Sv39 page tables, which translate virtual addresses to physical
+//! addresses.
+//!
+//! ## Overview
+//!
+//! OpenV uses the RISC-V Sv39 paging mode, which supports 39-bit
+//! virtual addresses (512 GB virtual address space) organized as
+//! a three-level page table hierarchy:
+//!
+//! - **L2** (root): 512 entries, each pointing to an L1 table
+//!  - **L1**: 512 entries, each pointing to an L0 table
+//!  - **L0** (leaf): 512 entries, each mapping a 4 KB page
+//!
+//! Each page table entry (PTE) is 8 bytes and contains:
+//! - **PPN** (bits 10-53): Physical page number
+//!  - **Flags** (bits 0-7): V (valid), R (read), W (write), X (execute),
+//!    U (user), G (global), A (accessed), D (dirty)
+//!
+//! ## PTE Flags
+//!
+//! The following flag constants are defined:
+//! - [`PTE_V`]: Valid
+//!  - [`PTE_R`]: Readable
+//!  - [`PTE_W`]: Writable
+//!  - [`PTE_X`]: Executable
+//!  - [`PTE_U`]: User-accessible
+//!
+//! ## Kernel Mapping
+//!
+//! The kernel is identity-mapped in the first 4 GB of physical address
+//! space using 1 GB mega-pages (indices 0-3 in the root page table).
+//! This covers the UART MMIO at `0x1000_0000` and RAM at `0x8000_0000`.
+//!
+//! ## User Mapping
+//!
+//! User processes live above the 4 GB kernel identity map and below the
+//! Sv39 upper canonical boundary (`0x0000_8000_0000_0000`). The VMM
+//! provides functions for:
+//!
+//! - **Mapping pages**: [`PageTable::map_page`]
+//!  - **Walking page tables**: [`PageTable::walk_page_table`]
+//!  - **Cloning user space** (fork): [`clone_user_space`]
+//!  - **Destroying user space** (exit): [`destroy_user_space`]
+//!  - **Handling page faults**: [`handle_user_page_fault`],
+//!    [`handle_store_page_fault`]
+//!  - **Unmapping ranges**: [`unmap_range`]
+//!
+//! ## Copy-on-Write (COW)
+//!
+//! When a process forks, the user space is cloned using copy-on-write.
+//! Both parent and child initially share the same physical pages with
+//! the write bit cleared. When either process writes to a COW page, a
+//! page fault triggers [`handle_store_page_fault`], which allocates a
+//! new page, copies the data, and updates the PTE.
+//!
+//! ## Demand Paging and Swap
+//!
+//! User pages are demand-paged. When a process accesses an unmapped
+//! page, [`handle_user_page_fault`] is called, which:
+//!
+//! 1. Checks if the page was previously swapped out (via
+//!    [`crate::mm::swap::lookup_swap`]) and restores it.
+//! 2. Otherwise, allocates a fresh zeroed page and maps it.
+//!
+//! ## Safety
+//!
+//! The VMM uses unsafe operations extensively to manipulate page
+//! tables. All unsafe operations are carefully documented with safety
+//! preconditions and postconditions.
+
 use crate::mm::pmm::alloc_frame;
 use crate::println;
 use core::arch::asm;
 use riscv::register::satp;
 
+/// PTE Valid flag. If set, the PTE is valid.
 pub const PTE_V: usize = 1 << 0;
+/// PTE Readable flag. If set, the page can be read.
 pub const PTE_R: usize = 1 << 1;
+/// PTE Writable flag. If set, the page can be written.
 pub const PTE_W: usize = 1 << 2;
+/// PTE Executable flag. If set, the page can be executed.
 pub const PTE_X: usize = 1 << 3;
+/// PTE User-accessible flag. If set, the page is accessible from U-mode.
 pub const PTE_U: usize = 1 << 4;
 
+/// A page table with 512 entries.
+///
+/// This is a 4 KB structure that contains 512 8-byte page table entries.
+/// It is aligned to 4 KB to ensure that it can be used as a page table.
 #[repr(C, align(4096))]
 pub struct PageTable {
+    /// The 512 page table entries.
     pub entries: [usize; 512],
 }
 
 impl PageTable {
+    /// Creates a new empty page table with all entries set to zero.
     pub const fn new() -> Self {
         PageTable { entries: [0; 512] }
     }
 
+    /// Creates a new process page table with kernel identity mapping.
+    ///
+    /// This function:
+    /// 1. Allocates a new root page table.
+/// 2. Identity-maps the first 4 GB of physical address space using
+    ///    1 GB mega-pages (indices 0-3).
+    /// 3. Returns the physical address of the root page table.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(root_pa)` with the physical address of the new root page
+    /// table, or an error if memory allocation fails.
+    ///
+    /// # Safety
+    ///
+    /// The returned page table has kernel identity mappings set up.
+    /// User mappings must be added separately via [`PageTable::map_page`].
     pub fn new_process_table() -> Result<usize, &'static str> {
         let root_page = alloc_frame().ok_or("Out of memory")?.into_raw();
         // SAFETY:
@@ -37,6 +139,25 @@ impl PageTable {
     }
 
     /// Maps a 4KB page at the given virtual address to the given physical address.
+    ///
+    /// # Arguments
+    ///
+    /// * `va` - The virtual address to map. Must be 4 KB-aligned.
+    /// * `pa` - The physical address to map to. Must be 4 KB-aligned.
+    /// * `flags` - The PTE flags (a combination of [`PTE_V`], [`PTE_R`],
+    ///   [`PTE_W`], [`PTE_X`], [`PTE_U`]).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success, or an error if:
+    /// - Memory allocation fails while creating intermediate page tables.
+    /// - The page is already mapped.
+    ///
+    /// # Implementation
+    ///
+    /// This function walks the page table hierarchy from L2 to L0,
+    /// allocating intermediate page tables as needed. If a leaf PTE
+    /// is already valid, the function returns an error.
     pub fn map_page(&mut self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
         let vpn = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
 
@@ -67,8 +188,23 @@ impl PageTable {
         Ok(())
     }
 
-    /// Walk the page table to find the physical address and flags for a given virtual address.
-    /// Returns `(physical_address, flags)` or an error if unmapped or not a leaf.
+    /// Walks the page table to find the physical address and flags for a given virtual address.
+    ///
+    /// # Arguments
+    ///
+    /// * `root_pa` - The physical address of the root page table.
+    /// * `va` - The virtual address to look up.
+    ///
+    /// # Returns
+    ///
+    /// `Ok((physical_address, flags))` on success, or an error if:
+    /// - The virtual address is unmapped.
+    /// - A huge page is encountered (not supported).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `root_pa` is a valid page table
+    /// root physical address.
     pub fn walk_page_table(root_pa: usize, va: usize) -> Result<(usize, usize), &'static str> {
         let vpn = [(va >> 12) & 0x1FF, (va >> 21) & 0x1FF, (va >> 30) & 0x1FF];
 
@@ -100,8 +236,26 @@ impl PageTable {
     }
 }
 
-/// Clone user portions of a parent's page table into a child page table, making pages copy-on-write.
-/// parent_root_pa and child_root_pa are physical addresses of the root page tables.
+/// Clones the user portions of a parent's page table into a child page table, making pages copy-on-write.
+///
+/// `parent_root_pa` and `child_root_pa` are physical addresses of the root page tables.
+///
+/// # Arguments
+///
+/// * `parent_root_pa` - The physical address of the parent's root page table.
+/// * `child_root_pa` - The physical address of the child's root page table.
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if memory allocation fails.
+///
+/// # Safety
+///
+/// The caller must ensure that:
+/// - `parent_root_pa` and `child_root_pa` are valid, 4 KB-aligned
+///   physical addresses of page tables owned by the respective processes.
+/// - The parent's page table is not concurrently modified (the caller
+///   should hold the process lock).
 pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(), &'static str> {
     use crate::mm::pmm;
 
@@ -179,8 +333,26 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
     unsafe { clone_level(parent_root_pa, child_root_pa, 2) }
 }
 
-/// Handle store page fault at given virtual address in the currently active page table.
-/// Perform copy-on-write if the page is a user mapping that is currently read-only.
+/// Handles a store page fault at the given virtual address in the currently active page table.
+///
+/// Performs copy-on-write if the page is a user mapping that is currently read-only.
+///
+/// # Arguments
+///
+/// * `root_pa` - The physical address of the active root page table.
+/// * `fault_va` - The faulting virtual address.
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if:
+/// - The faulting address is not a COW candidate.
+/// - Memory allocation fails.
+/// - The page is an unmanaged physical page (e.g., MMIO).
+///
+/// # Safety
+///
+/// The caller must ensure that `root_pa` is a valid page table root
+/// physical address (typically read from the active `SATP` CSR).
 pub fn handle_store_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'static str> {
     use crate::mm::pmm;
 
@@ -247,11 +419,10 @@ pub fn handle_store_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'
             pmm::free_page(pa);
         }
 
-        // Flush TLB to make the new writable PTE visible to the CPU.
-        // SAFETY:
-        // Preconditions: Process is in supervisor mode.
-        // Postconditions: Executes the `sfence.vma` instruction to flush the TLB, ensuring the new PTE is visible.
+        // Flush local TLB, then IPI all other HARTs so they also flush.
+        // SAFETY: sfence.vma is a privileged instruction valid in S-mode.
         unsafe { core::arch::asm!("sfence.vma") };
+        crate::smp::send_ipi_all();
 
         Ok(())
     } else {
@@ -302,6 +473,26 @@ unsafe fn destroy_level(pt_pa: usize, level: usize) {
     }
 }
 
+/// Destroys the user space of a process, freeing all user pages and page table pages.
+///
+/// The kernel identity mappings (indices 0-3 in the root page table) are
+/// preserved. The root page table itself is freed.
+///
+/// # Arguments
+///
+/// * `root_pa` - The physical address of the root page table to destroy.
+///
+/// # Returns
+///
+/// `Ok(())` on success.
+///
+/// # Safety
+///
+/// The caller must ensure that:
+/// - `root_pa` is the physical address of the root page table for a
+///   process that is currently exiting.
+/// - The process has been removed from the scheduler so no concurrent
+///   access is possible.
 pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
     // Walk levels and free user mappings and page-table pages (but keep kernel identity entries if present)
     // SAFETY: `root_pa` is the physical address of the root page table for a
@@ -347,7 +538,25 @@ pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
     }
 }
 
-/// Handle an instruction or load page fault in user space by lazily allocating a zero page.
+/// Handles an instruction or load page fault in user space by lazily allocating a zero page.
+///
+/// # Arguments
+///
+/// * `root_pa` - The physical address of the active root page table.
+/// * `fault_va` - The faulting virtual address.
+///
+/// # Returns
+///
+/// `Ok(())` on success, or an error if:
+/// - The faulting address is in kernel space.
+/// - The faulting address is in the kernel identity map region.
+/// - The page was previously swapped out and swap-in failed.
+/// - Memory allocation fails.
+///
+/// # Safety
+///
+/// The caller must ensure that `root_pa` is a valid page table root
+/// physical address (typically read from the active `SATP` CSR).
 pub fn handle_user_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'static str> {
     use crate::mm::pmm::PAGE_SIZE;
     // Reject anything in the upper canonical half (kernel space in Sv39)
@@ -378,24 +587,35 @@ pub fn handle_user_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'s
     match pt.map_page(page_va, frame.pa(), PTE_R | PTE_W | PTE_U) {
         Ok(()) => {
             frame.into_raw(); // Ownership transferred to PTE
-            // SAFETY: sfence.vma is a privileged instruction valid in S-mode.
+            // Flush local TLB then IPI all other HARTs.
             unsafe { core::arch::asm!("sfence.vma") };
+            crate::smp::send_ipi_all();
             Ok(())
         }
         Err(_) => {
             // Page was already mapped (e.g., a concurrent fault race).
             // `frame` drops here, automatically freeing the physical page.
-            // SAFETY:
-            // Preconditions: Process is in supervisor mode.
-            // Postconditions: Flushes the TLB so the new mapping or concurrent update is visible.
             unsafe { core::arch::asm!("sfence.vma") };
+            crate::smp::send_ipi_all();
             Ok(())
         }
     }
 }
 
-/// Unmap all 4 KB pages in `[va_start, va_start+len)` from `root_pa`.
+/// Unmaps all 4 KB pages in `[va_start, va_start+len)` from `root_pa`.
+///
 /// Managed physical pages are freed when their ref-count drops to zero.
+///
+/// # Arguments
+///
+/// * `root_pa` - The physical address of the root page table.
+/// * `va_start` - The start of the virtual address range to unmap.
+/// * `len` - The length of the virtual address range to unmap.
+///
+/// # Safety
+///
+/// The caller must ensure that `root_pa` is a valid page table root
+/// physical address.
 pub fn unmap_range(root_pa: usize, va_start: usize, len: usize) {
     use crate::mm::pmm;
     let page_size = pmm::PAGE_SIZE;
@@ -435,8 +655,55 @@ pub fn unmap_range(root_pa: usize, va_start: usize, len: usize) {
         }
         va += page_size;
     }
+    // Send IPI to all harts for TLB shootdown
+    crate::smp::send_ipi_all();
+    // Flush TLB on this hart
+    unsafe { core::arch::asm!("sfence.vma") };
 }
 
+
+/// Validates that `[ptr, ptr + count * size_of::<T>())` lies entirely within
+/// the user-space virtual address window and is not null.
+///
+/// Does NOT verify that the pages are actually mapped; call sites must ensure
+/// the faulting path is handled or walk the page table separately.
+///
+/// # Arguments
+///
+/// * `_tf` - The trap frame (unused, but kept for API consistency).
+/// * `ptr` - The pointer to validate.
+/// * `count` - The number of elements of type `T`.
+///
+/// # Returns
+///
+/// `true` if the pointer and count describe a valid user-space range,
+/// `false` otherwise.
+pub fn is_user_pointer_valid<T>(
+    _tf: &crate::trap::TrapFrame,
+    ptr: *const T,
+    count: usize,
+) -> bool {
+    if ptr.is_null() {
+        return false;
+    }
+    let byte_len = core::mem::size_of::<T>().saturating_mul(count);
+    let start = ptr as usize;
+    let end = start.saturating_add(byte_len);
+    // User processes live above the 4 GB kernel identity map and below the
+    // Sv39 upper canonical boundary (0x0000_8000_0000_0000).
+    start >= 0x1_0000_0000 && end <= 0x0000_8000_0000_0000
+}
+
+/// Initializes the virtual memory manager.
+///
+/// This function:
+/// 1. Allocates a root page table for the kernel.
+/// 2. Identity-maps the first 4 GB of physical address space.
+/// 3. Enables Sv39 paging by writing the `SATP` CSR.
+/// 4. Flushes the TLB.
+///
+/// This should be called once during kernel boot, after the PMM is
+/// initialized.
 pub fn init() {
     let root_page = alloc_frame().expect("Failed to allocate root page table").into_raw();
     // SAFETY: `ROOT_PAGE_TABLE` is only written here during single-threaded

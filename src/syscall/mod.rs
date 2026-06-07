@@ -1,12 +1,53 @@
+//! # Syscall Dispatch
+//!
+//! This module is the entry point for all system calls. When a user-space
+//! process executes `ecall`, the trap handler ([`crate::trap::rust_trap_handler`])
+//! reads the syscall number from `a7` and the first four arguments from
+//! `a0`–`a3`, then calls [`dispatch`].
+//!
+//! ## Syscall Convention
+//!
+//! - Syscall number in `a7`
+//! - Arguments in `a0`, `a1`, `a2`, `a3`, and `a4`
+//! - Return value placed in `a0` (trap frame `regs[10]`)
+//! - `sepc` has been advanced past the `ecall` instruction by the trap
+//!   handler (so the process resumes after the ecall).
+//!
+//! ## Syscall Categories
+//!
+//! | Module   | Range  | Description                       |
+//! |----------|--------|-----------------------------------|
+//! | `pm`     | 100–109| Process/VM management primitives  |
+//! | `proc`   | 0–1, 50–89, 120–122 | POSIX process/signal control |
+//! | `fs`     | 2, 5, 9, 55–56, 63–65, 110–113, 130–131 | File & FS operations |
+//! | `ipc`    | 3, 57–58, 61–62, 81, 90–93 | IPC & fd ops |
+//! | `net`    | 10–11, 40–49 | Networking & sockets |
+//! | `user`   | 23–24, 30–35 | User/credential ops |
+//! | `tty`    | 37–38 | TTY mode control |
+//! | `trace`  | 140–142 | eBPF-compatible tracepoints |
+//!
+//! ## Error Convention
+//!
+//! All syscalls return a negative error code on failure. The negative
+//! value is `-errno` (e.g., `-1` for `EPERM`, `-2` for `ENOENT`, etc.).
+//! See [`crate::errno`].
+
 use crate::trap::TrapFrame;
 
+/// Macro to fetch the current process, or return `ESRCH` to user-space
+/// if no current process is found.
+///
+/// On `Err` branch, this macro sets `a0 = ESRCH` and advances `sepc`
+/// past the `ecall` and returns from the enclosing function. This is
+/// a shorthand for the common pattern at the top of syscalls that
+/// manipulate the current process.
 #[macro_export]
 macro_rules! get_current_proc_or_esrch {
     ($tf:expr) => {
-        match crate::posix::process::get_current_proc() {
+        match $crate::posix::process::get_current_proc() {
             Some(p) => p,
             None => {
-                $tf.regs[10] = crate::errno::ESRCH;
+                $tf.regs[10] = $crate::errno::ESRCH;
                 $tf.sepc += 4;
                 return;
             }
@@ -22,6 +63,20 @@ pub mod tty;
 pub mod user;
 pub mod pm;
 
+/// Dispatches a system call to the appropriate handler.
+///
+/// This function is called by [`crate::trap::rust_trap_handler`] with
+/// the syscall number and arguments extracted from the trap frame. It
+/// matches the syscall number to a handler and invokes it. Unknown
+/// syscall numbers return `usize::MAX` in `a0` (and print a message
+/// to the kernel log).
+///
+/// # Arguments
+///
+/// * `syscall_num` - Syscall number (from `a7`).
+/// * `arg0`–`arg3` - First four arguments (from `a0`–`a3`).
+/// * `tf` - The trap frame of the calling process. Handlers write the
+///   return value to `tf.regs[10]`.
 pub fn dispatch(
     syscall_num: usize,
     arg0: usize,

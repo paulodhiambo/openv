@@ -44,12 +44,13 @@ park:
 1:
     lb t1, (t0)
     beqz t1, 1b
-    # Compute stack top: SECONDARY_STACKS[hartid * 16384 .. +16384]
+    # Compute stack top: HartStack is [4096-guard][16384-stack], total 20480 bytes.
+    # sp = &SECONDARY_STACKS[hartid].stack[16384]  (top of usable stack)
     la   t0, SECONDARY_STACKS
-    li   t1, 16384
-    mul  t2, s0, t1          # hartid * 16384 bytes
-    add  t0, t0, t2          # base of this hart's stack area
-    add  sp, t0, t1          # stack top = base + 16384
+    li   t1, 20480           # sizeof(HartStack) = 4096 + 16384
+    mul  t2, s0, t1          # hartid * 20480 bytes
+    add  t0, t0, t2          # base of this hart's HartStack
+    add  sp, t0, t1          # sp = base + 20480 (top of stack field)
     mv   tp, s0              # tp = hartid (S-mode per-hart ID)
     mv   a0, s0              # a0 = hartid
     mv   a1, s1              # a1 = dtb_ptr

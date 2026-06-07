@@ -1,42 +1,118 @@
+//! # ELF Binary Loader
+//!
+//! This module provides an ELF (Executable and Linkable Format) binary
+//! loader. ELF is the standard executable format on Unix-like systems,
+//! including Linux and OpenV.
+//!
+//! ## Overview
+//!
+//! The loader supports the 64-bit RISC-V ELF format with the following
+//! features:
+//!
+//! - **PT_LOAD segments**: Loadable program segments are mapped into
+//!    the process's page table.
+//!  - **Read/Write/Execute flags**: Segment permissions are translated
+//!    to PTE flags.
+//!  - **Bounds checking**: All accesses to the binary data are bounds-checked
+//!    to prevent out-of-bounds reads.
+//!
+//! ## Limitations
+//!
+//! - Only `PT_LOAD` segments are processed.
+//! - Dynamic linking is not supported (no PT_INTERP, PT_DYNAMIC).
+//! - No support for section headers or relocations.
+
 use crate::mm::pmm::{PAGE_SIZE, alloc_frame};
 use crate::mm::vmm::{PTE_R, PTE_U, PTE_W, PTE_X, PageTable};
+
+/// ELF file header (64-bit).
 #[repr(C)]
 struct ElfHeader {
+    /// ELF identification (magic number, class, data encoding, etc.).
     ident: [u8; 16],
+    /// Object file type (2 = executable, 3 = shared object).
     type_: u16,
+    /// Target architecture (243 = RISC-V).
     machine: u16,
+    /// ELF version.
     version: u32,
+    /// Virtual address of the entry point.
     entry: u64,
+    /// Offset of the program header table.
     phoff: u64,
+    /// Offset of the section header table.
     shoff: u64,
+    /// Processor-specific flags.
     flags: u32,
+    /// Size of the ELF header.
     ehsize: u16,
+    /// Size of a program header entry.
     phentsize: u16,
+    /// Number of program header entries.
     phnum: u16,
+    /// Size of a section header entry.
     shentsize: u16,
+    /// Number of section header entries.
     shnum: u16,
+    /// Index of the section header string table.
     shstrndx: u16,
 }
 
+/// ELF program header (64-bit).
 #[repr(C)]
 struct ProgramHeader {
+    /// Segment type (1 = PT_LOAD).
     type_: u32,
+    /// Segment flags (PF_X, PF_W, PF_R).
     flags: u32,
+    /// Offset of the segment in the file.
     offset: u64,
+    /// Virtual address of the segment in memory.
     vaddr: u64,
+    /// Physical address (unused on most systems).
     paddr: u64,
+    /// Size of the segment in the file.
     filesz: u64,
+    /// Size of the segment in memory.
     memsz: u64,
+    /// Alignment requirement.
     align: u64,
 }
 
+/// Program header type: Loadable segment.
 const PT_LOAD: u32 = 1;
+/// Segment flag: Executable.
 const PF_X: u32 = 1;
+/// Segment flag: Writable.
 const PF_W: u32 = 2;
+/// Segment flag: Readable.
 const PF_R: u32 = 4;
 
 /// Loads an ELF binary from a byte slice into the given page table.
-/// Returns the entry point address.
+///
+/// This function parses the ELF header and program headers, allocates
+/// physical pages for each `PT_LOAD` segment, copies the file data
+/// into those pages, and maps them into the page table.
+///
+/// # Arguments
+///
+/// * `data` - The ELF binary data.
+/// * `page_table` - The page table to load the binary into.
+///
+/// # Returns
+///
+/// `Ok(entry_point)` with the virtual address of the entry point on
+/// success, or an error if:
+/// - The data is too small to be an ELF file.
+/// - The ELF magic number is wrong.
+/// - The program header table is malformed.
+/// - A segment extends past the end of the file.
+/// - Memory allocation fails.
+///
+/// # Safety
+///
+/// The caller must ensure that `data` points to valid memory containing
+/// a valid ELF binary.
 pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'static str> {
     if data.len() < core::mem::size_of::<ElfHeader>() {
         return Err("File too small");

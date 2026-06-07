@@ -1,6 +1,43 @@
+//! # Process / VM Management Syscalls
+//!
+//! This module implements low-level process and virtual memory
+//! management syscalls (numbers 100–109). These are the primitive
+//! syscalls used by the `pm` (process manager) server. Regular
+//! POSIX-style process operations live in [`crate::syscall::proc`].
+//!
+//! ## Capability Gating
+//!
+//! All syscalls in this module require the calling process to have
+//! `CAP_PROCESS` or `CAP_SYS_ADMIN` (depending on the operation). If
+//! the caller does not have the required capability, the syscall
+//! returns `EPERM`. See [`crate::posix::process`] for the capability
+//! bit definitions.
+
 use crate::trap::TrapFrame;
 use core::sync::atomic::Ordering;
 
+/// Clones the address space of a target process into a new process.
+///
+/// Creates a [`Process`] with `target_pid` as the parent and copies
+/// the parent's user-space page tables (with copy-on-write) into the
+/// child. The child's trap frame is a copy of the parent's so the
+/// child can resume at the same instruction. The child's IPC state
+/// is also copied (so it can expect a reply if the parent was in a
+/// send-receive state).
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Target parent PID to clone from.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// The new child's PID is written to `tf.regs[10]`. On failure,
+/// `usize::MAX` is written.
+///
+/// # Capability
+///
+/// Requires `CAP_PROCESS`.
 pub fn sys_clone_process(arg0: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     if let Some(proc) = crate::posix::process::get_current_proc() {
@@ -47,6 +84,26 @@ pub fn sys_clone_process(arg0: usize, tf: &mut TrapFrame) {
     tf.regs[10] = child_pid as usize;
 }
 
+/// Sets the trap frame of a target process (used to start execution
+/// at a specific address with a specific register state).
+///
+/// Copies the trap frame at `arg1` (a user-space pointer) into the
+/// target process's saved trap frame. The target's `kernel_sp` is
+/// preserved.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Target PID.
+/// * `arg1` (`a1`) - Pointer to a [`TrapFrame`] in user-space.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// 0 on success, `usize::MAX` on failure.
+///
+/// # Capability
+///
+/// Requires `CAP_PROCESS` or `CAP_SYS_ADMIN`.
 pub fn sys_set_trapframe(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     let tf_ptr = arg1 as *const TrapFrame;
@@ -70,6 +127,21 @@ pub fn sys_set_trapframe(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Sets the run state of a target process.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Target PID.
+/// * `arg1` (`a1`) - State: 0 = Stopped, 1 = Runnable.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// 0 on success, `usize::MAX` on failure.
+///
+/// # Capability
+///
+/// Requires `CAP_PROCESS`.
 pub fn sys_set_process_state(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     let state = arg1; // 0 = Stopped, 1 = Runnable
@@ -96,6 +168,25 @@ pub fn sys_set_process_state(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Destroys the user-space of a target process and gives it a new
+/// empty page table.
+///
+/// Allocates a new page table via [`crate::mm::vmm::PageTable::new_process_table`]
+/// and replaces the target process's `satp`. Then destroys the old
+/// user-space.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Target PID.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// 0 on success, `usize::MAX` on failure.
+///
+/// # Capability
+///
+/// Requires `CAP_PROCESS` or `CAP_SYS_ADMIN`.
 pub fn sys_destroy_user_space(arg0: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     if let Some(proc) = crate::posix::process::get_current_proc() {
@@ -122,6 +213,22 @@ pub fn sys_destroy_user_space(arg0: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Allocates a single user page at the given VA with the given flags.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Target PID.
+/// * `arg1` (`a1`) - Virtual address to map. Must be page-aligned.
+/// * `arg2` (`a2`) - Mapping flags (PTE bits).
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// 0 on success, `usize::MAX` on failure.
+///
+/// # Capability
+///
+/// Requires `CAP_PROCESS` or `CAP_SYS_ADMIN`.
 pub fn sys_alloc_user_page(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     let va = arg1;
@@ -156,6 +263,25 @@ pub fn sys_alloc_user_page(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
     }
 }
 
+/// Reaps a zombie process, freeing its kernel stack and user-space.
+///
+/// The process must already be in the [`crate::posix::process::ProcState::Zombie`]
+/// state. Reaping a running process would free its kernel stack
+/// while another HART may be executing on it, which is unsafe.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Target PID to reap.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// 0 on success, `usize::MAX` on failure, `ESRCH` if the target is
+/// not a zombie.
+///
+/// # Capability
+///
+/// Requires `CAP_PROCESS`.
 pub fn sys_reap_process(arg0: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     if let Some(proc) = crate::posix::process::get_current_proc() {
@@ -208,6 +334,29 @@ pub fn sys_reap_process(arg0: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Maps a range of physical memory into the current process's user
+/// address space.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Virtual address. Must be page-aligned.
+/// * `arg1` (`a1`) - Physical address. Must be page-aligned.
+/// * `arg2` (`a2`) - Length in bytes. Must be page-aligned.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// The mapped VA on success, `usize::MAX` on failure.
+///
+/// # Capability
+///
+/// Requires `CAP_MMIO`.
+///
+/// # Safety
+///
+/// This syscall exposes physical memory to user-space. Drivers that
+/// need to access MMIO registers use this syscall. Pages are mapped
+/// as `R | W | U`.
 pub fn sys_phys_map(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let va = arg0;
     let pa = arg1;
@@ -244,6 +393,18 @@ pub fn sys_phys_map(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     tf.regs[10] = va;
 }
 
+/// Walks the page table to translate a virtual address to a physical
+/// address in the current process.
+///
+/// # Arguments
+///
+/// * `arg0` (`a0`) - Virtual address to translate.
+/// * `tf` - Caller's trap frame.
+///
+/// # Returns
+///
+/// The physical address on success, `usize::MAX` if the VA is not
+/// mapped.
 pub fn sys_virt_to_phys(arg0: usize, tf: &mut TrapFrame) {
     let va = arg0;
     crate::get_current_proc_or_esrch!(tf);

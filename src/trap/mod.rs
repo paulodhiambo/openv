@@ -1,3 +1,48 @@
+//! # Trap Handling
+//!
+//! This module provides trap (exception and interrupt) handling for
+//! OpenV. Traps are the mechanism by which the CPU transfers control
+//! to the kernel in response to synchronous exceptions (e.g., page
+//! faults, ecall) or asynchronous interrupts (e.g., timer, external).
+//!
+//! ## Overview
+//!
+//! The trap handler is defined in assembly (`trap_vector`) and dispatches
+//! to [`rust_trap_handler`], which handles:
+//!
+//! - **User ecall** (exception 8): System calls, dispatched via
+//!    [`crate::syscall::dispatch`].
+//!  - **Page faults** (exceptions 12, 13, 15): Handled via
+//!    [`page_fault::handle_page_fault`].
+//!  - **Interrupts** (1, 5, 9, 11): Handled via
+//!    [`interrupt::handle_interrupt`].
+//!  - **Other exceptions**: Misaligned access, illegal instruction, etc.
+//!  - **Signal delivery**: Before returning to user-space, any pending
+//!    signals are delivered via the user's signal handler.
+//!
+//! ## Trap Frame
+//!
+//! The [`TrapFrame`] structure holds the saved register state of a
+//! process when it was trapped. The trap handler saves all 32 general-purpose
+//! registers, `sepc`, and `sstatus`. The `kernel_sp` field is used to
+//! switch to the kernel stack.
+//!
+//! ## Signal Delivery
+//!
+//! Before returning to user-space, the trap handler checks for pending
+//! signals. If a signal is pending and not blocked, the handler:
+//! 1. Saves the current trap frame on the user stack.
+//! 2. Sets `sepc` to the signal handler address.
+//! 3. Sets `regs[1]` (ra) to the signal restorer address.
+//! 4. Updates the blocked signals mask.
+//! 5. Returns to user-space, which will execute the signal handler.
+//!
+//! ## Server PIDs
+//!
+//! The module tracks the PIDs of the VFS server ([`VFS_SERVER_PID`])
+//! and the block driver server ([`BLK_SERVER_PID`]). These are used
+//! for capability-based IPC.
+
 pub mod interrupt;
 pub mod page_fault;
 
@@ -6,42 +51,72 @@ use core::arch::global_asm;
 use core::sync::atomic::Ordering;
 use riscv::register::{scause, sepc, stvec};
 
+// Defined in main.rs global_asm.
 unsafe extern "C" {
     pub(crate) fn __halt_cpu() -> !;
 }
 
+/// Halts the CPU in an infinite loop.
+///
+/// # Safety
+///
+/// This function never returns (`!`).
 pub unsafe fn halt_cpu() -> ! {
     unsafe { __halt_cpu() }
 }
 
 use core::sync::atomic::AtomicI32;
 
-/// PID of the registered VFS server process (0 = not yet started).
+/// PID of the registered VFS server process (`0` = not yet started).
 pub static VFS_SERVER_PID: AtomicI32 = AtomicI32::new(0);
 
-/// PID of the registered block driver process (0 = not yet started).
+/// PID of the registered block driver process (`0` = not yet started).
 pub static BLK_SERVER_PID: AtomicI32 = AtomicI32::new(0);
 
+/// The trap frame structure, holding saved register state.
+///
+/// # Fields
+///
+/// * `kernel_sp` - The kernel stack pointer.
+/// * `regs` - The 32 general-purpose registers (x0 to x31).
+/// * `sepc` - The saved program counter.
+/// * `sstatus` - The saved status register.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct TrapFrame {
+    /// The kernel stack pointer.
     pub kernel_sp: usize,
-    pub regs: [usize; 32], // x0 to x31
+    /// The 32 general-purpose registers (x0 to x31).
+    pub regs: [usize; 32],
+    /// The saved program counter.
     pub sepc: usize,
+    /// The saved status register.
     pub sstatus: usize,
 }
 
 /// Signal frame pushed to the user stack on signal delivery.
-/// `sys_sigreturn` reads this back to restore both the trap frame and the signal mask.
+///
+/// `sys_sigreturn` reads this back to restore both the trap frame and
+/// the signal mask.
+///
+/// # Fields
+///
+/// * `saved_blocked` - The blocked signals mask at the time of delivery.
+/// * `_pad` - Padding for alignment.
+/// * `tf` - The saved trap frame.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct SignalFrame {
+    /// The blocked signals mask at the time of delivery.
     pub saved_blocked: u32,
+    /// Padding for alignment.
     pub _pad: u32,
+    /// The saved trap frame.
     pub tf: TrapFrame,
 }
 
 impl TrapFrame {
+    /// Creates a new zeroed trap frame.
     pub const fn new() -> Self {
         TrapFrame {
             kernel_sp: 0,
@@ -183,9 +258,25 @@ return_to_user:
 
 unsafe extern "C" {
     fn trap_vector();
+    /// Returns to user-space using the given trap frame.
+    ///
+    /// # Safety
+    ///
+    /// The trap frame must be valid and the address space must be set
+    /// up correctly. This function never returns.
     pub fn return_to_user(trap_frame: usize) -> !;
 }
 
+/// Initializes the trap handler.
+///
+/// This function:
+/// 1. Sets the trap vector to [`trap_vector`].
+/// 2. Enables supervisor software interrupts (for TLB shootdown).
+/// 3. Enables supervisor external interrupts.
+///
+/// Timer interrupts are NOT enabled here — they are enabled right
+/// before the first call to `schedule()` to avoid firing while
+/// `sscratch` is still 0.
 pub fn init() {
     unsafe {
         stvec::write(trap_vector as *const () as usize, stvec::TrapMode::Direct);
@@ -200,7 +291,7 @@ pub fn init() {
     println!("Trap handler initialized.");
 }
 
-/// Called by secondary HARTs from secondary_kmain — same as init() without the print.
+/// Called by secondary HARTs from `secondary_kmain` — same as [`init`] without the print.
 pub fn init_hart() {
     unsafe {
         stvec::write(trap_vector as *const () as usize, stvec::TrapMode::Direct);
@@ -209,9 +300,11 @@ pub fn init_hart() {
     }
 }
 
-/// Enable timer interrupts and arm the first timer.
-/// Must be called right before the first schedule(), after sscratch has
-/// been initialised by a prior return_to_user or kernel-mode scratch page.
+/// Enables timer interrupts and arms the first timer.
+///
+/// Must be called right before the first `schedule()`, after `sscratch`
+/// has been initialised by a prior `return_to_user` or kernel-mode
+/// scratch page.
 pub fn enable_timer() {
     unsafe {
         riscv::register::sie::set_stimer();
@@ -219,6 +312,20 @@ pub fn enable_timer() {
     crate::timer::set_next_timer();
 }
 
+/// The main trap handler, called from the assembly [`trap_vector`].
+///
+/// This function dispatches the trap to the appropriate handler based
+/// on the `scause` register. After handling, it checks for pending
+/// signals and delivers them if necessary.
+///
+/// # Arguments
+///
+/// * `tf` - A mutable reference to the trap frame.
+///
+/// # Returns
+///
+/// A pointer to the (possibly modified) trap frame. The assembly code
+/// uses this to restore the register state.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
     let cause = scause::read().cause();

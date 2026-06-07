@@ -473,6 +473,14 @@ fn scan_initrd(vfs: &mut Vfs) {
             Err(_) => { offset += 512; continue; }
         };
         if name.is_empty() { offset += 512; continue; }
+        // Skip macOS ._ resource-fork metadata files
+        let base = name.trim_end_matches('/').rsplit('/').next().unwrap_or(name);
+        if base.starts_with("._") {
+            let size = octal_to_usize(&header[124..136]);
+            let data_blocks = size.div_ceil(512);
+            offset += 512 + data_blocks * 512;
+            continue;
+        }
 
         let type_flag = header[156];
         let size = octal_to_usize(&header[124..136]);
