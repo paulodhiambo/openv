@@ -279,11 +279,11 @@ pub extern "C" fn main() -> i32 {
                 my_println!("virtio-blk-driver: datacopy res={}", res);
                 let mut reply = Message::new();
                 reply.type_ = 0; // OK
-                libos::msg_send(req_pid, &mut reply);
+                libos::msg_send(req_pid, &reply);
             } else {
                 let mut reply = Message::new();
                 reply.type_ = -1; // ERR
-                libos::msg_send(req_pid, &mut reply);
+                libos::msg_send(req_pid, &reply);
             }
         } else if msg.type_ == 101 { // OP_BLOCK_WRITE
             let blk = u32::from_le_bytes(msg.data[0..4].try_into().unwrap());
@@ -295,11 +295,11 @@ pub extern "C" fn main() -> i32 {
             if ok {
                 let mut reply = Message::new();
                 reply.type_ = 0; // OK
-                libos::msg_send(req_pid, &mut reply);
+                libos::msg_send(req_pid, &reply);
             } else {
                 let mut reply = Message::new();
                 reply.type_ = -1; // ERR
-                libos::msg_send(req_pid, &mut reply);
+                libos::msg_send(req_pid, &reply);
             }
         }
     }
