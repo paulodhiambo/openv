@@ -30,7 +30,6 @@
 /// External interrupts come from the PLIC. We claim the IRQ, dispatch
 /// to the registered driver or user-space driver, then complete the
 /// IRQ.
-
 use crate::trap::TrapFrame;
 use core::sync::atomic::Ordering;
 use alloc::collections::BTreeMap;
@@ -71,11 +70,7 @@ pub fn poll_uart_into_linedisc() {
 
     let mut uart = crate::uart::Uart::new();
     let mut any_pushed = false;
-    loop {
-        let c = match uart.try_get_char() {
-            Some(c) => c,
-            None => break,
-        };
+    while let Some(c) = uart.try_get_char() {
         if c == 0x03 {
             let fg = crate::posix::process::FOREGROUND_PID.load(Ordering::Relaxed);
             uart.put_char(b'^');
@@ -229,7 +224,7 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
         // External interrupts — PLIC claim/complete
         9 | 11 => {
             let hart = crate::smp::current_hartid();
-            let irq = crate::plic::claim(hart as usize);
+            let irq = crate::plic::claim(hart);
             if irq != 0 {
                 // If it's UART (10), drain the FIFO into the line discipline first.
                 // The UART is level-triggered: if we complete the PLIC ack without
@@ -237,14 +232,14 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
                 // the timer ISR and preventing poll_uart_into_linedisc from running.
                 if irq == 10 {
                     poll_uart_into_linedisc();
-                    crate::plic::complete(hart as usize, irq);
+                    crate::plic::complete(hart, irq);
                 } else {
                     let mut handled_in_userspace = false;
                     {
                         let handlers = IRQ_HANDLERS.lock();
                         if let Some(&pid) = handlers.get(&irq) {
                             // Mask the interrupt at the PLIC so it doesn't fire again immediately
-                            crate::plic::set_enable(hart as usize, irq, false);
+                            crate::plic::set_enable(hart, irq, false);
                             
                             // Create hardware interrupt IPC message
                             let mut d = [0u8; 56];
@@ -263,13 +258,13 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
                             crate::syscall::ipc::kernel_send_msg(pid, msg);
                             
                             // Acknowledge the interrupt
-                            crate::plic::complete(hart as usize, irq);
+                            crate::plic::complete(hart, irq);
                             handled_in_userspace = true;
                         }
                     }
                     if !handled_in_userspace {
                         crate::drivers::dispatch_interrupt(irq as usize);
-                        crate::plic::complete(hart as usize, irq);
+                        crate::plic::complete(hart, irq);
                     }
                 }
             }

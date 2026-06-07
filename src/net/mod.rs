@@ -102,7 +102,7 @@ pub fn register_device(dev: &'static dyn NetDevice) {
 /// `None` otherwise.
 pub fn device() -> Option<&'static dyn NetDevice> {
     let slot = NET_DEVICE.lock();
-    slot.clone()
+    *slot
 }
 
 /// Initializes networking via the driver framework; falls back to loopback if nothing claims a device.

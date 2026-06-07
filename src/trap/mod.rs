@@ -115,6 +115,12 @@ pub struct SignalFrame {
     pub tf: TrapFrame,
 }
 
+impl Default for TrapFrame {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TrapFrame {
     /// Creates a new zeroed trap frame.
     pub const fn new() -> Self {
@@ -443,7 +449,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
 
     // If we are returning to user-space (SPP == 0), check for pending signals
     unsafe {
-        let mut_tf = &mut *(ret_tf as *mut TrapFrame);
+        let mut_tf = &mut *ret_tf;
         if (mut_tf.sstatus & (1 << 8)) == 0 {
             let pid = crate::posix::process::current_pid();
             let table = crate::posix::process::PROCESS_TABLE.lock();

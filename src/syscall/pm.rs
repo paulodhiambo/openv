@@ -40,11 +40,11 @@ use core::sync::atomic::Ordering;
 /// Requires `CAP_PROCESS`.
 pub fn sys_clone_process(arg0: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
-    if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
-            return;
-        }
+    if let Some(proc) = crate::posix::process::get_current_proc()
+        && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
     }
     let child = match crate::posix::process::Process::new(target_pid) {
         Ok(c) => c,
@@ -107,11 +107,11 @@ pub fn sys_clone_process(arg0: usize, tf: &mut TrapFrame) {
 pub fn sys_set_trapframe(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     let tf_ptr = arg1 as *const TrapFrame;
-    if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & (crate::posix::process::CAP_PROCESS | crate::posix::process::CAP_SYS_ADMIN) == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
-            return;
-        }
+    if let Some(proc) = crate::posix::process::get_current_proc()
+        && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & (crate::posix::process::CAP_PROCESS | crate::posix::process::CAP_SYS_ADMIN) == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
     }
 
     if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid) {
@@ -145,11 +145,11 @@ pub fn sys_set_trapframe(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 pub fn sys_set_process_state(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     let state = arg1; // 0 = Stopped, 1 = Runnable
-    if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
-            return;
-        }
+    if let Some(proc) = crate::posix::process::get_current_proc()
+        && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
     }
 
     if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid) {
@@ -189,11 +189,11 @@ pub fn sys_set_process_state(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 /// Requires `CAP_PROCESS` or `CAP_SYS_ADMIN`.
 pub fn sys_destroy_user_space(arg0: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
-    if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & (crate::posix::process::CAP_PROCESS | crate::posix::process::CAP_SYS_ADMIN) == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
-            return;
-        }
+    if let Some(proc) = crate::posix::process::get_current_proc()
+        && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & (crate::posix::process::CAP_PROCESS | crate::posix::process::CAP_SYS_ADMIN) == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
     }
 
     if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid) {
@@ -233,11 +233,11 @@ pub fn sys_alloc_user_page(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
     let target_pid = arg0 as i32;
     let va = arg1;
     let flags = arg2; // mapping flags
-    if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & (crate::posix::process::CAP_PROCESS | crate::posix::process::CAP_SYS_ADMIN) == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
-            return;
-        }
+    if let Some(proc) = crate::posix::process::get_current_proc()
+        && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & (crate::posix::process::CAP_PROCESS | crate::posix::process::CAP_SYS_ADMIN) == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
     }
 
     if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid) {
@@ -284,11 +284,11 @@ pub fn sys_alloc_user_page(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
 /// Requires `CAP_PROCESS`.
 pub fn sys_reap_process(arg0: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
-    if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
-            return;
-        }
+    if let Some(proc) = crate::posix::process::get_current_proc()
+        && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
     }
 
     // Refuse to reap a process that is not already a zombie: reaping a running
@@ -299,7 +299,7 @@ pub fn sys_reap_process(arg0: usize, tf: &mut TrapFrame) {
             None => { tf.regs[10] = usize::MAX; return; }
             Some(proc) => {
                 if !matches!(*proc.state.lock(), crate::posix::process::ProcState::Zombie(_)) {
-                    tf.regs[10] = crate::errno::ESRCH as usize;
+                    tf.regs[10] = crate::errno::ESRCH;
                     return;
                 }
             }
@@ -366,13 +366,13 @@ pub fn sys_phys_map(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let proc = crate::posix::process::get_current_proc().unwrap();
     
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_MMIO == 0 {
-        tf.regs[10] = crate::errno::EPERM as usize;
+        tf.regs[10] = crate::errno::EPERM;
         return;
     }
 
     let root_pa = (proc.satp_val.load(core::sync::atomic::Ordering::Relaxed) & 0xFFFFFFFFFFF) << 12;
 
-    if va % 4096 != 0 || pa % 4096 != 0 || len % 4096 != 0 {
+    if !va.is_multiple_of(4096) || !pa.is_multiple_of(4096) || !len.is_multiple_of(4096) {
         tf.regs[10] = usize::MAX;
         return;
     }

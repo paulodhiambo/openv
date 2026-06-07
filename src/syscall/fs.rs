@@ -211,7 +211,7 @@ pub fn sys_proc_list(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
-        tf.regs[10] = crate::errno::EPERM as usize;
+        tf.regs[10] = crate::errno::EPERM;
         return;
     }
     let buf_ptr = arg0 as *mut u32;
@@ -233,7 +233,7 @@ pub fn sys_proc_status(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
-        tf.regs[10] = crate::errno::EPERM as usize;
+        tf.regs[10] = crate::errno::EPERM;
         return;
     }
     let pid = arg0 as i32;
@@ -266,11 +266,11 @@ pub fn sys_proc_status(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame
 pub fn sys_blk_register(tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(Ordering::Relaxed) & crate::posix::process::CAP_MMIO == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
+            tf.regs[10] = crate::errno::EPERM;
             return;
         }
     } else {
-        tf.regs[10] = crate::errno::ESRCH as usize;
+        tf.regs[10] = crate::errno::ESRCH;
         return;
     }
     let pid = crate::posix::process::current_pid();
@@ -289,7 +289,7 @@ pub fn sys_vfs_register(tf: &mut TrapFrame) {
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_SYS_ADMIN == 0 {
-        tf.regs[10] = crate::errno::EPERM as usize;
+        tf.regs[10] = crate::errno::EPERM;
         return;
     }
     let pid = crate::posix::process::current_pid();
@@ -307,7 +307,7 @@ pub fn sys_initrd_data(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_DATACOPY == 0 {
-        tf.regs[10] = crate::errno::EPERM as usize;
+        tf.regs[10] = crate::errno::EPERM;
         return;
     }
     let buf_ptr = arg0;

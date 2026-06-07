@@ -118,29 +118,24 @@ pub fn probe_all(dtb_ptr: usize) {
         Err(_) => return,
     };
     for node in fdt.all_nodes() {
-        if let Some(comp_prop) = node.property("compatible") {
-            if let Some(comp_str) = comp_prop.as_str() {
-                for entry in DRIVER_TABLE {
-                    if entry.compatible.iter().any(|c| comp_str.contains(c)) {
-                        // Get the base address from the `reg` property, or
-                        // fall back to the address encoded in the node name.
-                        let mut base = node.property("reg").and_then(|p| p.as_usize()).unwrap_or(0);
-                        if base == 0 {
-                            if let Some(idx) = node.name.rfind('@') {
-                                if let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16) {
-                                    base = x;
-                                }
-                            }
-                        }
-                        // Get the IRQ number from the `interrupts` property.
-                        let irq = node
-                            .property("interrupts")
-                            .and_then(|p| p.as_usize())
-                            .unwrap_or(0);
-                        // Attempt to initialize the device.
-                        if let Some(drv) = (entry.probe)(base, irq) {
-                            ACTIVE_DRIVERS.lock().push(drv);
-                        }
+        if let Some(comp_prop) = node.property("compatible")
+            && let Some(comp_str) = comp_prop.as_str()
+        {
+            for entry in DRIVER_TABLE {
+                if entry.compatible.iter().any(|c| comp_str.contains(c)) {
+                    let mut base = node.property("reg").and_then(|p| p.as_usize()).unwrap_or(0);
+                    if base == 0
+                        && let Some(idx) = node.name.rfind('@')
+                        && let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16)
+                    {
+                        base = x;
+                    }
+                    let irq = node
+                        .property("interrupts")
+                        .and_then(|p| p.as_usize())
+                        .unwrap_or(0);
+                    if let Some(drv) = (entry.probe)(base, irq) {
+                        ACTIVE_DRIVERS.lock().push(drv);
                     }
                 }
             }

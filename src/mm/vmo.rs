@@ -74,7 +74,7 @@ impl Vmo {
     /// are freed before returning.
     pub fn new(size_bytes: usize) -> Option<Self> {
         // Round up to the nearest page boundary.
-        let num_pages = (size_bytes + 4095) / 4096;
+        let num_pages = size_bytes.div_ceil(4096);
         let mut pages = Vec::with_capacity(num_pages);
 
         for _ in 0..num_pages {

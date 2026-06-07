@@ -81,7 +81,7 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     let pt = unsafe { &mut *(pt_pa as *mut crate::mm::vmm::PageTable) };
 
     // Load ELF
-    let entry_point = load_elf(&file_data, pt).map_err(cleanup)?;
+    let entry_point = load_elf(file_data, pt).map_err(cleanup)?;
 
     // Allocate and map user stack.
     // The page immediately below the allocated stack region is intentionally left unmapped
@@ -193,7 +193,7 @@ pub fn exit(pid: Pid, status: i32) {
             {
                 let mut tf = proc.trap_frame.lock();
                 tf.sepc += 4; // undo the sepc -= 4 that armed the retry
-                tf.regs[10] = crate::errno::ESRCH as usize;
+                tf.regs[10] = crate::errno::ESRCH;
             }
             *proc.ipc_state.lock() = crate::posix::process::IpcState::None;
             let mut st = proc.state.lock();
@@ -225,7 +225,7 @@ pub fn exit(pid: Pid, status: i32) {
             {
                 let mut tf = proc.trap_frame.lock();
                 tf.sepc += 4;
-                tf.regs[10] = crate::errno::ESRCH as usize;
+                tf.regs[10] = crate::errno::ESRCH;
             }
             *proc.ipc_state.lock() = crate::posix::process::IpcState::None;
             let mut st = proc.state.lock();
@@ -326,6 +326,10 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
 
 /// Replaces the current process image with a new ELF (execve-like minimal).
 ///
+/// # Safety
+///
+/// `path_ptr` must point to a valid, readable buffer of at least `path_len` bytes.
+///
 /// # Arguments
 ///
 /// * `path_ptr` - Pointer to a byte slice containing the path string.
@@ -335,7 +339,7 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
 ///
 /// `Ok(entry_point)` with the virtual address of the new entry point on
 /// success. The trap handler uses this to set `sepc`, `sp`, and `sstatus`.
-pub fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static str> {
+pub unsafe fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static str> {
     let ppid = crate::posix::process::current_pid();
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = core::str::from_utf8(path_bytes).map_err(|_| "Invalid UTF-8 path")?;
@@ -404,10 +408,10 @@ pub fn cleanup_process(pid: Pid) {
         let table = PROCESS_TABLE.lock();
         if let Some(proc) = table.get(&pid) {
             let ppid = proc.ppid.load(Ordering::Relaxed);
-            if ppid != 0 {
-                if let Some(parent) = table.get(&ppid) {
-                    parent.children.lock().retain(|&c| c != pid);
-                }
+            if ppid != 0
+                && let Some(parent) = table.get(&ppid)
+            {
+                parent.children.lock().retain(|&c| c != pid);
             }
         }
     }

@@ -193,14 +193,14 @@ pub fn init(dtb_ptr: usize) {
 
     let mut initrd_start = 0usize;
     let mut initrd_end   = 0usize;
-    if let Some(chosen) = fdt.find_node("/chosen") {
-        if let (Some(s), Some(e)) = (
+    if let Some(chosen) = fdt.find_node("/chosen")
+        && let (Some(s), Some(e)) = (
             chosen.property("linux,initrd-start"),
             chosen.property("linux,initrd-end"),
-        ) {
-            initrd_start = s.as_usize().unwrap_or(0);
-            initrd_end   = e.as_usize().unwrap_or(0);
-        }
+        )
+    {
+        initrd_start = s.as_usize().unwrap_or(0);
+        initrd_end   = e.as_usize().unwrap_or(0);
     }
 
     // SAFETY:
@@ -329,7 +329,7 @@ pub fn alloc_page() -> Option<usize> {
 ///
 /// Panics if `page` is not 4 KB-aligned (in debug builds).
 pub fn free_page(page: usize) {
-    debug_assert!(page % PAGE_SIZE == 0, "free_page: misaligned address {:#x}", page);
+    debug_assert!(page.is_multiple_of(PAGE_SIZE), "free_page: misaligned address {:#x}", page);
 
     // Acquire both locks together so there is no window where the refcount
     // is 0 but the page hasn't been returned to the free list yet.

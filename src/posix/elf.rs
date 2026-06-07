@@ -184,8 +184,8 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
                 let frame = alloc_frame().ok_or("Failed to alloc page for ELF")?;
                 let pa = frame.pa();
 
-                let va_offset = if va >= start_va { va - start_va } else { 0 };
-                let page_offset = if start_va > va { start_va - va } else { 0 };
+                let va_offset = va.saturating_sub(start_va);
+                let page_offset = start_va.saturating_sub(va);
 
                 if va_offset < file_size {
                     let copy_len = core::cmp::min(PAGE_SIZE - page_offset, file_size - va_offset);

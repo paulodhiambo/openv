@@ -34,7 +34,10 @@ pub extern "C" fn libos_init() {
         // Kernel ABI mismatch — abort immediately with a distinctive exit code.
         syscall(1, usize::MAX, 0, 0);
         loop {
-            core::arch::asm!("wfi");
+            unsafe {
+                core::arch::asm!("wfi");
+            }
+
         }
     }
 }

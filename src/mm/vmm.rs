@@ -98,6 +98,12 @@ pub struct PageTable {
     pub entries: [usize; 512],
 }
 
+impl Default for PageTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PageTable {
     /// Creates a new empty page table with all entries set to zero.
     pub const fn new() -> Self {
@@ -220,7 +226,7 @@ impl PageTable {
             if is_leaf {
                 return Err("huge pages not supported");
             }
-            pt_pa = ((entry >> 10) << 12) as usize;
+            pt_pa = (entry >> 10) << 12;
         }
 
         // SAFETY: `pt_pa` is a valid leaf page table physical address.
@@ -377,7 +383,7 @@ pub fn handle_store_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'
         if is_leaf {
             return Err("huge page (1GB/2MB) not supported for COW");
         }
-        pt_pa = ((entry >> 10) << 12) as usize;
+        pt_pa = (entry >> 10) << 12;
     }
 
     // SAFETY:

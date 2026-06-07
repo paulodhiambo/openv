@@ -5,11 +5,11 @@ unsafe extern "C" {
 }
 
 pub fn sys_net_send(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
-    if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_NET_RAW == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
-            return;
-        }
+    if let Some(proc) = crate::posix::process::get_current_proc()
+        && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_NET_RAW == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
     }
     let pkt = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
     if let Some(dev) = crate::net::device() {
@@ -21,11 +21,11 @@ pub fn sys_net_send(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 }
 
 pub fn sys_net_recv(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
-    if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_NET_RAW == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
-            return;
-        }
+    if let Some(proc) = crate::posix::process::get_current_proc()
+        && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_NET_RAW == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
     }
     let buf = unsafe { core::slice::from_raw_parts_mut(arg0 as *mut u8, arg1) };
     if let Some(dev) = crate::net::device() {

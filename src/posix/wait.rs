@@ -39,13 +39,13 @@ pub fn poll_waitpid(
         let children = parent.children.lock();
 
         for &child_pid in children.iter() {
-            if target_pid == -1 || target_pid == child_pid {
-                if let Some(child) = table.get(&child_pid) {
-                    let state = child.state.lock();
-                    if let ProcState::Zombie(status) = *state {
-                        found_zombie = Some((child_pid, status));
-                        break;
-                    }
+            if (target_pid == -1 || target_pid == child_pid)
+                && let Some(child) = table.get(&child_pid)
+            {
+                let state = child.state.lock();
+                if let ProcState::Zombie(status) = *state {
+                    found_zombie = Some((child_pid, status));
+                    break;
                 }
             }
         }
@@ -83,36 +83,32 @@ pub fn poll_waitpid(
 /// process would sleep and be woken up by the scheduler when a child
 /// exits.
 pub fn waitpid_sync(ppid: Pid, target_pid: Pid) -> Result<(Pid, i32), &'static str> {
-    loop {
-        // We simulate polling. In a real system, we'd sleep and be woken up.
-        let mut table = PROCESS_TABLE.lock();
-        let parent = table.get(&ppid).cloned().ok_or("Parent not found")?;
+    // We simulate polling. In a real system, we'd sleep and be woken up.
+    let mut table = PROCESS_TABLE.lock();
+    let parent = table.get(&ppid).cloned().ok_or("Parent not found")?;
 
-        let mut found_zombie = None;
-        {
-            let children = parent.children.lock();
-            for &child_pid in children.iter() {
-                if target_pid == -1 || target_pid == child_pid {
-                    if let Some(child) = table.get(&child_pid) {
-                        let state = child.state.lock();
-                        if let ProcState::Zombie(status) = *state {
-                            found_zombie = Some((child_pid, status));
-                            break;
-                        }
-                    }
+    let mut found_zombie = None;
+    {
+        let children = parent.children.lock();
+        for &child_pid in children.iter() {
+            if (target_pid == -1 || target_pid == child_pid)
+                && let Some(child) = table.get(&child_pid)
+            {
+                let state = child.state.lock();
+                if let ProcState::Zombie(status) = *state {
+                    found_zombie = Some((child_pid, status));
+                    break;
                 }
             }
         }
-
-        if let Some((zpid, status)) = found_zombie {
-            table.remove(&zpid);
-            let mut children = parent.children.lock();
-            children.retain(|&p| p != zpid);
-            return Ok((zpid, status));
-        }
-
-        // Normally we'd `wfi` here, but for the mock test we just return.
-        // To avoid a tight loop freezing the test, we'll just return an error if no zombie is found immediately.
-        return Err("No zombie found");
     }
+
+    if let Some((zpid, status)) = found_zombie {
+        table.remove(&zpid);
+        let mut children = parent.children.lock();
+        children.retain(|&p| p != zpid);
+        return Ok((zpid, status));
+    }
+
+    Err("No zombie found")
 }

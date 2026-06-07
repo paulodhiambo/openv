@@ -513,7 +513,7 @@ pub fn sys_datacopy(
 ) {
     let proc = crate::posix::process::get_current_proc().unwrap();
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_DATACOPY == 0 {
-        tf.regs[10] = crate::errno::EPERM as usize;
+        tf.regs[10] = crate::errno::EPERM;
         return;
     }
 

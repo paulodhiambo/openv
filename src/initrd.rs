@@ -153,9 +153,8 @@ pub fn kernel_initrd_lookup(path: &str) -> Option<&'static [u8]> {
         // Extract the file size from the header. The size is stored as a
         // 12-byte octal number in bytes 124-135.
         let mut size = 0;
-        for i in 124..135 {
-            let b = header[i];
-            if b >= b'0' && b <= b'7' {
+        for &b in header[124..135].iter() {
+            if (b'0'..=b'7').contains(&b) {
                 size = (size << 3) | (b - b'0') as usize;
             }
         }

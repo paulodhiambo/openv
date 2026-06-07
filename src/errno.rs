@@ -43,7 +43,7 @@
 /// or using a capability it doesn't have.
 ///
 /// **POSIX name**: `EPERM` (1)
-pub const EPERM: usize = usize::MAX - 0;   // -1
+pub const EPERM: usize = usize::MAX;   // -1
 
 /// No such file or directory.
 ///

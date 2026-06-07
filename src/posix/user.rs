@@ -257,7 +257,7 @@ pub fn groups_of(uid: Uid) -> alloc::vec::Vec<Gid> {
 /// # Returns
 ///
 /// `Some(&UserEntry)` if authentication succeeds, `None` otherwise.
-pub fn authenticate<'a>(username: &str, password: &[u8]) -> Option<&'static UserEntry> {
+pub fn authenticate(username: &str, password: &[u8]) -> Option<&'static UserEntry> {
     let user = find_by_name(username)?;
     if verify_password(user.password_hash, password) {
         Some(user)
@@ -278,7 +278,7 @@ pub fn authenticate<'a>(username: &str, password: &[u8]) -> Option<&'static User
 ///
 /// `true` if the password matches, `false` otherwise.
 pub fn authenticate_uid(uid: Uid, password: &[u8]) -> bool {
-    find_by_uid(uid).map_or(false, |u| verify_password(u.password_hash, password))
+    find_by_uid(uid).is_some_and(|u| verify_password(u.password_hash, password))
 }
 
 // ── Privilege checks ───────────────────────────────────────────────────────
@@ -297,7 +297,7 @@ pub fn in_group(uid: Uid, gid: Gid) -> bool {
     GROUPS
         .iter()
         .find(|g| g.gid == gid)
-        .map_or(false, |g| g.members.contains(&uid))
+        .is_some_and(|g| g.members.contains(&uid))
 }
 
 /// Returns `true` if the UID is allowed to use `sudo` (root or member of the `sudo` group).

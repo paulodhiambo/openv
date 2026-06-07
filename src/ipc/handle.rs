@@ -195,6 +195,12 @@ pub struct HandleTable {
     cloexec: BTreeSet<Handle>,
 }
 
+impl Default for HandleTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HandleTable {
     /// Creates a new empty [`HandleTable`].
     ///

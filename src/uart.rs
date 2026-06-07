@@ -121,12 +121,11 @@ pub fn init_from_dtb(dtb_ptr: usize) {
 
     // `reg` on a serial node is (base_address, size).  On most boards the
     // parent bus `ranges` makes this a direct CPU physical address.
-    if let Some(reg) = node.property("reg") {
-        if let Some(addr) = reg.as_usize() {
-            if addr != 0 {
-                set_base(addr);
-            }
-        }
+    if let Some(reg) = node.property("reg")
+        && let Some(addr) = reg.as_usize()
+        && addr != 0
+    {
+        set_base(addr);
     }
 }
 
@@ -135,6 +134,12 @@ pub fn init_from_dtb(dtb_ptr: usize) {
 /// This type is used to group UART-related methods together. It is
 /// zero-sized, so creating a `Uart` instance has no runtime cost.
 pub struct Uart;
+
+impl Default for Uart {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Uart {
     /// Creates a new `Uart` instance.

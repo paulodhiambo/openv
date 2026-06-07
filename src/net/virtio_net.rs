@@ -28,6 +28,12 @@ use crate::sync::Mutex;
 /// useful for testing the network stack without actual hardware.
 pub struct LoopbackNet;
 
+impl Default for LoopbackNet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LoopbackNet {
     /// Creates a new [`LoopbackNet`] instance.
     pub const fn new() -> Self {

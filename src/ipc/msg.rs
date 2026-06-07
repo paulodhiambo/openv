@@ -47,6 +47,12 @@ pub struct Message {
     pub data: [u8; 56],
 }
 
+impl Default for Message {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Message {
     /// Creates a new zeroed [`Message`].
     ///

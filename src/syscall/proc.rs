@@ -83,11 +83,11 @@ pub fn sys_spawn(path_ptr: usize, path_len: usize, tf: &mut TrapFrame) {
 pub fn sys_spawn_with_caps(path_ptr: usize, path_len: usize, caps: u64, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_SYS_ADMIN == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
+            tf.regs[10] = crate::errno::EPERM;
             return;
         }
     } else {
-        tf.regs[10] = crate::errno::ESRCH as usize;
+        tf.regs[10] = crate::errno::ESRCH;
         return;
     }
 
@@ -116,11 +116,11 @@ pub fn sys_spawn_with_caps(path_ptr: usize, path_len: usize, caps: u64, tf: &mut
 pub fn sys_privctl(pid: usize, caps: u64, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_SYS_ADMIN == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
+            tf.regs[10] = crate::errno::EPERM;
             return;
         }
     } else {
-        tf.regs[10] = crate::errno::ESRCH as usize;
+        tf.regs[10] = crate::errno::ESRCH;
         return;
     }
 
@@ -129,7 +129,7 @@ pub fn sys_privctl(pid: usize, caps: u64, tf: &mut TrapFrame) {
         target_proc.caps.store(caps, core::sync::atomic::Ordering::Relaxed);
         tf.regs[10] = 0; // Success
     } else {
-        tf.regs[10] = crate::errno::ESRCH as usize;
+        tf.regs[10] = crate::errno::ESRCH;
     }
 }
 
@@ -144,11 +144,11 @@ pub fn sys_privctl(pid: usize, caps: u64, tf: &mut TrapFrame) {
 pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_INTERRUPT == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
+            tf.regs[10] = crate::errno::EPERM;
             return;
         }
     } else {
-        tf.regs[10] = crate::errno::ESRCH as usize;
+        tf.regs[10] = crate::errno::ESRCH;
         return;
     }
     
@@ -164,17 +164,17 @@ pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 pub fn sys_irq_enable(arg0: usize, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
         if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_INTERRUPT == 0 {
-            tf.regs[10] = crate::errno::EPERM as usize;
+            tf.regs[10] = crate::errno::EPERM;
             return;
         }
     } else {
-        tf.regs[10] = crate::errno::ESRCH as usize;
+        tf.regs[10] = crate::errno::ESRCH;
         return;
     }
     
     let irq = arg0 as u32;
     let hart = crate::smp::current_hartid();
-    crate::plic::set_enable(hart as usize, irq, true);
+    crate::plic::set_enable(hart, irq, true);
     tf.regs[10] = 0;
 }
 
@@ -275,7 +275,7 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
         Vec::new()
     };
 
-    match crate::posix::spawn::sys_exec(path_ptr as *const u8, path_len) {
+    match unsafe { crate::posix::spawn::sys_exec(path_ptr as *const u8, path_len) } {
         Ok(entry_point) => {
             let pid = crate::posix::process::current_pid();
 
@@ -425,13 +425,12 @@ pub fn sys_waitpid(target: usize, status_ptr: usize, options: usize, tf: &mut Tr
                         } else { false }
                     };
 
-                    if matches {
-                        if let Some(child) = table.get(&child_pid) {
-                            if let crate::posix::process::ProcState::Zombie(st) = *child.state.lock() {
-                                found = Some((child_pid, st));
-                                break;
-                            }
-                        }
+                    if matches
+                        && let Some(child) = table.get(&child_pid)
+                        && let crate::posix::process::ProcState::Zombie(st) = *child.state.lock()
+                    {
+                        found = Some((child_pid, st));
+                        break;
                     }
                 }
             }
@@ -503,15 +502,13 @@ pub fn sys_waitpid(target: usize, status_ptr: usize, options: usize, tf: &mut Tr
                                     } else {
                                         true // -1 or pgid — accept any
                                     };
-                                    if matches {
-                                        if let Some(child) = table.get(&child_pid) {
-                                            if let crate::posix::process::ProcState::Zombie(st) =
-                                                *child.state.lock()
-                                            {
-                                                found = Some((child_pid, st));
-                                                break;
-                                            }
-                                        }
+                                    if matches
+                                        && let Some(child) = table.get(&child_pid)
+                                        && let crate::posix::process::ProcState::Zombie(st) =
+                                            *child.state.lock()
+                                    {
+                                        found = Some((child_pid, st));
+                                        break;
                                     }
                                 }
                             }
@@ -562,10 +559,10 @@ pub fn sys_set_fg_pid(arg0: usize, tf: &mut TrapFrame) {
     // Route the UART ISR to the new foreground process's TTY.
     if pid > 0 {
         let proc_arc = crate::posix::process::PROCESS_TABLE.lock().get(&pid).cloned();
-        if let Some(proc) = proc_arc {
-            if let Some(crate::ipc::handle::KernelObject::Tty(tty)) = proc.fds.lock().get(0) {
-                *crate::tty::ACTIVE_TTY.lock() = Some(tty.clone());
-            }
+        if let Some(proc) = proc_arc
+            && let Some(crate::ipc::handle::KernelObject::Tty(tty)) = proc.fds.lock().get(0)
+        {
+            *crate::tty::ACTIVE_TTY.lock() = Some(tty.clone());
         }
     }
     tf.regs[10] = 0;
@@ -866,7 +863,7 @@ pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
 
     let child = match crate::posix::process::Process::new(ppid) {
         Ok(c) => c,
-        Err(_) => { tf.regs[10] = crate::errno::ENOMEM as usize; return; }
+        Err(_) => { tf.regs[10] = crate::errno::ENOMEM; return; }
     };
     let child_pid = child.pid;
 
@@ -874,7 +871,7 @@ pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
         Some(p) => p,
         None => {
             crate::posix::spawn::cleanup_process(child_pid);
-            tf.regs[10] = crate::errno::ESRCH as usize;
+            tf.regs[10] = crate::errno::ESRCH;
             return;
         }
     };
@@ -980,7 +977,7 @@ pub fn sys_futex(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
             let mut table = crate::posix::process::FUTEX_TABLE.lock();
             let actual = unsafe { core::ptr::read_volatile(uaddr as *const u32) };
             if actual != val as u32 {
-                tf.regs[10] = crate::errno::EAGAIN as usize;
+                tf.regs[10] = crate::errno::EAGAIN;
                 return;
             }
             table.entry(uaddr).or_default().push_back(pid);

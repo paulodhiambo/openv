@@ -144,7 +144,7 @@ pub fn socket_id_for_fd(pid: Pid, fd: u32) -> Option<u32> {
 /// * `pid` - The PID to add.
 pub fn add_pending_accept(sid: u32, pid: Pid) {
     let mut m = PENDING_ACCEPTS.lock();
-    m.entry(sid).or_insert(Vec::new()).push(pid);
+    m.entry(sid).or_default().push(pid);
 }
 
 /// Pops a waiting PID from the pending-accepts queue for a socket.
@@ -177,7 +177,7 @@ pub fn pop_waiting_pid(sid: u32) -> Option<Pid> {
 /// * `user_fd` - The user-space file descriptor for the accepted connection.
 pub fn push_pending_accepted(sid: u32, user_fd: u32) {
     let mut m = PENDING_ACCEPTED.lock();
-    m.entry(sid).or_insert(Vec::new()).push(user_fd);
+    m.entry(sid).or_default().push(user_fd);
 }
 
 /// Opcode: Acknowledgment.

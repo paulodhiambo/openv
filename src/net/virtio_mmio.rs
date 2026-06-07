@@ -394,12 +394,11 @@ pub fn probe_and_init() -> bool {
 
         // Parse base address
         let mut base = node.property("reg").and_then(|p| p.as_usize()).unwrap_or(0);
-        if base == 0 {
-            if let Some(idx) = node.name.rfind('@') {
-                if let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16) {
-                    base = x;
-                }
-            }
+        if base == 0
+            && let Some(idx) = node.name.rfind('@')
+            && let Ok(x) = usize::from_str_radix(&node.name[idx + 1..], 16)
+        {
+            base = x;
         }
         if base == 0 {
             continue;
