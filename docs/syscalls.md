@@ -102,9 +102,28 @@
 
 ## Error Values
 
-All syscalls signal errors by returning `usize::MAX` (which equals `-1i32` when cast, following Unix convention). There is currently no `errno` variable; the caller knows only that an error occurred, not its specific cause.
+All syscalls signal errors by returning a `usize` in the range `[usize::MAX - 4095, usize::MAX]`. This matches the RISC-V Linux convention where these values are interpreted as `-errno`.
 
-Future work: introduce named error codes (`ENOENT = usize::MAX`, `EACCES = usize::MAX - 12`, etc.) and an `errno` thread-local in libos.
+Common error codes (defined in `src/errno.rs`):
+
+| Name | Value | Description |
+|------|-------|-------------|
+| `EPERM` | `-1` | Operation not permitted |
+| `ENOENT` | `-2` | No such file or directory |
+| `ESRCH` | `-3` | No such process |
+| `EINTR` | `-4` | Interrupted system call |
+| `EIO` | `-5` | I/O error |
+| `EBADF` | `-9` | Bad file descriptor |
+| `EAGAIN` | `-11` | Resource temporarily unavailable |
+| `ENOMEM` | `-12` | Out of memory |
+| `EACCES` | `-13` | Permission denied |
+| `EFAULT` | `-14` | Bad address |
+| `EINVAL` | `-22` | Invalid argument |
+| `EMFILE` | `-24` | Too many open files |
+| `ENOSYS` | `-38` | Function not implemented |
+| `ECONNREFUSED` | `-111` | Connection refused |
+
+User-space can use these values to determine the specific cause of a failure.
 
 ---
 

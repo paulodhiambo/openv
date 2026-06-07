@@ -7,7 +7,9 @@
 [![Architecture](https://img.shields.io/badge/arch-RISC--V%2064-blue)](#architecture)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-openv is a **RISC-V 64-bit microkernel** written in Rust. It boots under QEMU via OpenSBI, provides an interactive Unix-like environment, and implements a comprehensive POSIX-compatible kernel from scratch:
+openv is a **RISC-V 64-bit microkernel** written in Rust. It boots under QEMU via OpenSBI, provides an interactive Unix-like environment, and implements a comprehensive POSIX-compatible kernel from scratch.
+
+For detailed technical documentation, see the [Documentation Index](docs/index.md).
 
 - **Preemptive multitasking** — round-robin scheduler, 10 ms SBI timer slices
 - **Virtual memory** — Sv39 paging, COW fork, demand paging (zero-fill on access)

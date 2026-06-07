@@ -214,7 +214,7 @@ Add a row to the appropriate table section:
 | 99 | `my_syscall` | `(arg0: usize, arg1: usize) → isize` | 0 / -1 | What it does and any important semantics. |
 ```
 
-Also update the "Complete Syscall Table" in `docs/architecture.md` §5.
+Also update the "Complete Syscall Table" in `docs/architecture/syscalls.md`.
 
 ---
 
@@ -427,7 +427,7 @@ Use this checklist when reviewing or submitting PRs:
 
 **Documentation**
 - [ ] `docs/syscalls.md` updated (new syscalls)
-- [ ] `docs/architecture.md` updated (new subsystems)
+- [ ] `docs/architecture/` updated (new subsystems)
 - [ ] `CONTRIBUTING.md` updated if development workflow changes
 
 **Style**

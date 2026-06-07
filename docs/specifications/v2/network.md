@@ -1,5 +1,8 @@
 # Networking Subsystem — Implementation Specification
 
+> **NOTE:** This is a **v2 specification** and does NOT reflect the current implementation.
+> See [docs/specifications/v2/README.md](README.md) for more context.
+
 > Status: Draft v0.2 (build spec)
 > Target: riscv64
 > IPC model: capability handles + bidirectional channels (pipe semantics available)
