@@ -151,7 +151,8 @@ pub fn sys_privctl(pid: usize, caps: u64, tf: &mut TrapFrame) {
 /// Requires `CAP_INTERRUPT`.
 pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_INTERRUPT == 0 {
+        let caps = proc.caps.load(core::sync::atomic::Ordering::Relaxed);
+        if caps & (crate::posix::process::CAP_INTERRUPT | crate::posix::process::CAP_DRIVER) == 0 {
             tf.regs[10] = crate::errno::EPERM;
             return;
         }
@@ -159,7 +160,7 @@ pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::ESRCH;
         return;
     }
-    
+
     let irq = arg0 as u32;
     let pid = arg1 as i32;
     crate::trap::interrupt::IRQ_HANDLERS.lock().insert(irq, pid);
@@ -168,10 +169,11 @@ pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 
 /// Re-enables an IRQ at the PLIC for the current HART.
 ///
-/// Requires `CAP_INTERRUPT`.
+/// Requires `CAP_INTERRUPT` or `CAP_DRIVER`.
 pub fn sys_irq_enable(arg0: usize, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_INTERRUPT == 0 {
+        let caps = proc.caps.load(core::sync::atomic::Ordering::Relaxed);
+        if caps & (crate::posix::process::CAP_INTERRUPT | crate::posix::process::CAP_DRIVER) == 0 {
             tf.regs[10] = crate::errno::EPERM;
             return;
         }
@@ -872,30 +874,36 @@ pub fn sys_sigreturn(tf: &mut TrapFrame) {
 // ── Thread support ─────────────────────────────────────────────────────────────
 
 /// `clone` flag: share address space with parent.
-const CLONE_VM:     u32 = 0x0000_0100;
+const CLONE_VM:               u32 = 0x0000_0100;
 /// `clone` flag: join parent's thread group.
-const CLONE_THREAD: u32 = 0x0001_0000;
+const CLONE_THREAD:           u32 = 0x0001_0000;
 /// `clone` flag: set `tp` to the TLS argument.
-const CLONE_SETTLS: u32 = 0x0008_0000;
+const CLONE_SETTLS:           u32 = 0x0008_0000;
+/// `clone` flag: write 0 to child_tid_ptr and futex-wake on thread exit.
+const CLONE_CHILD_CLEARTID:   u32 = 0x0020_0000;
+/// `clone` flag: write child TID to child_tid_ptr after fork.
+const CLONE_CHILD_SETTID:     u32 = 0x0100_0000;
 
 /// Creates a new thread or process.
 ///
 /// # Arguments
 ///
 /// * `arg0` (`a0`) - Flags (combinations of `CLONE_VM`, `CLONE_THREAD`,
-///   `CLONE_SETTLS`, and namespace flags).
+///   `CLONE_SETTLS`, `CLONE_CHILD_SETTID`, `CLONE_CHILD_CLEARTID`).
 /// * `arg1` (`a1`) - New stack pointer for child (`0` = inherit parent sp).
 /// * `arg2` (`a2`) - TLS value loaded into `tp` (only when `CLONE_SETTLS`).
+/// * `arg3` (`a3`) - User-space `*mut u32` for SETTID/CLEARTID.
 /// * `tf` - Caller's trap frame.
 ///
 /// # Returns
 ///
 /// The new thread/process PID in the parent, 0 in the child.
-pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
+pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, arg3: usize, tf: &mut TrapFrame) {
     use core::sync::atomic::Ordering;
     let flags = arg0 as u32;
     let stack = arg1;
     let tls   = arg2;
+    let child_tid_ptr = arg3;
 
     let ppid = crate::posix::process::current_pid();
 
@@ -972,6 +980,16 @@ pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
         if flags & CLONE_SETTLS != 0 {
             child_tf.regs[4] = tls;   // tp
         }
+    }
+
+    // CLONE_CHILD_SETTID: write child's TID into child_tid_ptr (shared address space).
+    if flags & CLONE_CHILD_SETTID != 0 && child_tid_ptr != 0 {
+        unsafe { core::ptr::write_volatile(child_tid_ptr as *mut u32, child_pid as u32); }
+    }
+
+    // CLONE_CHILD_CLEARTID: store the pointer so it is cleared on thread exit.
+    if flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
+        child.clear_tid_ptr.store(child_tid_ptr, Ordering::Relaxed);
     }
 
     crate::posix::process::RUN_QUEUE.lock().push_back(child_pid);
@@ -1235,6 +1253,98 @@ pub fn sys_job_set_policy(job_handle: usize, policy_type: usize, value: usize, t
         tf.regs[10] = 0;
     } else {
         tf.regs[10] = crate::errno::EINVAL;
+    }
+}
+
+// ── Thread lifecycle helpers ────────────────────────────────────────────────
+
+/// Exits all threads in the calling thread's thread group (POSIX exit_group).
+///
+/// Sets every process with the same tgid as a zombie with `status`, then
+/// schedules the next process.
+pub fn sys_exit_group(status: usize, tf: &mut TrapFrame) {
+    let _ = tf;
+    let my_tgid = {
+        let pid = crate::posix::process::current_pid();
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        match table.get(&pid) {
+            Some(p) => p.tgid.load(Ordering::Relaxed),
+            None => { crate::posix::process::schedule(); unsafe { __halt_cpu() } }
+        }
+    };
+
+    let peers: Vec<crate::posix::process::Pid> = {
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter(|(_, p)| p.tgid.load(Ordering::Relaxed) == my_tgid)
+            .map(|(pid, _)| *pid)
+            .collect()
+    };
+
+    for peer in peers {
+        crate::posix::spawn::exit(peer, status as i32);
+    }
+
+    crate::posix::process::schedule();
+    unsafe { __halt_cpu() }
+}
+
+/// Stores `ptr` as the thread's `clear_tid_ptr` and returns the calling TID.
+///
+/// Used by libc at thread start to register the futex address for `pthread_join`.
+pub fn sys_set_tid_address(ptr: usize, tf: &mut TrapFrame) {
+    let pid = crate::posix::process::current_pid();
+    if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&pid).cloned() {
+        proc.clear_tid_ptr.store(ptr, Ordering::Relaxed);
+    }
+    tf.regs[10] = pid as usize;
+}
+
+/// Terminates a task (process or job) identified by a handle.
+///
+/// If `handle` is 0, kills the calling process. If it resolves to a
+/// [`KernelObject::Job`], kills every process currently in the job.
+pub fn sys_task_kill(handle: usize, tf: &mut TrapFrame) {
+    if handle == 0 {
+        let pid = crate::posix::process::current_pid();
+        crate::posix::spawn::exit(pid, -1);
+        crate::posix::process::schedule();
+        unsafe { __halt_cpu() }
+    }
+
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+
+    let job = match proc.fds.lock().get(handle as u32) {
+        Some(crate::ipc::handle::KernelObject::Job(j)) => j.clone(),
+        _ => { tf.regs[10] = crate::errno::EBADF; return; }
+    };
+
+    let pids: Vec<crate::posix::process::Pid> = job.processes.lock().clone();
+    for pid in pids {
+        crate::posix::spawn::exit(pid, -1);
+    }
+    tf.regs[10] = 0;
+}
+
+/// Sends signal `sig` to thread `tid` within thread group `tgid`.
+///
+/// Only delivers if `tid` exists and its `tgid` matches.
+pub fn sys_tgkill(tgid: usize, tid: usize, sig: usize, tf: &mut TrapFrame) {
+    let target_pid = tid as crate::posix::process::Pid;
+    let target_tgid = tgid as i32;
+
+    let proc_arc = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid).cloned();
+    match proc_arc {
+        Some(p) if p.tgid.load(Ordering::Relaxed) == target_tgid => {
+            if sig != 0 && sig < 32 {
+                p.pending_signals.fetch_or(1 << (sig - 1), Ordering::SeqCst);
+            }
+            tf.regs[10] = 0;
+        }
+        Some(_) => tf.regs[10] = crate::errno::ESRCH,
+        None    => tf.regs[10] = crate::errno::ESRCH,
     }
 }
 

@@ -39,6 +39,9 @@ pub extern "C" fn main() -> ! {
 
     ok_line(b"Mounting virtual filesystem");
 
+    // ── Start component manager ───────────────────────────────────────────────
+    let _cm_pid = spawn(b"/component-manager".as_ptr(), 19);
+    ok_line(b"Starting component manager");
 
     // ── Run verification tests ────────────────────────────────────────────────
     ok_line(b"Running boot-time verification");

@@ -389,7 +389,8 @@ pub fn sys_phys_map(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     
-    if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_MMIO == 0 {
+    let caps = proc.caps.load(core::sync::atomic::Ordering::Relaxed);
+    if caps & (crate::posix::process::CAP_MMIO | crate::posix::process::CAP_DRIVER) == 0 {
         tf.regs[10] = crate::errno::EPERM;
         return;
     }
@@ -438,5 +439,64 @@ pub fn sys_virt_to_phys(arg0: usize, tf: &mut TrapFrame) {
     match crate::mm::vmm::PageTable::walk_page_table(root_pa, va) {
         Ok((pa, _flags)) => tf.regs[10] = pa,
         Err(_) => tf.regs[10] = usize::MAX,
+    }
+}
+
+/// Creates a hardware resource capability handle.
+///
+/// Requires `CAP_SYS_ADMIN`. Returns a handle to a [`ResourceSpec`] that
+/// grants access to the specified MMIO range and/or IRQ line.
+///
+/// # Arguments
+/// * `arg0` (`a0`) — Physical base address of the MMIO region (0 if IRQ-only).
+/// * `arg1` (`a1`) — Size in bytes of the MMIO region (0 if IRQ-only).
+/// * `arg2` (`a2`) — IRQ number, or `u32::MAX` (0xffffffff) if no IRQ.
+pub fn sys_create_resource(arg0: usize, arg1: usize, arg2: usize, tf: &mut crate::trap::TrapFrame) {
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+
+    if proc.caps.load(core::sync::atomic::Ordering::Relaxed)
+        & crate::posix::process::CAP_SYS_ADMIN
+        == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+
+    let irq = if arg2 == usize::MAX { None } else { Some(arg2 as u32) };
+    let spec = crate::ipc::handle::ResourceSpec { pa: arg0, pa_size: arg1, irq };
+    let handle = proc.fds.lock().insert(crate::ipc::handle::KernelObject::Resource(spec));
+    tf.regs[10] = handle as usize;
+}
+
+/// Grants `CAP_DRIVER` capability to a target process.
+///
+/// Requires `CAP_SYS_ADMIN`. Allows the target process to call
+/// `sys_phys_map` and `sys_irq_register`/`sys_irq_enable`.
+///
+/// # Arguments
+/// * `arg0` (`a0`) — PID of the target process.
+pub fn sys_grant_driver_cap(arg0: usize, tf: &mut crate::trap::TrapFrame) {
+    crate::get_current_proc_or_esrch!(tf);
+    let caller = crate::posix::process::get_current_proc().unwrap();
+
+    if caller.caps.load(core::sync::atomic::Ordering::Relaxed)
+        & crate::posix::process::CAP_SYS_ADMIN
+        == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+
+    let target_pid = arg0 as i32;
+    match crate::posix::process::PROCESS_TABLE.lock().get(&target_pid).cloned() {
+        Some(target) => {
+            target.caps.fetch_or(
+                crate::posix::process::CAP_DRIVER,
+                core::sync::atomic::Ordering::SeqCst,
+            );
+            tf.regs[10] = 0;
+        }
+        None => tf.regs[10] = crate::errno::ESRCH,
     }
 }

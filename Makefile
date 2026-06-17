@@ -13,7 +13,7 @@ DISK_IMG    := disk.img
 DISK_SIZE_MB := 8
 
 # Overridable via env or make args
-BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server pm-server rs-server echo-server net-client ipc_test virtio-blk-driver pkg epolltest procfs-server devfs-server
+BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server pm-server rs-server echo-server net-client ipc_test virtio-blk-driver pkg epolltest procfs-server devfs-server component-manager
 QEMU_MEM   ?= 512M
 QEMU_CPUS  ?= 1
 QEMU_FLAGS  = -machine virt -bios default -nographic -m $(QEMU_MEM) -smp $(QEMU_CPUS)

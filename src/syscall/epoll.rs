@@ -110,7 +110,8 @@ fn check_fd_readiness(fd: i32, interest: u32) -> u32 {
             }
             events
         }
-        KernelObject::Vmo(_) | KernelObject::Port(_) | KernelObject::Job(_) => {
+        KernelObject::Vmo(_) | KernelObject::Port(_) | KernelObject::Job(_)
+        | KernelObject::Resource(_) => {
             if interest & EPOLLNVAL != 0 {
                 EPOLLNVAL
             } else {

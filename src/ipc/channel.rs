@@ -106,6 +106,8 @@ pub struct ChannelEndpoint {
     pub observers: Mutex<Vec<crate::ipc::port::SignalObserver>>,
     /// Epoll instances waiting for readability on this endpoint.
     pub epoll_waiters: Mutex<Vec<Weak<EpollInstance>>>,
+    /// Direct signal waiters: (pid, signal_mask) — woken when any matching signal fires.
+    pub signal_waiters: Mutex<VecDeque<(i32, u32)>>,
 }
 
 impl ChannelEndpoint {
@@ -136,6 +138,7 @@ impl ChannelEndpoint {
             waiter: AtomicI32::new(0),
             observers: Mutex::new(Vec::new()),
             epoll_waiters: Mutex::new(Vec::new()),
+            signal_waiters: Mutex::new(VecDeque::new()),
         });
 
         let ep2 = Arc::new(Self {
@@ -149,6 +152,7 @@ impl ChannelEndpoint {
             waiter: AtomicI32::new(0),
             observers: Mutex::new(Vec::new()),
             epoll_waiters: Mutex::new(Vec::new()),
+            signal_waiters: Mutex::new(VecDeque::new()),
         });
 
         *ep1.peer.lock() = Arc::downgrade(&ep2);
@@ -298,15 +302,30 @@ impl ChannelEndpoint {
         sigs
     }
 
-    /// Notifies all bound ports if any trigger matches the current active signals.
+    /// Notifies all bound ports and direct waiters if any trigger matches the current active signals.
     pub fn notify_signals(&self, active_signals: u32) {
+        // Wake direct sys_object_wait_one waiters.
+        {
+            let mut waiters = self.signal_waiters.lock();
+            let mut i = 0;
+            while i < waiters.len() {
+                let (pid, mask) = waiters[i];
+                if active_signals & mask != 0 {
+                    waiters.remove(i);
+                    crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        // Wake port observers.
         let obs = self.observers.lock();
         for observer in obs.iter() {
             let triggered = active_signals & observer.trigger_signals;
             if triggered != 0 {
                 observer.port.queue_packet(crate::ipc::port::PortPacket {
                     key: observer.key,
-                    type_: 1, // Signal change event type
+                    type_: 1,
                     status: 0,
                     observed_signals: active_signals,
                 });
@@ -335,6 +354,10 @@ impl Drop for ChannelEndpoint {
             let waiter = peer_arc.waiter.swap(0, Ordering::Relaxed);
             if waiter > 0 {
                 crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+            }
+            // Also wake any direct sys_object_wait_one waiters watching the peer.
+            for (pid, _) in peer_arc.signal_waiters.lock().drain(..) {
+                crate::posix::process::RUN_QUEUE.lock().push_back(pid);
             }
             peer_arc.notify_signals(peer_arc.get_signals());
         }

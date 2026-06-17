@@ -82,6 +82,9 @@ pub static PROC_SERVER_PID: AtomicI32 = AtomicI32::new(0);
 /// PID of the registered devfs server (`0` = VFS server handles /dev inline).
 pub static DEV_SERVER_PID: AtomicI32 = AtomicI32::new(0);
 
+/// PID of the registered component manager (`0` = not yet started).
+pub static CM_SERVER_PID: AtomicI32 = AtomicI32::new(0);
+
 /// The trap frame structure, holding saved register state.
 ///
 /// # Fields

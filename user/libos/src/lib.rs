@@ -579,6 +579,17 @@ pub fn get_vfs_pid() -> i32 {
     if v == usize::MAX { -1 } else { v as i32 }
 }
 
+/// Registers the calling process as the component manager.
+pub fn cm_register() {
+    syscall(163, 0, 0, 0);
+}
+
+/// Returns the PID of the registered component manager (−1 if not started).
+pub fn get_cm_pid() -> i32 {
+    let v = syscall(164, 0, 0, 0);
+    if v == 0 || v == usize::MAX { -1 } else { v as i32 }
+}
+
 pub fn datacopy(
     src_pid: i32,
     src_addr: *const u8,

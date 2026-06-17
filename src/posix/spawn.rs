@@ -162,7 +162,7 @@ pub fn exit(pid: Pid, status: i32) {
     use crate::posix::process::{PROCESS_TABLE, ProcState};
 
     // Phase 1: Mark zombie and collect ppid, children, and IPC senders in one lock scope.
-    let (ppid, children, blocked_senders) = {
+    let (ppid, children, blocked_senders, clear_tid) = {
         let table = PROCESS_TABLE.lock();
         match table.get(&pid) {
             None => return,
@@ -176,10 +176,25 @@ pub fn exit(pid: Pid, status: i32) {
                 // iterate them in phase 1.5 without risking a second drain.
                 let blocked_senders: alloc::vec::Vec<Pid> =
                     proc.senders.lock().drain(..).collect();
-                (proc.ppid.load(Ordering::Relaxed), children, blocked_senders)
+                let clear_tid = proc.clear_tid_ptr.load(Ordering::Relaxed);
+                (proc.ppid.load(Ordering::Relaxed), children, blocked_senders, clear_tid)
             }
         }
     };
+
+    // CLONE_CHILD_CLEARTID: write 0 to the TID address and wake any futex waiters.
+    if clear_tid != 0 && clear_tid >= 0x1_0000_0000 {
+        unsafe { core::ptr::write_volatile(clear_tid as *mut u32, 0); }
+        let mut table = crate::posix::process::FUTEX_TABLE.lock();
+        if let Some(waiters) = table.remove(&clear_tid) {
+            for waiter_pid in waiters {
+                if let Some(wp) = PROCESS_TABLE.lock().get(&waiter_pid).cloned() {
+                    *wp.state.lock() = ProcState::Running;
+                }
+                crate::posix::process::RUN_QUEUE.lock().push_back(waiter_pid);
+            }
+        }
+    }
 
     // Phase 1.5: Unblock processes that are permanently stuck waiting on the dying
     // process.  Two categories:

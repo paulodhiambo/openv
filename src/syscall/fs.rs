@@ -474,3 +474,16 @@ pub fn sys_getcwd(arg0: usize, arg1: usize, tf: &mut crate::trap::TrapFrame) {
         tf.regs[10] = bytes.len();
     }
 }
+
+/// Registers the calling process as the component manager.
+pub fn sys_cm_register(tf: &mut crate::trap::TrapFrame) {
+    let pid = crate::posix::process::current_pid();
+    crate::trap::CM_SERVER_PID.store(pid, core::sync::atomic::Ordering::Relaxed);
+    crate::println!("CM server registered: pid {}", pid);
+    tf.regs[10] = 0;
+}
+
+/// Returns the PID of the registered component manager (0 if not yet started).
+pub fn sys_get_cm_pid(tf: &mut crate::trap::TrapFrame) {
+    tf.regs[10] = crate::trap::CM_SERVER_PID.load(core::sync::atomic::Ordering::Relaxed) as usize;
+}

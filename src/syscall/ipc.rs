@@ -1104,3 +1104,68 @@ pub fn sys_handle_get_rights(handle: usize, tf: &mut TrapFrame) {
     }
 }
 
+/// Waits for any of `signals_mask` to be asserted on a Channel handle.
+///
+/// Writes the observed signal bitmask to `observed_ptr` on success.
+/// Blocks (retrying the syscall) if no signal is currently active.
+///
+/// # Arguments
+/// * `arg0` — Channel handle
+/// * `arg1` — Signal mask to wait for (bitfield of SIGNAL_* constants)
+/// * `arg2` — Deadline (ignored; future extension)
+/// * `arg3` — User-space `*mut u32` for the observed signals output
+pub fn sys_object_wait_one(arg0: usize, arg1: usize, _arg2: usize, arg3: usize, tf: &mut TrapFrame) {
+    let handle = arg0 as u32;
+    let signals_mask = arg1 as u32;
+    let observed_ptr = arg3;
+
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+
+    if observed_ptr != 0
+        && !crate::mm::vmm::is_user_pointer_valid(tf, observed_ptr as *const u32, 1)
+    {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+
+    let channel = {
+        let fds = proc.fds.lock();
+        match fds.get(handle) {
+            Some(crate::ipc::handle::KernelObject::Channel(ch)) => ch.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EBADF;
+                return;
+            }
+        }
+    };
+
+    let current_signals = channel.get_signals();
+    if current_signals & signals_mask != 0 {
+        if observed_ptr != 0 {
+            unsafe { *(observed_ptr as *mut u32) = current_signals; }
+        }
+        tf.regs[10] = 0;
+        return;
+    }
+
+    // Register as direct waiter before re-checking to avoid lost wakeup.
+    let pid = crate::posix::process::current_pid();
+    channel.signal_waiters.lock().push_back((pid, signals_mask));
+
+    let current_signals = channel.get_signals();
+    if current_signals & signals_mask != 0 {
+        let mut w = channel.signal_waiters.lock();
+        if let Some(pos) = w.iter().position(|(p, _)| *p == pid) { w.remove(pos); }
+        if observed_ptr != 0 {
+            unsafe { *(observed_ptr as *mut u32) = current_signals; }
+        }
+        tf.regs[10] = 0;
+        return;
+    }
+
+    tf.sepc -= 4;
+    crate::posix::process::schedule();
+    unsafe { __halt_cpu() }
+}
+

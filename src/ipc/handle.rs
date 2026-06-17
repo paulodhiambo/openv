@@ -228,6 +228,8 @@ pub enum KernelObject {
     Job(Arc<crate::posix::job::Job>),
     /// An epoll instance for I/O event notification.
     EpollInstance(Arc<EpollInstance>),
+    /// A hardware resource capability (MMIO range and/or IRQ line).
+    Resource(ResourceSpec),
 }
 
 /// Counter for generating unique kernel object IDs.
@@ -263,6 +265,17 @@ bitflags::bitflags! {
         /// Right to transfer the handle to another process via a channel.
         const TRANSFER      = 1 << 3;
     }
+}
+
+/// A hardware resource capability describing an MMIO range and/or IRQ line.
+#[derive(Clone)]
+pub struct ResourceSpec {
+    /// Physical base address of the MMIO region (page-aligned, may be 0 if IRQ-only).
+    pub pa: usize,
+    /// Size in bytes of the MMIO region (may be 0 if IRQ-only).
+    pub pa_size: usize,
+    /// IRQ number, if this resource grants interrupt access.
+    pub irq: Option<u32>,
 }
 
 /// An entry in a [`HandleTable`] representing a [`KernelObject`] and its [`Rights`].

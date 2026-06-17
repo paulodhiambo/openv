@@ -134,6 +134,33 @@ pub const SYS_EPOLL_CTL: usize = 233;
 pub const SYS_EPOLL_PWAIT: usize = 244;
 pub const SYS_EPOLL_CREATE1: usize = 291;
 
+// VMO / VMAR (Zircon-compatible virtual memory objects)
+pub const SYS_VMO_CREATE: usize = 150;
+pub const SYS_VMO_MAP: usize = 151;
+pub const SYS_VMO_UNMAP: usize = 152;
+pub const SYS_VMO_READ: usize = 153;
+pub const SYS_VMO_WRITE: usize = 154;
+pub const SYS_HANDLE_CLOSE: usize = 155;
+
+// Thread lifecycle
+pub const SYS_EXIT_GROUP: usize = 158;
+pub const SYS_SET_TID_ADDRESS: usize = 159;
+pub const SYS_TGKILL: usize = 160;
+
+// Object signal wait (Zircon-compatible)
+pub const SYS_OBJECT_WAIT_ONE: usize = 161;
+
+// Task kill
+pub const SYS_TASK_KILL: usize = 162;
+
+// Component manager
+pub const SYS_CM_REGISTER: usize = 163;
+pub const SYS_GET_CM_PID: usize = 164;
+
+// Driver framework isolation
+pub const SYS_CREATE_RESOURCE: usize = 165;
+pub const SYS_GRANT_DRIVER_CAP: usize = 166;
+
 // ── Job / handle management (Zircon/Fuchsia-compatible) ─────────────────────
 pub const SYS_JOB_CREATE: usize = 74;
 pub const SYS_JOB_SET_POLICY: usize = 75;

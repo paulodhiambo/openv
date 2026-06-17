@@ -137,6 +137,8 @@ pub const CAP_PROCESS: u64   = 1 << 3;
 pub const CAP_INTERRUPT: u64 = 1 << 4;
 /// Perform system administration tasks.
 pub const CAP_SYS_ADMIN: u64 = 1 << 5;
+/// Driver access: MMIO mapping and IRQ registration.
+pub const CAP_DRIVER: u64 = 1 << 6;
 
 /// The state of a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +223,8 @@ pub struct Process {
     pub job: Arc<crate::posix::job::Job>,
     /// The number of physical pages allocated to this process's user space.
     pub allocated_pages: AtomicUsize,
+    /// User-space address to clear (write 0) and futex-wake on thread exit (CLONE_CHILD_CLEARTID).
+    pub clear_tid_ptr: AtomicUsize,
 
     // Fields to support synchronous waitpid
     /// Target PID for synchronous waitpid.
@@ -547,6 +551,7 @@ impl Process {
             cwd: Mutex::new(cwd),
             job,
             allocated_pages: AtomicUsize::new(0),
+            clear_tid_ptr: AtomicUsize::new(0),
             wait_target: Mutex::new(None),
             wait_status_ptr: Mutex::new(None),
             wait_result: Mutex::new(VecDeque::new()),

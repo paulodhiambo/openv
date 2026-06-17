@@ -64,6 +64,7 @@ pub mod proc;
 pub mod tty;
 pub mod user;
 pub mod pm;
+pub mod vm;
 
 /// Dispatches a system call to the appropriate handler.
 ///
@@ -122,7 +123,7 @@ pub fn dispatch(
         89 => proc::sys_sigreturn(tf),
         74 => proc::sys_job_create(arg0, arg1, tf),
         75 => proc::sys_job_set_policy(arg0, arg1, arg2, tf),
-        120 => proc::sys_clone(arg0, arg1, arg2, tf),
+        120 => proc::sys_clone(arg0, arg1, arg2, arg3, tf),
         121 => proc::sys_futex(arg0, arg1, arg2, tf),
         122 => proc::sys_gettid(tf),
 
@@ -136,6 +137,33 @@ pub fn dispatch(
         137 => proc::sys_brk(arg0, tf),
         138 => proc::sys_abi_version(tf),
         139 => proc::sys_unshare(arg0, tf),
+
+        // vm.rs — VMO / handle-close
+        150 => vm::sys_vmo_create(arg0, tf),
+        151 => vm::sys_vmo_map(arg0, arg1, arg2, arg3, tf),
+        152 => vm::sys_vmo_unmap(arg0, arg1, tf),
+        153 => vm::sys_vmo_read(arg0, arg1, arg2, arg3, tf),
+        154 => vm::sys_vmo_write(arg0, arg1, arg2, arg3, tf),
+        155 => vm::sys_handle_close(arg0, tf),
+
+        // proc.rs — thread lifecycle
+        158 => proc::sys_exit_group(arg0, tf),
+        159 => proc::sys_set_tid_address(arg0, tf),
+        160 => proc::sys_tgkill(arg0, arg1, arg2, tf),
+
+        // ipc.rs — object signal wait (Zircon-compatible)
+        161 => ipc::sys_object_wait_one(arg0, arg1, arg2, arg3, tf),
+
+        // proc.rs — task kill
+        162 => proc::sys_task_kill(arg0, tf),
+
+        // fs.rs — component manager registration
+        163 => fs::sys_cm_register(tf),
+        164 => fs::sys_get_cm_pid(tf),
+
+        // pm.rs — driver framework isolation
+        165 => pm::sys_create_resource(arg0, arg1, arg2, tf),
+        166 => pm::sys_grant_driver_cap(arg0, tf),
 
         // trace.rs — eBPF-compatible observability
         140 => crate::trace::sys_trace_load(arg0, arg1, tf),
