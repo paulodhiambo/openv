@@ -419,11 +419,7 @@ pub fn handle_store_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'
         pt.entries[vpn[0]] = new_entry;
         new_frame.into_raw(); // ownership transferred to PTE
 
-        // Decrement refcount of old page; free if zero
-        let remaining = pmm::decr_ref(pa);
-        if remaining == 0 {
-            pmm::free_page(pa);
-        }
+        pmm::decr_ref_and_maybe_free(pa);
 
         // Flush local TLB, then IPI all other HARTs so they also flush.
         // SAFETY: sfence.vma is a privileged instruction valid in S-mode.
@@ -454,13 +450,7 @@ unsafe fn destroy_level(pt_pa: usize, level: usize) {
             let pa = (entry >> 10) << 12;
             let flags = entry & 0x3FF;
             if (flags & PTE_U) != 0 {
-                // user page: decrement ref and free if needed
-                if crate::mm::pmm::is_managed_page(pa) {
-                    let remaining = crate::mm::pmm::decr_ref(pa);
-                    if remaining == 0 {
-                        crate::mm::pmm::free_page(pa);
-                    }
-                }
+                crate::mm::pmm::decr_ref_and_maybe_free(pa);
             }
             pt.entries[idx] = 0;
         } else {
@@ -524,10 +514,7 @@ pub fn destroy_user_space(root_pa: usize) -> Result<(), &'static str> {
                 let flags = entry & 0x3FF;
                 if (flags & PTE_U) != 0 {
                     let page_pa = pa;
-                    let remaining = crate::mm::pmm::decr_ref(page_pa);
-                    if remaining == 0 {
-                        crate::mm::pmm::free_page(page_pa);
-                    }
+                    crate::mm::pmm::decr_ref_and_maybe_free(page_pa);
                 }
                 root.entries[i] = 0;
             } else {
@@ -582,6 +569,13 @@ pub fn handle_user_page_fault(root_pa: usize, fault_va: usize, extra_flags: usiz
         return crate::mm::swap::swap_in(root_pa, page_va);
     }
 
+    let proc_opt = crate::posix::process::get_current_proc();
+    if let Some(ref proc) = proc_opt {
+        if !proc.job.check_memory_limit(PAGE_SIZE) {
+            return Err("Memory limit exceeded for Job");
+        }
+    }
+
     // Allocate a fresh physical page (zeroed by PMM).
     let frame = crate::mm::pmm::alloc_frame().ok_or("OOM in demand paging")?;
 
@@ -593,6 +587,10 @@ pub fn handle_user_page_fault(root_pa: usize, fault_va: usize, extra_flags: usiz
     match pt.map_page(page_va, frame.pa(), flags) {
         Ok(()) => {
             frame.into_raw(); // Ownership transferred to PTE
+            if let Some(ref proc) = proc_opt {
+                proc.job.alloc_memory(PAGE_SIZE);
+                proc.allocated_pages.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+            }
             // Flush local TLB then IPI all other HARTs.
             unsafe { core::arch::asm!("sfence.vma") };
             crate::smp::send_ipi_all();
@@ -651,11 +649,8 @@ pub fn unmap_range(root_pa: usize, va_start: usize, len: usize) {
         if l0e & PTE_V != 0 {
             let pa = (l0e >> 10) << 12;
             let flags = l0e & 0x3FF;
-            if (flags & PTE_U) != 0 && pmm::is_managed_page(pa) {
-                let remaining = pmm::decr_ref(pa);
-                if remaining == 0 {
-                    pmm::free_page(pa);
-                }
+            if (flags & PTE_U) != 0 {
+                pmm::decr_ref_and_maybe_free(pa);
             }
             l0.entries[vpn[0]] = 0;
         }

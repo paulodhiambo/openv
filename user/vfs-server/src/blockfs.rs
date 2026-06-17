@@ -66,9 +66,11 @@ const DATA_START: u32 = JOURNAL_DATA_BLK + JOURNAL_SLOTS as u32; // = 44
 const ITYPE_FREE: u8 = 0;
 pub const ITYPE_FILE: u8 = 1;
 pub const ITYPE_DIR: u8  = 2;
+pub const ITYPE_SYMLINK: u8 = 3;
 
 pub const ITYPE_FILE_ENTRY: u8 = 1;
 pub const ITYPE_DIR_ENTRY: u8  = 2;
+pub const ITYPE_SYMLINK_ENTRY: u8 = 3;
 
 pub const ROOT_INODE: u32 = 0;
 
@@ -378,6 +380,25 @@ impl OfsState {
         Some((cur_ino, cur_type))
     }
 
+    pub fn dir_link_entry(&mut self, dir_ino: u32, name: &str, child_ino: u32, etype: u8) -> bool {
+        // Increment nlink on the target inode.
+        let mut child = match self.read_inode(child_ino) {
+            Some(i) => i,
+            None => return false,
+        };
+        child.nlink = child.nlink.saturating_add(1);
+        self.write_inode(child_ino, &child);
+
+        // Create the directory entry using the shared logic.
+        let ok = self.dir_add_entry(dir_ino, name, child_ino, etype);
+        if !ok {
+            // Rollback nlink increment on failure.
+            child.nlink = child.nlink.saturating_sub(1);
+            self.write_inode(child_ino, &child);
+        }
+        ok
+    }
+
     pub fn dir_add_entry(&mut self, dir_ino: u32, name: &str, child_ino: u32, etype: u8) -> bool {
         let mut inode = match self.read_inode(dir_ino) { Some(i) => i, None => return false };
         if inode.itype != ITYPE_DIR { return false; }
@@ -462,7 +483,7 @@ impl OfsState {
         -> Result<usize, &'static str>
     {
         let inode = self.read_inode(ino).ok_or("bad inode")?;
-        if inode.itype != ITYPE_FILE { return Err("not a file"); }
+        if inode.itype != ITYPE_FILE && inode.itype != ITYPE_SYMLINK { return Err("not a file"); }
         if offset >= inode.size as usize { return Ok(0); }
         let available = inode.size as usize - offset;
         let to_read   = core::cmp::min(available, buf.len());
@@ -559,10 +580,19 @@ impl OfsState {
                 let n = de.name_len as usize;
                 if n == name_bytes.len() && &de.name[..n] == name_bytes {
                     let child_ino = de.inode_num;
-                    if de.entry_type == ITYPE_FILE_ENTRY {
-                        self.file_truncate(child_ino);
+                    // Decrement nlink; only free data when the last link goes away.
+                    let mut child = self.read_inode(child_ino).unwrap_or_default();
+                    if child.nlink > 0 {
+                        child.nlink -= 1;
                     }
-                    self.free_inode(child_ino);
+                    if child.nlink == 0 {
+                        if de.entry_type == ITYPE_FILE_ENTRY || de.entry_type == ITYPE_SYMLINK_ENTRY {
+                            self.file_truncate(child_ino);
+                        }
+                        self.free_inode(child_ino);
+                    } else {
+                        self.write_inode(child_ino, &child);
+                    }
                     let zeros = [0u8; DIRENTRY_SIZE];
                     buf[slot * DIRENTRY_SIZE..slot * DIRENTRY_SIZE + DIRENTRY_SIZE]
                         .copy_from_slice(&zeros);

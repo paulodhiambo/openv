@@ -11,6 +11,10 @@ pub fn sys_net_send(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::EPERM;
         return;
     }
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const u8, arg1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let pkt = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
     if let Some(dev) = crate::net::device() {
         dev.send(pkt);
@@ -25,6 +29,10 @@ pub fn sys_net_recv(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_NET_RAW == 0
     {
         tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const u8, arg1) {
+        tf.regs[10] = crate::errno::EFAULT;
         return;
     }
     let buf = unsafe { core::slice::from_raw_parts_mut(arg0 as *mut u8, arg1) };
@@ -113,6 +121,10 @@ pub fn sys_bind(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let fd = arg0 as u32;
     let addr_ptr = arg1 as *const u8;
     let addr_len = arg2;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, addr_ptr, addr_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let fds = proc.fds.lock();
@@ -161,6 +173,10 @@ pub fn sys_connect(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let fd = arg0 as u32;
     let addr_ptr = arg1 as *const u8;
     let addr_len = arg2;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, addr_ptr, addr_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let fds = proc.fds.lock();
@@ -186,6 +202,10 @@ pub fn sys_sock_send(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
     let fd = arg0 as u32;
     let buf_ptr = arg1 as *const u8;
     let len = arg2;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, buf_ptr, len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let fds = proc.fds.lock();
@@ -211,6 +231,10 @@ pub fn sys_sock_recv(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
     let fd = arg0 as u32;
     let buf_ptr = arg1 as *mut u8;
     let max_len = arg2;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, buf_ptr as *const u8, max_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let fds = proc.fds.lock();
@@ -240,6 +264,10 @@ pub fn sys_try_recv(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let fd = arg0 as u32;
     let buf_ptr = arg1 as *mut u8;
     let max_len = arg2;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, buf_ptr as *const u8, max_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let fds = proc.fds.lock();

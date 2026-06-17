@@ -58,6 +58,14 @@ pub fn sys_getegid(tf: &mut TrapFrame) {
 }
 
 pub fn sys_authenticate(arg0: usize, arg1: usize, arg2: usize, arg3: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const u8, arg1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg2 as *const u8, arg3) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let username_bytes = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
     let password_bytes = unsafe { core::slice::from_raw_parts(arg2 as *const u8, arg3) };
     if let Ok(username) = core::str::from_utf8(username_bytes) {

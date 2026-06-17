@@ -6,12 +6,16 @@ unsafe extern "C" {
 }
 
 pub fn sys_write(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg1 as *const u8, arg2) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let buf = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2) };
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let fds = proc.fds.lock();
-    if let Some(obj) = fds.get(arg0 as u32) {
-        match obj {
+    match fds.get_with_rights(arg0 as u32, crate::ipc::handle::Rights::WRITE) {
+        Ok(obj) => match obj {
             crate::ipc::handle::KernelObject::Tty(_) => {
                 if let Ok(s) = core::str::from_utf8(buf) {
                     crate::print!("{}", s);
@@ -39,6 +43,7 @@ pub fn sys_write(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                 if waiter > 0 {
                     crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
                 }
+                crate::ipc::handle::wake_epoll_waiters(&half.epoll_waiters);
             }
             crate::ipc::handle::KernelObject::VfsFile(_) => {
                 tf.regs[10] = usize::MAX;
@@ -46,18 +51,23 @@ pub fn sys_write(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
             _ => {
                 tf.regs[10] = usize::MAX;
             }
+        },
+        Err(e) => {
+            tf.regs[10] = e;
         }
-    } else {
-        tf.regs[10] = usize::MAX;
     }
 }
 
 pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg1 as *const u8, arg2) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let fds = proc.fds.lock();
-    if let Some(obj) = fds.get(arg0 as u32) {
-        match obj {
+    match fds.get_with_rights(arg0 as u32, crate::ipc::handle::Rights::READ) {
+        Ok(obj) => match obj {
             crate::ipc::handle::KernelObject::Tty(tty_arc) => {
                 let tty = tty_arc.clone();
                 drop(fds);
@@ -180,9 +190,10 @@ pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
             _ => {
                 tf.regs[10] = usize::MAX;
             }
+        },
+        Err(e) => {
+            tf.regs[10] = e;
         }
-    } else {
-        tf.regs[10] = usize::MAX;
     }
 }
 
@@ -214,8 +225,12 @@ pub fn sys_proc_list(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::EPERM;
         return;
     }
-    let buf_ptr = arg0 as *mut u32;
     let max_count = arg1.min(512);
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const u32, max_count) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    let buf_ptr = arg0 as *mut u32;
     let table = crate::posix::process::PROCESS_TABLE.lock();
     let mut count = 0usize;
     for &pid in table.keys() {
@@ -234,6 +249,10 @@ pub fn sys_proc_status(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame
     let proc = crate::posix::process::get_current_proc().unwrap();
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
         tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg1 as *const u8, arg2) {
+        tf.regs[10] = crate::errno::EFAULT;
         return;
     }
     let pid = arg0 as i32;
@@ -320,6 +339,10 @@ pub fn sys_initrd_data(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame
     } else {
         let avail = total - offset;
         let copy_len = max_len.min(avail).min(4096);
+        if !crate::mm::vmm::is_user_pointer_valid(tf, buf_ptr as *const u8, copy_len) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
         unsafe {
             let src = core::slice::from_raw_parts((start + offset) as *const u8, copy_len);
             let dst = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, copy_len);
@@ -345,6 +368,10 @@ pub fn sys_fdatasync(_arg0: usize, tf: &mut TrapFrame) {
 }
 
 pub fn sys_chdir(arg0: usize, arg1: usize, tf: &mut crate::trap::TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const u8, arg1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let path_bytes = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
     if let Ok(path) = core::str::from_utf8(path_bytes) {
         crate::get_current_proc_or_esrch!(tf);
@@ -358,6 +385,10 @@ pub fn sys_chdir(arg0: usize, arg1: usize, tf: &mut crate::trap::TrapFrame) {
 }
 
 pub fn sys_getcwd(arg0: usize, arg1: usize, tf: &mut crate::trap::TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const u8, arg1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let cwd = proc.cwd.lock();

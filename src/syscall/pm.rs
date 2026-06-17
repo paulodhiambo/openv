@@ -113,6 +113,10 @@ pub fn sys_set_trapframe(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::EPERM;
         return;
     }
+    if !crate::mm::vmm::is_user_pointer_valid(tf, tf_ptr, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
 
     if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid) {
         let mut target_tf = proc.trap_frame.lock();
@@ -207,6 +211,8 @@ pub fn sys_destroy_user_space(arg0: usize, tf: &mut TrapFrame) {
         
         // Destroy old
         let _ = crate::mm::vmm::destroy_user_space(root_pa);
+        let allocated_bytes = proc.allocated_pages.swap(0, Ordering::SeqCst) * 4096;
+        proc.job.dealloc_memory(allocated_bytes);
         tf.regs[10] = 0;
     } else {
         tf.regs[10] = usize::MAX;
@@ -241,6 +247,10 @@ pub fn sys_alloc_user_page(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
     }
 
     if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid) {
+        if !proc.job.check_memory_limit(4096) {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
         let satp = proc.satp_val.load(Ordering::Relaxed);
         let root_pa = (satp & 0xFFFFFFFFFFF) << 12;
 
@@ -257,6 +267,8 @@ pub fn sys_alloc_user_page(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
             return;
         }
         frame.into_raw();
+        proc.job.alloc_memory(4096);
+        proc.allocated_pages.fetch_add(1, Ordering::SeqCst);
         tf.regs[10] = 0;
     } else {
         tf.regs[10] = usize::MAX;
@@ -312,6 +324,9 @@ pub fn sys_reap_process(arg0: usize, tf: &mut TrapFrame) {
     };
 
     if let Some(proc) = removed_proc {
+        let allocated_bytes = proc.allocated_pages.load(Ordering::SeqCst) * 4096;
+        proc.job.dealloc_memory(allocated_bytes);
+
         let kstack = proc.kernel_stack_bottom;
         let satp = proc.satp_val.load(Ordering::Relaxed);
         let root_pa = (satp & 0xFFFFFFFFFFF) << 12;

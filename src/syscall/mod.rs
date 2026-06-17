@@ -25,6 +25,7 @@
 //! | `user`   | 23–24, 30–35 | User/credential ops |
 //! | `tty`    | 37–38 | TTY mode control |
 //! | `trace`  | 140–142 | eBPF-compatible tracepoints |
+//! | `epoll`  | 233, 244, 291 | I/O event notification |
 //!
 //! ## Error Convention
 //!
@@ -55,6 +56,7 @@ macro_rules! get_current_proc_or_esrch {
     };
 }
 
+pub mod epoll;
 pub mod fs;
 pub mod ipc;
 pub mod net;
@@ -118,6 +120,8 @@ pub fn dispatch(
         87 => proc::sys_kill(arg0, arg1, tf),
         88 => proc::sys_sigaction(arg0, arg1, arg2, tf),
         89 => proc::sys_sigreturn(tf),
+        74 => proc::sys_job_create(arg0, arg1, tf),
+        75 => proc::sys_job_set_policy(arg0, arg1, arg2, tf),
         120 => proc::sys_clone(arg0, arg1, arg2, tf),
         121 => proc::sys_futex(arg0, arg1, arg2, tf),
         122 => proc::sys_gettid(tf),
@@ -159,10 +163,19 @@ pub fn dispatch(
         61 => ipc::sys_mailbox_send(arg0, arg1, arg2, tf),
         62 => ipc::sys_mailbox_receive(arg0, arg1, arg2, tf),
         81 => ipc::sys_fcntl(arg0, arg1, arg2, tf),
+        70 => ipc::sys_port_create(arg0, tf),
+        71 => ipc::sys_port_wait(arg0, arg1, tf),
+        72 => ipc::sys_port_queue(arg0, arg1, tf),
+        73 => ipc::sys_port_bind(arg0, arg1, arg2 as u64, arg3 as u32, tf),
+         76 => ipc::sys_handle_duplicate(arg0, arg1, tf),
+         77 => ipc::sys_handle_get_rights(arg0, tf),
         90 => ipc::sys_ipc_send(arg0, arg1, tf),
         91 => ipc::sys_ipc_receive(arg0, arg1, tf),
         92 => ipc::sys_ipc_sendrec(arg0, arg1, tf),
         93 => ipc::sys_datacopy(arg0, arg1, arg2, arg3, tf.regs[14], tf),
+        94 => ipc::sys_channel_create(arg0, tf),
+        95 => ipc::sys_channel_write(arg0, arg1, arg2, arg3, tf.regs[14], tf),
+        96 => ipc::sys_channel_read(arg0, arg1, arg2, arg3, tf.regs[14], tf),
 
         // net.rs
         10 => net::sys_net_send(arg0, arg1, tf),
@@ -191,6 +204,11 @@ pub fn dispatch(
         // tty.rs
         37 => tty::sys_set_echo(arg0, tf),
         38 => tty::sys_set_raw(arg0, tf),
+
+        // epoll.rs
+        233 => epoll::sys_epoll_ctl(arg0, arg1, arg2, arg3, tf),
+        244 => epoll::sys_epoll_pwait(arg0, arg1, arg2, arg3, tf),
+        291 => epoll::sys_epoll_create1(arg0, tf),
 
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);

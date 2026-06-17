@@ -150,6 +150,14 @@ pub const EMFILE: usize = usize::MAX - 23; // -24
 /// **POSIX name**: `ENOSYS` (38)
 pub const ENOSYS: usize = usize::MAX - 37; // -38
 
+/// File exists.
+///
+/// Returned when an attempt is made to create a file or object that already
+/// exists. Used by epoll_ctl(EPOLL_CTL_ADD) when the fd is already registered.
+///
+/// **POSIX name**: `EEXIST` (17)
+pub const EEXIST: usize = usize::MAX - 16; // -17
+
 /// Connection refused.
 ///
 /// Returned when a connection attempt is refused by the remote host.

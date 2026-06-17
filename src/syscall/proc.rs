@@ -62,6 +62,10 @@ pub fn sys_exit(status: usize, _tf: &mut TrapFrame) {
 ///
 /// The new child's PID on success, `usize::MAX` on failure.
 pub fn sys_spawn(path_ptr: usize, path_len: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, path_ptr as *const u8, path_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
     if let Ok(path) = core::str::from_utf8(path_bytes) {
         match crate::posix::spawn::posix_spawn(path, crate::posix::process::current_pid()) {
@@ -88,6 +92,10 @@ pub fn sys_spawn_with_caps(path_ptr: usize, path_len: usize, caps: u64, tf: &mut
         }
     } else {
         tf.regs[10] = crate::errno::ESRCH;
+        return;
+    }
+    if !crate::mm::vmm::is_user_pointer_valid(tf, path_ptr as *const u8, path_len) {
+        tf.regs[10] = crate::errno::EFAULT;
         return;
     }
 
@@ -267,7 +275,17 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
 /// * `arg3` (`a3`) - Argv buffer length (in `tf.regs[13]`).
 /// * `tf` - Caller's trap frame.
 pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, path_ptr as *const u8, path_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let argv_buf_len = tf.regs[13]; // a3
+    if argv_buf_len > 0 {
+        if !crate::mm::vmm::is_user_pointer_valid(tf, argv_buf_ptr as *const u8, argv_buf_len) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
+    }
 
     let argv_data: Vec<u8> = if argv_buf_len > 0 && argv_buf_ptr != 0 {
         unsafe { core::slice::from_raw_parts(argv_buf_ptr as *const u8, argv_buf_len).to_vec() }
@@ -392,6 +410,10 @@ fn reap_zombie(
 /// The reaped PID on success, 0 if `WNOHANG` and no child is ready,
 /// or `-1` (`ECHILD`) if there are no matching children.
 pub fn sys_waitpid(target: usize, status_ptr: usize, options: usize, tf: &mut TrapFrame) {
+    if status_ptr != 0 && !crate::mm::vmm::is_user_pointer_valid(tf, status_ptr as *const i32, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let target = target as i32;
     let status_ptr = status_ptr as *mut i32;
     let ppid = crate::posix::process::current_pid();
@@ -591,6 +613,10 @@ pub struct TimeSpec {
 /// Returns the current time in CLINT ticks, converted to
 /// seconds/microseconds. The CLINT clock is 10 MHz.
 pub fn sys_gettimeofday(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
+    if arg0 != 0 && !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const TimeVal, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     // CLINT clock is 10 MHz: 10,000,000 ticks per second
     let ticks = riscv::register::time::read() as u64;
     let sec = ticks / 10_000_000;
@@ -610,8 +636,8 @@ pub fn sys_gettimeofday(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
 /// The current process is marked `Stopped` and the next process
 /// is scheduled.
 pub fn sys_nanosleep(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
-    if arg0 == 0 {
-        tf.regs[10] = usize::MAX;
+    if arg0 == 0 || !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const TimeSpec, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
         return;
     }
     let req = unsafe { &*(arg0 as *const TimeSpec) };
@@ -786,6 +812,14 @@ pub fn sys_sigaction(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
         tf.regs[10] = usize::MAX; // EINVAL
         return;
     }
+    if arg2 != 0 && !crate::mm::vmm::is_user_pointer_valid(tf, arg2 as *const SigAction, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    if arg1 != 0 && !crate::mm::vmm::is_user_pointer_valid(tf, arg1 as *const SigAction, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
@@ -816,6 +850,10 @@ pub fn sys_sigaction(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
 /// was delivered.
 pub fn sys_sigreturn(tf: &mut TrapFrame) {
     // sp points to the SignalFrame we pushed during signal delivery.
+    if !crate::mm::vmm::is_user_pointer_valid(tf, tf.regs[2] as *const crate::trap::SignalFrame, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let frame = unsafe { core::ptr::read(tf.regs[2] as *const crate::trap::SignalFrame) };
 
     // Restore the saved trap frame registers and sepc.  Do not restore
@@ -967,6 +1005,10 @@ pub fn sys_futex(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let uaddr = arg0;
     let op    = arg1;
     let val   = arg2;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, uaddr as *const u32, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
 
     match op {
         FUTEX_WAIT => {
@@ -1145,3 +1187,54 @@ pub fn sys_unshare(arg0: usize, tf: &mut TrapFrame) {
     // and record the intent.  Full isolation requires making Process::ns a Mutex<NsSet>.
     tf.regs[10] = 0;
 }
+
+pub const JOB_POLICY_MAX_MEMORY: usize = 1;
+
+pub fn sys_job_create(parent_handle: usize, options: usize, tf: &mut TrapFrame) {
+    let _ = options;
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+
+    let parent_job = if parent_handle == 0 {
+        proc.job.clone()
+    } else {
+        match proc.fds.lock().get(parent_handle as u32) {
+            Some(crate::ipc::handle::KernelObject::Job(job)) => job.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EBADF;
+                return;
+            }
+        }
+    };
+
+    let new_job = alloc::sync::Arc::new(crate::posix::job::Job::new(Some(alloc::sync::Arc::downgrade(&parent_job))));
+    parent_job.children.lock().push(new_job.clone());
+
+    let new_handle = proc.fds.lock().insert(crate::ipc::handle::KernelObject::Job(new_job));
+    tf.regs[10] = new_handle as usize;
+}
+
+pub fn sys_job_set_policy(job_handle: usize, policy_type: usize, value: usize, tf: &mut TrapFrame) {
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+
+    let job = if job_handle == 0 {
+        proc.job.clone()
+    } else {
+        match proc.fds.lock().get(job_handle as u32) {
+            Some(crate::ipc::handle::KernelObject::Job(j)) => j.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EBADF;
+                return;
+            }
+        }
+    };
+
+    if policy_type == JOB_POLICY_MAX_MEMORY {
+        job.max_memory.store(value, Ordering::SeqCst);
+        tf.regs[10] = 0;
+    } else {
+        tf.regs[10] = crate::errno::EINVAL;
+    }
+}
+

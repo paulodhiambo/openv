@@ -66,6 +66,18 @@ pub static SATP_REFCOUNT: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::n
 /// Futex wait table: maps (user virtual address) → list of sleeping PIDs.
 pub static FUTEX_TABLE: Mutex<BTreeMap<usize, VecDeque<Pid>>> = Mutex::new(BTreeMap::new());
 
+/// The root Job container for the system.
+pub static ROOT_JOB: Mutex<Option<Arc<crate::posix::job::Job>>> = Mutex::new(None);
+
+/// Returns the root Job container, allocating it if not already initialized.
+pub fn get_root_job() -> Arc<crate::posix::job::Job> {
+    let mut root = ROOT_JOB.lock();
+    if root.is_none() {
+        *root = Some(Arc::new(crate::posix::job::Job::new(None)));
+    }
+    root.as_ref().unwrap().clone()
+}
+
 /// Marks `root_pa` as shared by one additional thread.
 ///
 /// # Arguments
@@ -92,18 +104,14 @@ pub fn satp_unshare(root_pa: usize) -> bool {
     if let Some(count) = map.get_mut(&root_pa) {
         *count -= 1;
         let remaining = *count;
-        // Remove the entry early (at ≤1) so the last registered owner
-        // doesn't need to look up a dying entry; it will fall through to
-        // the else branch and return true.  Return true as soon as we
-        // drop to ≤1 — either this is the last owner (remaining==0) or
-        // only the implicit original owner remains (remaining==1) and it
-        // will be freed by the next satp_unshare via the else branch.
-        if remaining <= 1 {
+        if remaining == 0 {
             map.remove(&root_pa);
+            true  // last tracked owner — caller must free the page table
+        } else {
+            false // other owners remain
         }
-        remaining <= 1
     } else {
-        // Not in the shared map — this process is the sole owner.
+        // Not in the shared map — this process is the sole (unregistered) owner.
         true
     }
 }
@@ -209,6 +217,10 @@ pub struct Process {
     pub kernel_stack_bottom: usize,
     /// Current working directory — inherited from parent, updated by chdir.
     pub cwd: Mutex<String>,
+    /// The Job container for this process.
+    pub job: Arc<crate::posix::job::Job>,
+    /// The number of physical pages allocated to this process's user space.
+    pub allocated_pages: AtomicUsize,
 
     // Fields to support synchronous waitpid
     /// Target PID for synchronous waitpid.
@@ -451,8 +463,8 @@ impl Process {
             if let Some(parent) = parent_arc {
                 let parent_fds = parent.fds.lock();
                 let mut new_fds = HandleTable::new();
-                for (h, obj) in parent_fds.iter() {
-                    new_fds.insert_at(*h, obj.clone());
+                for (h, entry) in parent_fds.iter() {
+                    new_fds.insert_entry(crate::ipc::handle::encode_handle(*h, entry.generation), entry.clone());
                 }
                 // Inherit FD_CLOEXEC flags so exec in the child closes them correctly.
                 for h in parent_fds.cloexec_handles() {
@@ -500,6 +512,19 @@ impl Process {
              crate::namespace::NsSet::root())
         };
 
+        let job = if ppid != 0 {
+            let parent_arc = PROCESS_TABLE.lock().get(&ppid).cloned();
+            if let Some(parent) = parent_arc {
+                parent.job.clone()
+            } else {
+                get_root_job()
+            }
+        } else {
+            get_root_job()
+        };
+
+        job.processes.lock().push(pid);
+
         let proc = Arc::new(Process {
             pid,
             tgid: AtomicI32::new(pid), // main thread: tgid == pid; overridden by sys_clone
@@ -520,6 +545,8 @@ impl Process {
             heap_break: AtomicUsize::new(0x2_0000_0000),   // 8 GB initial brk
             kernel_stack_bottom: kstack_bottom,
             cwd: Mutex::new(cwd),
+            job,
+            allocated_pages: AtomicUsize::new(0),
             wait_target: Mutex::new(None),
             wait_status_ptr: Mutex::new(None),
             wait_result: Mutex::new(VecDeque::new()),

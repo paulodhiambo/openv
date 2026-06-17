@@ -452,69 +452,103 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
         let mut_tf = &mut *ret_tf;
         if (mut_tf.sstatus & (1 << 8)) == 0 {
             let pid = crate::posix::process::current_pid();
-            let table = crate::posix::process::PROCESS_TABLE.lock();
-            if let Some(proc) = table.get(&pid) {
-                let pending = proc.pending_signals.load(core::sync::atomic::Ordering::Relaxed);
-                let blocked = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
-                let deliverable = pending & !blocked;
-                if deliverable != 0 {
-                    // Find first set bit (the signal number)
-                    let sig = deliverable.trailing_zeros();
-                    
-                    // Clear the pending bit
-                    proc.pending_signals.fetch_and(!(1 << sig), core::sync::atomic::Ordering::Relaxed);
-                    
-                    if sig == crate::syscall::proc::SIGKILL as u32 {
-                        // Force exit immediately
-                        drop(table);
-                        crate::posix::spawn::exit(pid, -9);
-                        crate::posix::process::schedule();
-                        halt_cpu()
-                    } else {
-                        let handler_addr = proc.signal_handlers.lock()[sig as usize];
-                        let restorer_addr = proc.signal_restorers.lock()[sig as usize];
-                        
+            let mut root_pa = 0;
+            let mut new_sp = 0;
+            let mut new_sp_end = 0;
+            let mut sig = 0u32;
+            let mut handler_addr = 0;
+            let mut restorer_addr = 0;
+            let extra_mask;
+            let mut new_blocked = 0;
+            let mut saved_blocked = 0;
+            let mut do_deliver = false;
+            let frame_size = core::mem::size_of::<SignalFrame>();
+
+            // Phase 1: extract all needed data from PROCESS_TABLE under the lock.
+            // The lock is dropped before any VMM or user-memory access to avoid
+            // deadlock when handle_user_page_fault re-enters PROCESS_TABLE.
+            {
+                let table = crate::posix::process::PROCESS_TABLE.lock();
+                if let Some(proc) = table.get(&pid) {
+                    let pending = proc.pending_signals.load(core::sync::atomic::Ordering::Relaxed);
+                    let blocked = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+                    let deliverable = pending & !blocked;
+                    if deliverable != 0 {
+                        sig = deliverable.trailing_zeros();
+                        proc.pending_signals.fetch_and(!(1 << sig), core::sync::atomic::Ordering::Relaxed);
+
+                        if sig == crate::syscall::proc::SIGKILL as u32 {
+                            drop(table);
+                            crate::posix::spawn::exit(pid, -9);
+                            crate::posix::process::schedule();
+                            halt_cpu()
+                        }
+
+                        handler_addr = proc.signal_handlers.lock()[sig as usize];
+                        restorer_addr = proc.signal_restorers.lock()[sig as usize];
+
                         if handler_addr == 0 {
                             drop(table);
                             crate::posix::spawn::exit(pid, -(sig as i32));
                             crate::posix::process::schedule();
                             halt_cpu()
-                        } else {
-                            let frame_size = core::mem::size_of::<SignalFrame>();
-                            let sp = mut_tf.regs[2];
-                            // Guard against stack underflow and kernel-space hijack.
-                            if sp < frame_size + 16 || sp > 0x0000_8000_0000_0000 {
-                                drop(table);
-                                crate::posix::spawn::exit(pid, -11); // SIGSEGV
-                                crate::posix::process::schedule();
-                                halt_cpu()
-                            }
-                            let new_sp = (sp - frame_size) & !15;
-                            // Verify the target page is actually mapped before writing.
-                            let satp = proc.satp_val.load(Ordering::Relaxed);
-                            let root_pa = (satp & 0xFFF_FFFF_FFFF) << 12;
-                            if crate::mm::vmm::PageTable::walk_page_table(root_pa, new_sp).is_err() {
-                                drop(table);
-                                crate::posix::spawn::exit(pid, -11); // SIGSEGV
-                                crate::posix::process::schedule();
-                                halt_cpu()
-                            }
-                            let frame = SignalFrame {
-                                saved_blocked: blocked,
-                                _pad: 0,
-                                tf: *mut_tf,
-                            };
-                            core::ptr::write(new_sp as *mut SignalFrame, frame);
-                            mut_tf.regs[2] = new_sp;
-                            mut_tf.regs[10] = sig as usize;
-                            mut_tf.sepc = handler_addr;
-                            mut_tf.regs[1] = restorer_addr;
-                            // Mask the signal (and any sa_mask bits) during handler execution.
-                            let extra_mask = proc.signal_masks.lock()[sig as usize];
-                            let new_blocked = blocked | extra_mask | (1 << sig);
-                            proc.blocked_signals.store(new_blocked, Ordering::Relaxed);
                         }
+
+                        let sp = mut_tf.regs[2];
+                        if sp < frame_size + 16 || sp > 0x0000_8000_0000_0000 {
+                            drop(table);
+                            crate::posix::spawn::exit(pid, -11); // SIGSEGV
+                            crate::posix::process::schedule();
+                            halt_cpu()
+                        }
+
+                        new_sp = (sp - frame_size) & !15;
+                        new_sp_end = new_sp + frame_size - 1;
+                        saved_blocked = blocked;
+                        extra_mask = proc.signal_masks.lock()[sig as usize];
+                        new_blocked = blocked | extra_mask | (1 << sig);
+                        let satp = proc.satp_val.load(Ordering::Relaxed);
+                        root_pa = (satp & 0xFFF_FFFF_FFFF) << 12;
+                        do_deliver = true;
                     }
+                }
+            } // PROCESS_TABLE unlocked here
+
+            if do_deliver {
+                // Phase 2: VMM operations -- PROCESS_TABLE is NOT held, safe to
+                // call handle_user_page_fault which may re-enter PROCESS_TABLE.
+                if crate::mm::vmm::PageTable::walk_page_table(root_pa, new_sp).is_err() {
+                    if crate::mm::vmm::handle_user_page_fault(root_pa, new_sp, 0).is_err() {
+                        crate::posix::spawn::exit(pid, -11);
+                        crate::posix::process::schedule();
+                        halt_cpu()
+                    }
+                }
+                if (new_sp / 4096) != (new_sp_end / 4096)
+                    && crate::mm::vmm::PageTable::walk_page_table(root_pa, new_sp_end).is_err()
+                {
+                    if crate::mm::vmm::handle_user_page_fault(root_pa, new_sp_end, 0).is_err() {
+                        crate::posix::spawn::exit(pid, -11);
+                        crate::posix::process::schedule();
+                        halt_cpu()
+                    }
+                }
+
+                let frame = SignalFrame {
+                    saved_blocked,
+                    _pad: 0,
+                    tf: *mut_tf,
+                };
+                core::ptr::write(new_sp as *mut SignalFrame, frame);
+                mut_tf.regs[2] = new_sp;
+                mut_tf.regs[10] = sig as usize;
+                mut_tf.sepc = handler_addr;
+                mut_tf.regs[1] = restorer_addr;
+
+                // Phase 3: re-acquire PROCESS_TABLE to update blocked mask.
+                let table = crate::posix::process::PROCESS_TABLE.lock();
+                if let Some(proc) = table.get(&pid) {
+                    proc.blocked_signals.store(new_blocked, Ordering::Relaxed);
                 }
             }
         }

@@ -9,16 +9,8 @@ pub fn sys_pipe(arg0: usize, tf: &mut TrapFrame) {
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let mut fds = proc.fds.lock();
-    let h_r = {
-        let h = fds.lowest_free();
-        fds.insert_at(h, crate::ipc::handle::KernelObject::PipeRead(rh));
-        h
-    };
-    let h_w = {
-        let h = fds.lowest_free();
-        fds.insert_at(h, crate::ipc::handle::KernelObject::PipeWrite(wh));
-        h
-    };
+    let h_r = fds.insert(crate::ipc::handle::KernelObject::PipeRead(rh));
+    let h_w = fds.insert(crate::ipc::handle::KernelObject::PipeWrite(wh));
 
     if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const [u32; 2], 1) {
         tf.regs[10] = usize::MAX;
@@ -38,12 +30,24 @@ pub fn sys_dup(arg0: usize, tf: &mut TrapFrame) {
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let mut fds = proc.fds.lock();
-    if let Some(obj) = fds.get(old_fd) {
-        let obj_clone = obj.clone();
-        let new_fd = fds.insert(obj_clone);
+    
+    match fds.get_entry(old_fd) {
+        Some(entry) => {
+            if !entry.rights.contains(crate::ipc::handle::Rights::DUPLICATE) {
+                tf.regs[10] = crate::errno::EACCES;
+                return;
+            }
+        }
+        None => {
+            tf.regs[10] = crate::errno::EBADF;
+            return;
+        }
+    }
+
+    if let Some(new_fd) = fds.dup(old_fd) {
         tf.regs[10] = new_fd as usize;
     } else {
-        tf.regs[10] = usize::MAX;
+        tf.regs[10] = crate::errno::EBADF;
     }
 }
 
@@ -57,14 +61,27 @@ pub fn sys_dup2(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     crate::get_current_proc_or_esrch!(tf);
     let proc = crate::posix::process::get_current_proc().unwrap();
     let mut fds = proc.fds.lock();
-    if let Some(obj) = fds.get(old_fd) {
-        let obj_clone = obj.clone();
-        fds.insert_at(new_fd, obj_clone);
+    
+    match fds.get_entry(old_fd) {
+        Some(entry) => {
+            if !entry.rights.contains(crate::ipc::handle::Rights::DUPLICATE) {
+                tf.regs[10] = crate::errno::EACCES;
+                return;
+            }
+        }
+        None => {
+            tf.regs[10] = crate::errno::EBADF;
+            return;
+        }
+    }
+
+    if fds.dup2(old_fd, new_fd) {
         tf.regs[10] = new_fd as usize;
     } else {
-        tf.regs[10] = usize::MAX;
+        tf.regs[10] = crate::errno::EBADF;
     }
 }
+
 
 pub fn sys_mailbox_send(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let to_pid = arg0 as i32;
@@ -626,3 +643,464 @@ pub fn sys_datacopy(
 
     tf.regs[10] = copied;
 }
+
+pub fn sys_channel_create(arg0: usize, tf: &mut TrapFrame) {
+    let (ep1, ep2) = crate::ipc::channel::ChannelEndpoint::create_pair();
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+    let mut fds = proc.fds.lock();
+    let h1 = fds.insert(crate::ipc::handle::KernelObject::Channel(ep1));
+    let h2 = fds.insert(crate::ipc::handle::KernelObject::Channel(ep2));
+
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const [u32; 2], 1) {
+        fds.remove(h1);
+        fds.remove(h2);
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+
+    unsafe {
+        let arr = arg0 as *mut [u32; 2];
+        (*arr)[0] = h1;
+        (*arr)[1] = h2;
+    }
+    tf.regs[10] = 0;
+}
+
+pub fn sys_channel_write(
+    fd: usize,
+    buf_ptr: usize,
+    buf_len: usize,
+    handles_ptr: usize,
+    handles_len: usize,
+    tf: &mut TrapFrame,
+) {
+    if handles_len > 8 {
+        tf.regs[10] = crate::errno::EINVAL;
+        return;
+    }
+
+    if buf_len > 0 && !crate::mm::vmm::is_user_pointer_valid(tf, buf_ptr as *const u8, buf_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+
+    if handles_len > 0 && !crate::mm::vmm::is_user_pointer_valid(tf, handles_ptr as *const u32, handles_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+
+    let mut bytes = alloc::vec![0u8; buf_len];
+    if buf_len > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(buf_ptr as *const u8, bytes.as_mut_ptr(), buf_len);
+        }
+    }
+
+    let mut handle_ids = alloc::vec![0u32; handles_len];
+    if handles_len > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(handles_ptr as *const u32, handle_ids.as_mut_ptr(), handles_len);
+        }
+    }
+
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+
+    let mut handles = alloc::vec::Vec::with_capacity(handles_len);
+    let ep = {
+        let mut fds = proc.fds.lock();
+
+        // 1. Resolve fd to ChannelEndpoint with WRITE right
+        let ep = match fds.get_with_rights(fd as u32, crate::ipc::handle::Rights::WRITE) {
+            Ok(crate::ipc::handle::KernelObject::Channel(ep)) => ep.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EACCES;
+                return;
+            }
+        };
+
+        // 2. Disallow sending the channel's own handle to prevent deadlocks/ownership loop
+        for &h in &handle_ids {
+            if h == fd as u32 {
+                tf.regs[10] = crate::errno::EINVAL;
+                return;
+            }
+        }
+
+        // 2.5 Verify all handles in the write array are unique to prevent duplicate transfers
+        for (i, &h) in handle_ids.iter().enumerate() {
+            if handle_ids[..i].contains(&h) {
+                tf.regs[10] = crate::errno::EINVAL;
+                return;
+            }
+        }
+
+        // 3. Verify all handles exist and have TRANSFER rights
+        for &h in &handle_ids {
+            match fds.get_entry(h) {
+                Some(entry) => {
+                    if !entry.rights.contains(crate::ipc::handle::Rights::TRANSFER) {
+                        tf.regs[10] = crate::errno::EACCES;
+                        return;
+                    }
+                }
+                None => {
+                    tf.regs[10] = crate::errno::EBADF;
+                    return;
+                }
+            }
+        }
+
+        // 4. Remove handle entries from caller's table
+        for &h in &handle_ids {
+            if let Some(entry) = fds.remove_entry(h) {
+                handles.push(entry);
+            }
+        }
+
+        ep
+    };
+
+    // 5. Write message to endpoint
+    let msg = crate::ipc::channel::Message {
+        bytes,
+        handles,
+    };
+
+    match ep.write_fast(msg) {
+        Ok(waiter_pid) => {
+            tf.regs[10] = 0;
+            if let Some(waiter) = waiter_pid {
+                let current_pid = crate::posix::process::current_pid();
+                let mut rq = crate::posix::process::RUN_QUEUE.lock();
+                rq.push_back(current_pid);
+                rq.push_front(waiter);
+                drop(rq);
+                crate::posix::process::schedule();
+                unsafe { __halt_cpu() }
+            }
+        }
+        Err(_) => {
+            tf.regs[10] = usize::MAX; // -1 on error
+        }
+    }
+}
+
+pub fn sys_channel_read(
+    fd: usize,
+    buf_ptr: usize,
+    buf_len: usize,
+    handles_ptr: usize,
+    handles_len: usize,
+    tf: &mut TrapFrame,
+) {
+    if buf_len > 0 && !crate::mm::vmm::is_user_pointer_valid(tf, buf_ptr as *mut u8, buf_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        tf.regs[11] = 0;
+        return;
+    }
+
+    if handles_len > 0 && !crate::mm::vmm::is_user_pointer_valid(tf, handles_ptr as *mut u32, handles_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        tf.regs[11] = 0;
+        return;
+    }
+
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+
+    let ep_arc = {
+        let fds = proc.fds.lock();
+        match fds.get_with_rights(fd as u32, crate::ipc::handle::Rights::READ) {
+            Ok(crate::ipc::handle::KernelObject::Channel(ep)) => ep.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EACCES;
+                tf.regs[11] = 0;
+                return;
+            }
+        }
+    };
+
+    // Attempt to receive a message
+    match ep_arc.try_recv_constrained(buf_len, handles_len) {
+        Ok(Some(msg)) => {
+            copy_msg_to_user(msg, buf_ptr, buf_len, handles_ptr, handles_len, &proc, tf);
+        }
+        Ok(None) => {
+            // If peer is closed and no messages left, return EOF (0 bytes, 0 handles)
+            if ep_arc.is_peer_closed() {
+                tf.regs[10] = 0;
+                tf.regs[11] = 0;
+                return;
+            }
+
+            // Register as waiter
+            ep_arc.waiter.store(
+                crate::posix::process::current_pid(),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+
+            // Lost-wakeup check
+            match ep_arc.try_recv_constrained(buf_len, handles_len) {
+                Ok(Some(msg)) => {
+                    ep_arc.waiter.store(0, core::sync::atomic::Ordering::Relaxed);
+                    copy_msg_to_user(msg, buf_ptr, buf_len, handles_ptr, handles_len, &proc, tf);
+                }
+                Ok(None) => {
+                    if ep_arc.is_peer_closed() {
+                        ep_arc.waiter.store(0, core::sync::atomic::Ordering::Relaxed);
+                        tf.regs[10] = 0;
+                        tf.regs[11] = 0;
+                    } else {
+                        // Block
+                        tf.sepc -= 4; // Re-execute syscall
+                        crate::posix::process::schedule();
+                        unsafe { __halt_cpu() }
+                    }
+                }
+                Err(_) => {
+                    ep_arc.waiter.store(0, core::sync::atomic::Ordering::Relaxed);
+                    tf.regs[10] = crate::errno::EINVAL;
+                    tf.regs[11] = 0;
+                }
+            }
+        }
+        Err(_) => {
+            tf.regs[10] = crate::errno::EINVAL;
+            tf.regs[11] = 0;
+        }
+    }
+}
+
+fn copy_msg_to_user(
+    msg: crate::ipc::channel::Message,
+    buf_ptr: usize,
+    buf_len: usize,
+    handles_ptr: usize,
+    handles_len: usize,
+    proc: &alloc::sync::Arc<crate::posix::process::Process>,
+    tf: &mut TrapFrame,
+) {
+    let copy_bytes = core::cmp::min(buf_len, msg.bytes.len());
+    if copy_bytes > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(msg.bytes.as_ptr(), buf_ptr as *mut u8, copy_bytes);
+        }
+    }
+
+    let copy_handles = core::cmp::min(handles_len, msg.handles.len());
+    let mut minted_handles = alloc::vec![0u32; copy_handles];
+    if copy_handles > 0 {
+        let mut fds = proc.fds.lock();
+        for i in 0..copy_handles {
+            let entry = msg.handles[i].clone();
+            let new_id = fds.lowest_free();
+            let new_h = crate::ipc::handle::encode_handle(new_id, entry.generation.wrapping_add(1));
+            fds.insert_entry(new_h, entry);
+            minted_handles[i] = new_h;
+        }
+    }
+
+    if copy_handles > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(minted_handles.as_ptr(), handles_ptr as *mut u32, copy_handles);
+        }
+    }
+
+    tf.regs[10] = copy_bytes;
+    tf.regs[11] = copy_handles;
+}
+
+pub fn sys_port_create(out_handle_ptr: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, out_handle_ptr as *const u32, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+
+    let port = alloc::sync::Arc::new(crate::ipc::port::Port::new());
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+    let mut fds = proc.fds.lock();
+    let h = fds.insert(crate::ipc::handle::KernelObject::Port(port));
+    
+    unsafe {
+        *(out_handle_ptr as *mut u32) = h;
+    }
+    tf.regs[10] = 0;
+}
+
+pub fn sys_port_wait(port_fd: usize, out_packet_ptr: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, out_packet_ptr as *mut crate::ipc::port::PortPacket, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+    
+    let port = {
+        let fds = proc.fds.lock();
+        match fds.get_with_rights(port_fd as u32, crate::ipc::handle::Rights::READ) {
+            Ok(crate::ipc::handle::KernelObject::Port(p)) => p.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EACCES;
+                return;
+            }
+        }
+    };
+
+    if let Some(packet) = port.try_recv() {
+        unsafe {
+            *(out_packet_ptr as *mut crate::ipc::port::PortPacket) = packet;
+        }
+        tf.regs[10] = 0;
+    } else {
+        // Register as waiter
+        port.waiter.store(
+            crate::posix::process::current_pid(),
+            core::sync::atomic::Ordering::Relaxed,
+        );
+        // Lost-wakeup check
+        if let Some(packet) = port.try_recv() {
+            port.waiter.store(0, core::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                *(out_packet_ptr as *mut crate::ipc::port::PortPacket) = packet;
+            }
+            tf.regs[10] = 0;
+        } else {
+            // Block
+            tf.sepc -= 4; // Re-execute syscall when woken
+            crate::posix::process::schedule();
+            unsafe { __halt_cpu() }
+        }
+    }
+}
+
+pub fn sys_port_queue(port_fd: usize, packet_ptr: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, packet_ptr as *const crate::ipc::port::PortPacket, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+
+    let mut packet: crate::ipc::port::PortPacket = unsafe { core::mem::zeroed() };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            packet_ptr as *const crate::ipc::port::PortPacket,
+            &mut packet,
+            1,
+        );
+    }
+
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+    let port = {
+        let fds = proc.fds.lock();
+        match fds.get_with_rights(port_fd as u32, crate::ipc::handle::Rights::WRITE) {
+            Ok(crate::ipc::handle::KernelObject::Port(p)) => p.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EACCES;
+                return;
+            }
+        }
+    };
+
+    port.queue_packet(packet);
+    tf.regs[10] = 0;
+}
+
+pub fn sys_port_bind(
+    object_fd: usize,
+    port_fd: usize,
+    key: u64,
+    trigger_signals: u32,
+    tf: &mut TrapFrame,
+) {
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+
+    let fds = proc.fds.lock();
+    
+    let port = match fds.get_with_rights(port_fd as u32, crate::ipc::handle::Rights::WRITE) {
+        Ok(crate::ipc::handle::KernelObject::Port(p)) => p.clone(),
+        _ => {
+            tf.regs[10] = crate::errno::EACCES;
+            return;
+        }
+    };
+
+    let channel = match fds.get_with_rights(object_fd as u32, crate::ipc::handle::Rights::READ) {
+        Ok(crate::ipc::handle::KernelObject::Channel(ch)) => ch.clone(),
+        _ => {
+            tf.regs[10] = crate::errno::EACCES;
+            return;
+        }
+    };
+
+    // Bind observer
+    let observer = crate::ipc::port::SignalObserver {
+        port: port.clone(),
+        key,
+        trigger_signals,
+    };
+    channel.observers.lock().push(observer);
+
+    // Immediate state evaluation
+    let current_signals = channel.get_signals();
+    let triggered = current_signals & trigger_signals;
+    if triggered != 0 {
+        port.queue_packet(crate::ipc::port::PortPacket {
+            key,
+            type_: 1,
+            status: 0,
+            observed_signals: current_signals,
+        });
+    }
+
+    tf.regs[10] = 0;
+}
+
+pub fn sys_handle_duplicate(handle: usize, rights: usize, tf: &mut TrapFrame) {
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+    let mut fds = proc.fds.lock();
+    
+    let entry = match fds.get_entry(handle as u32) {
+        Some(e) => e,
+        None => {
+            tf.regs[10] = crate::errno::EBADF;
+            return;
+        }
+    };
+    
+    if !entry.rights.contains(crate::ipc::handle::Rights::DUPLICATE) {
+        tf.regs[10] = crate::errno::EACCES;
+        return;
+    }
+    
+    let req_rights = crate::ipc::handle::Rights::from_bits_truncate(rights as u32);
+    if !entry.rights.contains(req_rights) {
+        tf.regs[10] = crate::errno::EACCES;
+        return;
+    }
+    
+    let obj_clone = entry.object.clone();
+    let new_handle = fds.insert_with_rights(obj_clone, req_rights);
+    tf.regs[10] = new_handle as usize;
+}
+
+pub fn sys_handle_get_rights(handle: usize, tf: &mut TrapFrame) {
+    crate::get_current_proc_or_esrch!(tf);
+    let proc = crate::posix::process::get_current_proc().unwrap();
+    let fds = proc.fds.lock();
+
+    match fds.get_entry(handle as u32) {
+        Some(entry) => {
+            tf.regs[10] = entry.rights.bits() as usize;
+        }
+        None => {
+            tf.regs[10] = crate::errno::EBADF;
+        }
+    }
+}
+

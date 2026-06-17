@@ -1,7 +1,10 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use libos::{spawn, sys_yield, waitpid, write};
+use alloc::string::ToString;
 
 fn wrt(s: &[u8]) {
     write(1, s.as_ptr(), s.len());
@@ -37,7 +40,42 @@ pub extern "C" fn main() -> ! {
     ok_line(b"Mounting virtual filesystem");
 
 
-    // (Removed forktest)
+    // ── Run verification tests ────────────────────────────────────────────────
+    ok_line(b"Running boot-time verification");
+
+    // Run epolltest
+    let test_pid = spawn(b"/epolltest".as_ptr(), 10);
+    if test_pid >= 0 {
+        let mut status: i32 = 0;
+        waitpid(test_pid, &mut status as *mut i32, 0);
+        if status == 0 {
+            ok_line(b"epolltest");
+        } else {
+            // Show FAIL but continue boot
+            wrt(b"  \x1b[31mepolltest: FAILED (exit ");
+            wrt(status.to_string().as_bytes());
+            wrt(b")\x1b[0m\n");
+        }
+    } else {
+        wrt(b"  \x1b[33mepolltest: not found, skipping\x1b[0m\n");
+    }
+
+    // Run pkg (quick self-test — shows usage, confirms binary runs)
+    let pkg_pid = spawn(b"/pkg".as_ptr(), 4);
+    if pkg_pid >= 0 {
+        let mut status: i32 = 0;
+        waitpid(pkg_pid, &mut status as *mut i32, 0);
+        if status == 1 {
+            // pkg returns 1 for usage (no args) — that's expected
+            ok_line(b"pkg binary present");
+        } else {
+            wrt(b"  \x1b[33mpkg: unexpected exit status ");
+            wrt(status.to_string().as_bytes());
+            wrt(b"\x1b[0m\n");
+        }
+    } else {
+        wrt(b"  \x1b[33mpkg: not found, skipping\x1b[0m\n");
+    }
 
     // ── Login line ────────────────────────────────────────────────────────────
     wrt(b"openv 0.1.0-dev ttyS0\n\n");

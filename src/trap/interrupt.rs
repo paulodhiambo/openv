@@ -102,6 +102,7 @@ pub fn poll_uart_into_linedisc() {
                 if waiter > 0 {
                     crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
                 }
+                crate::ipc::handle::wake_epoll_waiters(&tty.epoll_waiters);
             }
             break;
         }
@@ -141,6 +142,7 @@ pub fn poll_uart_into_linedisc() {
         if waiter > 0 {
             crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
         }
+        crate::ipc::handle::wake_epoll_waiters(&tty.epoll_waiters);
     }
 }
 

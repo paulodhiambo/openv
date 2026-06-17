@@ -99,6 +99,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "epolltest"
+version = "0.1.0"
+dependencies = [
+ "libos",
+]
+
+[[package]]
 name = "forktest"
 version = "0.1.0"
 dependencies = [
@@ -146,6 +153,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "libopenv"
+version = "0.1.0"
+dependencies = [
+ "openv_syscall",
+ "vfs-proto",
+]
+
+[[package]]
 name = "libos"
 version = "0.1.0"
 dependencies = [
@@ -190,6 +205,17 @@ dependencies = [
  "heapless",
  "libos",
  "smoltcp",
+]
+
+[[package]]
+name = "openv_syscall"
+version = "0.1.0"
+
+[[package]]
+name = "pkg"
+version = "0.1.0"
+dependencies = [
+ "libos",
 ]
 
 [[package]]

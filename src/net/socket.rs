@@ -35,7 +35,8 @@
 //! [`Mutex`]: ../../sync/struct.Mutex.html
 
 use crate::ipc::channel::ChannelEndpoint;
-use crate::posix::process::Pid;
+use crate::ipc::handle::KernelObject;
+use crate::posix::process::{Pid, PROCESS_TABLE};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -175,9 +176,24 @@ pub fn pop_waiting_pid(sid: u32) -> Option<Pid> {
 ///
 /// * `sid` - The socket ID.
 /// * `user_fd` - The user-space file descriptor for the accepted connection.
+pub fn has_pending_accept(sid: u32) -> bool {
+    let m = PENDING_ACCEPTED.lock();
+    m.get(&sid).map_or(false, |v| !v.is_empty())
+}
+
 pub fn push_pending_accepted(sid: u32, user_fd: u32) {
     let mut m = PENDING_ACCEPTED.lock();
     m.entry(sid).or_default().push(user_fd);
+    drop(m);
+    // Wake epoll waiters on the listening socket.
+    if let Some((owner_pid, owner_fd)) = owner_of(sid) {
+        if let Some(proc) = PROCESS_TABLE.lock().get(&owner_pid).cloned() {
+            let fds = proc.fds.lock();
+            if let Some(KernelObject::Channel(ep)) = fds.get(owner_fd) {
+                crate::ipc::handle::wake_epoll_waiters(&ep.epoll_waiters);
+            }
+        }
+    }
 }
 
 /// Opcode: Acknowledgment.

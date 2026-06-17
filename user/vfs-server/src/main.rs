@@ -37,6 +37,8 @@ enum FsNode {
     MemFile(Vec<u8>),
     /// Directory: ordered list of child names (no leading slash).
     Dir(Vec<String>),
+    /// Symbolic link: target path string.
+    Symlink(String),
 }
 
 struct Vfs {
@@ -377,6 +379,102 @@ impl Vfs {
             FsNode::TarFile { size, .. } => Some((false, *size as u64)),
             FsNode::MemFile(data)        => Some((false, data.len() as u64)),
             FsNode::Dir(_)               => Some((true, 0)),
+            FsNode::Symlink(target)       => Some((false, target.len() as u64)),
+        }
+    }
+
+    fn readlink(&self, path: &str) -> Option<&str> {
+        if let Some(FsNode::Symlink(target)) = self.nodes.get(path) {
+            Some(target.as_str())
+        } else {
+            None
+        }
+    }
+
+    fn symlink(&mut self, link_path: &str, target: &str) -> bool {
+        if self.exists(link_path) { return false; }
+        if let Some((parent, name)) = Self::parent_and_name(link_path)
+            && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
+        {
+            children.push(name);
+            self.nodes.insert(String::from(link_path), FsNode::Symlink(String::from(target)));
+            true
+        } else {
+            false
+        }
+    }
+
+    fn link(&mut self, old_path: &str, new_path: &str) -> bool {
+        let node = match self.nodes.get(old_path) {
+            Some(n) => n,
+            None => return false,
+        };
+        // Don't link directories
+        if matches!(node, FsNode::Dir(_)) { return false; }
+        // Clone the node value
+        let cloned = match node {
+            FsNode::TarFile { tar_offset, size } => FsNode::TarFile { tar_offset: *tar_offset, size: *size },
+            FsNode::MemFile(data) => FsNode::MemFile(data.clone()),
+            FsNode::Symlink(t) => FsNode::Symlink(t.clone()),
+            FsNode::Dir(_) => unreachable!(),
+        };
+        if let Some((parent, name)) = Self::parent_and_name(new_path)
+            && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
+        {
+            if self.nodes.contains_key(new_path) { return false; }
+            children.push(name);
+            self.nodes.insert(String::from(new_path), cloned);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn chmod(&mut self, _path: &str, _mode: u32) -> bool {
+        // Mode is synthesized on stat; can store perms later if needed.
+        self.nodes.contains_key(_path) || is_virtual_path(_path)
+    }
+
+    fn chown(&mut self, _path: &str, _owner: u32, _group: u32) -> bool {
+        self.nodes.contains_key(_path) || is_virtual_path(_path)
+    }
+
+    fn truncate(&mut self, path: &str, length: u64) -> bool {
+        match self.nodes.get_mut(path) {
+            Some(FsNode::MemFile(data)) => {
+                data.resize(length as usize, 0);
+                true
+            }
+            Some(FsNode::TarFile { .. }) => {
+                // Promote TAR file to MemFile and truncate.
+                let mut data = Vec::new();
+                data.resize(length as usize, 0);
+                *self.nodes.get_mut(path).unwrap() = FsNode::MemFile(data);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn fallocate(&mut self, path: &str, offset: u64, length: u64) -> bool {
+        let end = (offset + length) as usize;
+        match self.nodes.get_mut(path) {
+            Some(FsNode::MemFile(data)) => {
+                if data.len() < end { data.resize(end, 0); }
+                true
+            }
+            Some(FsNode::TarFile { tar_offset, size }) => {
+                let (to, sz) = (*tar_offset, *size);
+                let mut data = Vec::new();
+                if sz > 0 {
+                    data.resize(sz, 0);
+                    initrd_read(&mut data, to);
+                }
+                if data.len() < end { data.resize(end, 0); }
+                *self.nodes.get_mut(path).unwrap() = FsNode::MemFile(data);
+                true
+            }
+            _ => false,
         }
     }
 }
@@ -750,7 +848,210 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 reply_ok(client, msg) // non-OFS fds have nothing to flush
             }
         }
-        _ => reply_err(client, msg),
+        OP_READLINK => {
+            let (path_ptr, path_len, buf_ptr, buf_len) = unpack_getdents_req(&msg.data);
+            if path_len == 0 || path_len > 1024 || buf_len == 0 { reply_err(client, msg); return; }
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+
+            let target_str;
+            let target_bytes: &[u8] = if let Some(stripped) = path.strip_prefix("/mnt") {
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                let ofs = match get_blockfs() { Some(o) => o, None => { reply_err(client, msg); return; } };
+                let (ino, etype) = match ofs.lookup_path(p) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                if etype != blockfs::ITYPE_SYMLINK_ENTRY { reply_err(client, msg); return; }
+                let inode = match ofs.read_inode(ino) { Some(i) => i, None => { reply_err(client, msg); return; } };
+                let mut content = alloc::vec![0u8; inode.size as usize];
+                if ofs.file_read(ino, 0, &mut content).is_err() { reply_err(client, msg); return; }
+                target_str = content; // keep alive
+                &target_str
+            } else {
+                match vfs.readlink(path) {
+                    Some(t) => t.as_bytes(),
+                    None => { reply_err(client, msg); return; }
+                }
+            };
+
+            let n = target_bytes.len().min(buf_len);
+            let mut data_buf = alloc::vec![0u8; n];
+            data_buf[..n].copy_from_slice(&target_bytes[..n]);
+            if libos::datacopy(libos::getpid(), data_buf.as_ptr(), client, buf_ptr as *mut u8, n) < 0 {
+                reply_err(client, msg); return;
+            }
+            pack_u32_reply(&mut msg.data, n as u32);
+            reply_ok(client, msg);
+        }
+        OP_SYMLINK => {
+            let (p1_ptr, p1_len, p2_ptr, p2_len) = unpack_two_paths_req(&msg.data);
+            if p1_len == 0 || p1_len > 1024 || p2_len == 0 || p2_len > 1024 { reply_err(client, msg); return; }
+            let mut link_buf = alloc::vec![0u8; p1_len];
+            let mut target_buf = alloc::vec![0u8; p2_len];
+            if libos::datacopy(client, p1_ptr as *const u8, libos::getpid(), link_buf.as_mut_ptr(), p1_len) < 0 ||
+               libos::datacopy(client, p2_ptr as *const u8, libos::getpid(), target_buf.as_mut_ptr(), p2_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let link = match core::str::from_utf8(&link_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            let target = match core::str::from_utf8(&target_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+
+            let ok = if let Some(stripped) = link.strip_prefix("/mnt") {
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                let ofs = match get_blockfs() { Some(o) => o, None => { reply_err(client, msg); return; } };
+                let (parent, name) = match Vfs::parent_and_name(p) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                let (dir_ino, etype) = match ofs.lookup_path(&parent) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                if etype != blockfs::ITYPE_DIR_ENTRY { reply_err(client, msg); return; }
+                // Allocate a new inode for the symlink.
+                let child_ino = match ofs.alloc_inode() { Some(i) => i, None => { reply_err(client, msg); return; } };
+                let new_inode = blockfs::RawInode {
+                    itype: blockfs::ITYPE_SYMLINK,
+                    _pad: [0; 3],
+                    size: 0,
+                    nlink: 1,
+                    used_blocks: 0,
+                    direct: [0u32; 12],
+                    indirect: 0,
+                    _reserved: [0u32; 15],
+                };
+                ofs.write_inode(child_ino, &new_inode);
+                // Write the target path as file content.
+                if ofs.file_write(child_ino, 0, target.as_bytes()).is_err() {
+                    ofs.free_inode(child_ino);
+                    false
+                } else if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_SYMLINK_ENTRY) {
+                    ofs.free_inode(child_ino);
+                    false
+                } else {
+                    true
+                }
+            } else {
+                vfs.symlink(link, target)
+            };
+            if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
+        }
+        OP_LINK => {
+            let (p1_ptr, p1_len, p2_ptr, p2_len) = unpack_two_paths_req(&msg.data);
+            if p1_len == 0 || p1_len > 1024 || p2_len == 0 || p2_len > 1024 { reply_err(client, msg); return; }
+            let mut old_buf = alloc::vec![0u8; p1_len];
+            let mut new_buf = alloc::vec![0u8; p2_len];
+            if libos::datacopy(client, p1_ptr as *const u8, libos::getpid(), old_buf.as_mut_ptr(), p1_len) < 0 ||
+               libos::datacopy(client, p2_ptr as *const u8, libos::getpid(), new_buf.as_mut_ptr(), p2_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let old = match core::str::from_utf8(&old_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            let new = match core::str::from_utf8(&new_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            let ok = if old.starts_with("/mnt") || new.starts_with("/mnt") {
+                // Both old and new must be on the same filesystem.
+                let (old_p, new_p) = if let (Some(o), Some(n)) = (
+                    old.strip_prefix("/mnt"),
+                    new.strip_prefix("/mnt"),
+                ) {
+                    let o = if o.is_empty() { "/" } else { o };
+                    let n = if n.is_empty() { "/" } else { n };
+                    (o, n)
+                } else {
+                    reply_err(client, msg); return;
+                };
+                let ofs = match get_blockfs() { Some(o) => o, None => { reply_err(client, msg); return; } };
+                let (old_ino, etype) = match ofs.lookup_path(old_p) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                let (parent, name) = match Vfs::parent_and_name(new_p) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                let (dir_ino, _) = match ofs.lookup_path(&parent) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                ofs.dir_link_entry(dir_ino, &name, old_ino, etype)
+            } else {
+                vfs.link(old, new)
+            };
+            if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
+        }
+        OP_CHMOD => {
+            let (_mode, path_ptr, path_len) = unpack_path_req(&msg.data);
+            if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            if vfs.exists(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+        }
+        OP_CHOWN => {
+            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
+            let mut path_buf = alloc::vec![0u8; path_len];
+            if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
+                reply_err(client, msg); return;
+            }
+            let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+            if vfs.exists(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+        }
+        OP_FTRUNCATE => {
+            let (fd, length) = unpack_ftruncate_req(&msg.data);
+            let path = match open_table.get(fd) {
+                Some(f) => f.path.clone(),
+                None => { reply_err(client, msg); return; }
+            };
+            let ok = if let Some(stripped) = path.strip_prefix("/mnt") {
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                let ofs = match get_blockfs() { Some(o) => o, None => { reply_err(client, msg); return; } };
+                let (ino, etype) = match ofs.lookup_path(p) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                if etype != blockfs::ITYPE_FILE_ENTRY { false } else {
+                    ofs.file_truncate(ino);
+                    true
+                }
+            } else {
+                vfs.truncate(&path, length)
+            };
+            if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
+        }
+        OP_LSEEK => {
+            let (fd, offset, whence) = unpack_lseek_req(&msg.data);
+            let file = match open_table.get(fd) {
+                Some(f) => f,
+                None => { reply_err(client, msg); return; }
+            };
+            // We need the file size to compute SEEK_END.
+            let file_size = vfs.stat(&file.path).map(|(_, s)| s).unwrap_or(0);
+            let new_offset = match whence {
+                0 /* SEEK_SET */ => offset,
+                1 /* SEEK_CUR */ => file.offset as i64 + offset,
+                2 /* SEEK_END */ => file_size as i64 + offset,
+                _ => { reply_err(client, msg); return; }
+            };
+            if new_offset < 0 { reply_err(client, msg); return; }
+            if let Some(f) = open_table.get_mut(fd) {
+                f.offset = new_offset as u64;
+                pack_u64_reply(&mut msg.data, new_offset as u64);
+                reply_ok(client, msg);
+            } else {
+                reply_err(client, msg);
+            }
+        }
+        OP_FPATH => {
+            let (fd, buf_ptr, buf_len) = unpack_fpath_req(&msg.data);
+            let path = match open_table.get(fd) {
+                Some(f) => f.path.as_bytes(),
+                None => { reply_err(client, msg); return; }
+            };
+            let n = path.len().min(buf_len);
+            let mut data_buf = alloc::vec![0u8; n];
+            data_buf.copy_from_slice(&path[..n]);
+            if libos::datacopy(libos::getpid(), data_buf.as_ptr(), client, buf_ptr as *mut u8, n) < 0 {
+                reply_err(client, msg); return;
+            }
+            pack_u32_reply(&mut msg.data, n as u32);
+            reply_ok(client, msg);
+        }
+        OP_FUTIMENS => {
+            let (_fd, _ats, _atns, _mts, _mtns) = unpack_futimens_req(&msg.data);
+            reply_ok(client, msg);
+        }
+        OP_FALLOCATE => {
+            let (fd, offset, length) = unpack_fallocate_req(&msg.data);
+            let path = match open_table.get(fd) {
+                Some(f) => f.path.clone(),
+                None => { reply_err(client, msg); return; }
+            };
+            if vfs.exists(&path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+        }
     }
 }
 

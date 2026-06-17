@@ -47,11 +47,16 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use crate::sync::Mutex;
 
-/// Map from `(root_pa, page_va)` to compressed page data.
+pub struct SwappedPage {
+    pub data: Vec<u8>,
+    pub flags: usize,
+}
+
+/// Map from `(root_pa, page_va)` to compressed page data and flags.
 ///
 /// The key is a tuple of the page table root physical address and the
-/// virtual address of the page. The value is the compressed page data.
-static SWAP_MAP: Mutex<BTreeMap<(usize, usize), Vec<u8>>> = Mutex::new(BTreeMap::new());
+/// virtual address of the page. The value is a SwappedPage containing the compressed data and original PTE flags.
+static SWAP_MAP: Mutex<BTreeMap<(usize, usize), SwappedPage>> = Mutex::new(BTreeMap::new());
 
 // ── Compression ───────────────────────────────────────────────────────────────
 
@@ -169,15 +174,13 @@ pub fn try_evict_page() -> bool {
                     let page_data = unsafe { *(pa as *const [u8; 4096]) };
                     // Compress and store
                     let compressed = compress_page(&page_data);
-                    SWAP_MAP.lock().insert((root_pa, va), compressed);
+                    let flags = pte & 0x3FF;
+                    SWAP_MAP.lock().insert((root_pa, va), SwappedPage { data: compressed, flags });
 
                     // Clear the PTE and free the physical frame
                     l0.entries[l0i] = 0;
                     unsafe { core::arch::asm!("sfence.vma") };
-                    let remaining = pmm::decr_ref(pa);
-                    if remaining == 0 {
-                        pmm::free_page(pa);
-                    }
+                    pmm::decr_ref_and_maybe_free(pa);
                     return true;
                 }
             }
@@ -227,20 +230,20 @@ pub fn lookup_swap(root_pa: usize, page_va: usize) -> bool {
 /// table entries and page data. The caller must ensure that `root_pa`
 /// is a valid page table root physical address.
 pub fn swap_in(root_pa: usize, page_va: usize) -> Result<(), &'static str> {
-    use crate::mm::vmm::{PageTable, PTE_R, PTE_W, PTE_U};
+    use crate::mm::vmm::PageTable;
     use crate::mm::pmm;
 
-    let compressed = SWAP_MAP.lock().remove(&(root_pa, page_va))
+    let swapped = SWAP_MAP.lock().remove(&(root_pa, page_va))
         .ok_or("swap entry not found")?;
 
     let frame = pmm::alloc_frame().ok_or("OOM during swap-in")?;
     // SAFETY: `frame.pa()` is a valid physical address returned by `alloc_frame`.
     let dst = unsafe { &mut *(frame.pa() as *mut [u8; 4096]) };
-    decompress_page(&compressed, dst);
+    decompress_page(&swapped.data, dst);
 
     // SAFETY: `root_pa` is a valid page table root physical address.
     let pt = unsafe { &mut *(root_pa as *mut PageTable) };
-    pt.map_page(page_va, frame.pa(), PTE_R | PTE_W | PTE_U)?;
+    pt.map_page(page_va, frame.pa(), swapped.flags)?;
     frame.into_raw();
     unsafe { core::arch::asm!("sfence.vma") };
     Ok(())

@@ -40,6 +40,10 @@
 //! [`decr_ref`]. This is used for copy-on-write (COW) sharing of
 //! physical pages between processes.
 //!
+//! When dropping the last reference to a page, use
+//! [`decr_ref_and_maybe_free`] (as [`PhysFrame`]'s `Drop` impl does)
+//! to avoid a TOCTOU race between the decrement and the free.
+//!
 //! ## Swap
 //!
 //! If the physical memory is exhausted, [`alloc_page`] attempts to
@@ -142,12 +146,12 @@ impl Drop for PhysFrame {
     /// Frees the frame when the guard is dropped.
     ///
     /// Decrements the reference count and, if it reaches zero,
-    /// returns the page to the free list.
+    /// returns the page to the free list.  Performs both the
+    /// decrement and the free under a single `PAGE_REF_COUNTS`
+    /// lock acquisition to prevent a TOCTOU race with
+    /// [`incr_ref`].
     fn drop(&mut self) {
-        let remaining = decr_ref(self.0);
-        if remaining == 0 {
-            free_page(self.0);
-        }
+        decr_ref_and_maybe_free(self.0);
     }
 }
 
@@ -253,6 +257,13 @@ pub fn init(dtb_ptr: usize) {
 
 /// Allocates a physical page frame.
 ///
+/// This function acquires [`FREE_LIST`] to pop a page, releases it,
+/// zeroes the page, then acquires [`PAGE_REF_COUNTS`] to set the
+/// initial reference count.  It never holds both locks simultaneously,
+/// so there is no lock-ordering conflict with [`free_page`] or
+/// [`decr_ref_and_maybe_free`] (which acquire
+/// [`PAGE_REF_COUNTS`] → [`FREE_LIST`]).
+///
 /// # Returns
 ///
 /// `Some(PhysFrame)` on success, or `None` if no pages are available.
@@ -320,6 +331,9 @@ pub fn alloc_page() -> Option<usize> {
 /// where the refcount is 0 but the page hasn't been returned to the
 /// free list yet.
 ///
+/// Lock order: [`PAGE_REF_COUNTS`] before [`FREE_LIST`] (see
+/// [`crate::sync`]).
+///
 /// # Arguments
 ///
 /// * `page` - The physical address of the page to free. Must be
@@ -331,16 +345,14 @@ pub fn alloc_page() -> Option<usize> {
 pub fn free_page(page: usize) {
     debug_assert!(page.is_multiple_of(PAGE_SIZE), "free_page: misaligned address {:#x}", page);
 
-    // Acquire both locks together so there is no window where the refcount
-    // is 0 but the page hasn't been returned to the free list yet.
-    // Lock order: PAGE_REF_COUNTS before FREE_LIST (see src/sync.rs).
-    let mut counts = PAGE_REF_COUNTS.lock();
-    let mut head   = FREE_LIST.lock();
-
     let idx = page_index(page);
-    if idx < MAX_PAGES {
-        counts[idx] = 0;
+    if idx >= MAX_PAGES {
+        return;
     }
+
+    let mut counts = PAGE_REF_COUNTS.lock();
+    counts[idx] = 0;
+    let mut head = FREE_LIST.lock();
 
     // SAFETY: `page` is a valid, 4096-byte-aligned physical frame with no
     // active references.  We write the old head into the frame's first word
@@ -394,6 +406,42 @@ pub fn decr_ref(page: usize) -> usize {
     } else {
         0
     }
+}
+
+/// Decrements the reference count for a page and, if it reaches zero,
+/// returns the physical page to the free list.
+///
+/// Unlike the callers that use [`decr_ref`] followed by a separate
+/// [`free_page`], this function holds the [`PAGE_REF_COUNTS`] lock
+/// across both the decrement and the decision to free, eliminating
+/// a TOCTOU window where a concurrent [`incr_ref`] could re-increment
+/// the count after it hits zero but before the page is freed.
+///
+/// Lock order: [`PAGE_REF_COUNTS`] before [`FREE_LIST`] (see
+/// [`crate::sync`]).
+///
+/// # Arguments
+///
+/// * `page` - The physical address of the page.
+pub fn decr_ref_and_maybe_free(page: usize) {
+    let idx = page_index(page);
+    if idx >= MAX_PAGES || !is_managed_page(page) {
+        return;
+    }
+
+    let mut counts = PAGE_REF_COUNTS.lock();
+
+    if counts[idx] > 1 {
+        counts[idx] -= 1;
+        return;
+    }
+
+    // Refcount was 1 (this drop). Zero it and return to free list.
+    counts[idx] = 0;
+
+    let mut head = FREE_LIST.lock();
+    unsafe { (page as *mut usize).write_volatile(*head); }
+    *head = page;
 }
 
 /// Checks if a physical address is managed by the PMM.
