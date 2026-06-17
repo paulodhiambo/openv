@@ -7,3 +7,4 @@ description = "OpenV userspace platform library — POSIX adaptation + VFS clien
 [dependencies]
 openv_syscall = { path = "../openv_syscall" }
 vfs-proto = { path = "../vfs-proto" }
+pm-proto = { path = "../pm-proto" }

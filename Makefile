@@ -13,14 +13,14 @@ DISK_IMG    := disk.img
 DISK_SIZE_MB := 8
 
 # Overridable via env or make args
-BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server pm-server rs-server echo-server net-client ipc_test virtio-blk-driver pkg epolltest
+BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server pm-server rs-server echo-server net-client ipc_test virtio-blk-driver pkg epolltest procfs-server devfs-server
 QEMU_MEM   ?= 512M
 QEMU_CPUS  ?= 1
 QEMU_FLAGS  = -machine virt -bios default -nographic -m $(QEMU_MEM) -smp $(QEMU_CPUS)
 QEMU_NET    = -netdev user,id=net0 -device virtio-net-device,netdev=net0
 QEMU_DISK   = -drive id=disk0,file=$(DISK_IMG),format=raw,if=none -device virtio-blk-device,drive=disk0
 
-.PHONY: help build build-kernel build-user build-release initrd              \
+.PHONY: help build build-kernel build-user build-release build-relibc initrd \
         run all debug image image-release disk                                \
         clean clean-user check clippy fmt                                     \
         $(BINS:%=test_root/%)
@@ -85,6 +85,10 @@ build-user:
 
 build-user-release:
 	cd user && $(CARGO) build --release
+
+build-relibc:
+	cd user/relibc && $(CARGO) build --release --target $(TARGET)
+	@echo "relibc static library: user/relibc/target/$(TARGET)/release/librelibc.a"
 
 initrd: test_root/proc test_root/dev
 	@for bin in $(BINS); do \

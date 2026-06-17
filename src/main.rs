@@ -377,7 +377,9 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         let pm_pid = posix::spawn::posix_spawn("/pm-server", init_pid).unwrap();
         let vfs_pid = posix::spawn::posix_spawn("/vfs-server", init_pid).unwrap();
         let rs_pid = posix::spawn::posix_spawn("/rs-server", init_pid).unwrap();
-        
+        let procfs_pid = posix::spawn::posix_spawn("/procfs-server", init_pid).unwrap();
+        let devfs_pid = posix::spawn::posix_spawn("/devfs-server", init_pid).unwrap();
+
         // Set capabilities for each boot server. Capabilities determine what
         // operations a process is allowed to perform. Each server gets a
         // different set of capabilities based on its role.
@@ -403,9 +405,17 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
             // The resource server (rs-server) can manage processes, perform
             // system administration, and copy data.
             rs_proc.caps.store(
-                posix::process::CAP_PROCESS | posix::process::CAP_SYS_ADMIN | posix::process::CAP_DATACOPY, 
+                posix::process::CAP_PROCESS | posix::process::CAP_SYS_ADMIN | posix::process::CAP_DATACOPY,
                 core::sync::atomic::Ordering::Relaxed
             );
+        }
+        if let Some(procfs_proc) = table.get(&procfs_pid) {
+            // procfs-server needs CAP_DATACOPY to write process data into callers' address spaces.
+            procfs_proc.caps.store(posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(devfs_proc) = table.get(&devfs_pid) {
+            // devfs-server needs CAP_DATACOPY to write device data into callers' address spaces.
+            devfs_proc.caps.store(posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
         }
         drop(table);
         

@@ -355,6 +355,78 @@ pub fn sys_initrd_data(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame
 
 
 
+/// syscall 66: register the calling process as the PM (process manager) server.
+/// Requires CAP_PROCESS.
+pub fn sys_pm_register(tf: &mut TrapFrame) {
+    if let Some(proc) = crate::posix::process::get_current_proc() {
+        if proc.caps.load(Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
+            tf.regs[10] = crate::errno::EPERM;
+            return;
+        }
+    } else {
+        tf.regs[10] = crate::errno::ESRCH;
+        return;
+    }
+    let pid = crate::posix::process::current_pid();
+    crate::trap::PM_SERVER_PID.store(pid, Ordering::Relaxed);
+    crate::println!("PM server registered: pid {}", pid);
+    tf.regs[10] = 0;
+}
+
+/// syscall 67: return the PID of the registered PM server, or usize::MAX.
+pub fn sys_get_pm_pid(tf: &mut TrapFrame) {
+    let pid = crate::trap::PM_SERVER_PID.load(Ordering::Relaxed);
+    tf.regs[10] = if pid > 0 { pid as usize } else { usize::MAX };
+}
+
+/// syscall 114: register the calling process as the procfs server.
+/// Requires CAP_DATACOPY.
+pub fn sys_proc_server_register(tf: &mut TrapFrame) {
+    if let Some(proc) = crate::posix::process::get_current_proc() {
+        if proc.caps.load(Ordering::Relaxed) & crate::posix::process::CAP_DATACOPY == 0 {
+            tf.regs[10] = crate::errno::EPERM;
+            return;
+        }
+    } else {
+        tf.regs[10] = crate::errno::ESRCH;
+        return;
+    }
+    let pid = crate::posix::process::current_pid();
+    crate::trap::PROC_SERVER_PID.store(pid, Ordering::Relaxed);
+    crate::println!("Proc server registered: pid {}", pid);
+    tf.regs[10] = 0;
+}
+
+/// syscall 115: return the PID of the registered procfs server, or usize::MAX.
+pub fn sys_get_proc_server_pid(tf: &mut TrapFrame) {
+    let pid = crate::trap::PROC_SERVER_PID.load(Ordering::Relaxed);
+    tf.regs[10] = if pid > 0 { pid as usize } else { usize::MAX };
+}
+
+/// syscall 116: register the calling process as the devfs server.
+/// Requires CAP_DATACOPY.
+pub fn sys_dev_server_register(tf: &mut TrapFrame) {
+    if let Some(proc) = crate::posix::process::get_current_proc() {
+        if proc.caps.load(Ordering::Relaxed) & crate::posix::process::CAP_DATACOPY == 0 {
+            tf.regs[10] = crate::errno::EPERM;
+            return;
+        }
+    } else {
+        tf.regs[10] = crate::errno::ESRCH;
+        return;
+    }
+    let pid = crate::posix::process::current_pid();
+    crate::trap::DEV_SERVER_PID.store(pid, Ordering::Relaxed);
+    crate::println!("Dev server registered: pid {}", pid);
+    tf.regs[10] = 0;
+}
+
+/// syscall 117: return the PID of the registered devfs server, or usize::MAX.
+pub fn sys_get_dev_server_pid(tf: &mut TrapFrame) {
+    let pid = crate::trap::DEV_SERVER_PID.load(Ordering::Relaxed);
+    tf.regs[10] = if pid > 0 { pid as usize } else { usize::MAX };
+}
+
 /// syscall 130: flush all pending writes for a VFS-backed fd to durable storage.
 /// The actual flush is done in the vfs-server (OFS commit_txn); the kernel just
 /// ACKs non-VFS fds immediately since there is nothing to flush here.

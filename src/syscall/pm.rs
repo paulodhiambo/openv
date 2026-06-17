@@ -79,8 +79,17 @@ pub fn sys_clone_process(arg0: usize, tf: &mut TrapFrame) {
         *child.ipc_state.lock() = target_proc.ipc_state.lock().clone();
     }
 
-    // Do NOT push to RUN_QUEUE yet; pm-server's msg_send will push it when it replies.
-    
+    // Leave child Stopped with mailbox_waiter=1 so pm-server's msg_send wakes it.
+    // pm-server must send a reply to child_pid after setting its trap frame,
+    // which will transition child to Running and push it to RUN_QUEUE.
+    {
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        if let Some(child_proc) = table.get(&child_pid) {
+            *child_proc.state.lock() = crate::posix::process::ProcState::Stopped;
+            child_proc.mailbox_waiter.store(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     tf.regs[10] = child_pid as usize;
 }
 

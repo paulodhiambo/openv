@@ -260,7 +260,8 @@ fn cmd_update() -> i32 {
     stdout(b"pkg: resolved ");
     stdout(MIRROR_HOST);
     stdout(b" to ");
-    stdout(mirror_ip.to_string().as_bytes());
+    let ip_str = alloc::format!("{}.{}.{}.{}", mirror_ip[0], mirror_ip[1], mirror_ip[2], mirror_ip[3]);
+    stdout(ip_str.as_bytes());
     stdout(b"\n");
 
     // Fetch Packages.gz for the architecture
@@ -348,6 +349,7 @@ fn resolve_deps(
 }
 
 fn cmd_install_pkg(pkg_name: &[u8]) -> i32 {
+    let mirror_ip = resolve_mirror_ip();
     // Read cached index
     let index_path = path_join(CACHE_DIR, b"Packages");
     let index_data = match read_file(&index_path, 4 * 1024 * 1024) {
@@ -412,7 +414,7 @@ fn cmd_install_pkg(pkg_name: &[u8]) -> i32 {
         stdout(&pkg.package);
         stdout(b"...\n");
 
-        let (status, body) = match http::http_get(MIRROR_IP, MIRROR_PORT, MIRROR_HOST, &deb_url) {
+        let (status, body) = match http::http_get(mirror_ip, MIRROR_PORT, MIRROR_HOST, &deb_url) {
             Some(r) => r,
             None => {
                 stderr(b"pkg: failed to download ");

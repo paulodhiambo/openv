@@ -260,6 +260,7 @@ impl Vfs {
                 Some(n)
             }
             FsNode::Dir(_) => None,
+            FsNode::Symlink(_) => None,
         }
     }
 
@@ -304,6 +305,7 @@ impl Vfs {
                 Some(n)
             }
             FsNode::Dir(_) => None,
+            FsNode::Symlink(_) => None,
         }
     }
 
@@ -418,11 +420,12 @@ impl Vfs {
             FsNode::Symlink(t) => FsNode::Symlink(t.clone()),
             FsNode::Dir(_) => unreachable!(),
         };
-        if let Some((parent, name)) = Self::parent_and_name(new_path)
-            && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
-        {
+        if let Some((parent, name)) = Self::parent_and_name(new_path) {
             if self.nodes.contains_key(new_path) { return false; }
-            children.push(name);
+            match self.nodes.get_mut(&parent) {
+                Some(FsNode::Dir(children)) => children.push(name),
+                _ => return false,
+            }
             self.nodes.insert(String::from(new_path), cloned);
             true
         } else {
@@ -652,6 +655,198 @@ fn reply_err(client: i32, mut msg: libos::ipc::Message) {
     libos::msg_send(client, &msg);
 }
 
+// ── Server PID helpers ────────────────────────────────────────────────────────
+
+fn get_proc_server_pid() -> i32 {
+    let r = libos::syscall(115, 0, 0, 0); // SYS_GET_PROC_SERVER_PID
+    if r == usize::MAX { 0 } else { r as i32 }
+}
+
+fn get_dev_server_pid() -> i32 {
+    let r = libos::syscall(117, 0, 0, 0); // SYS_GET_DEV_SERVER_PID
+    if r == usize::MAX { 0 } else { r as i32 }
+}
+
+// ── proc-server forwarding ────────────────────────────────────────────────────
+
+const OP_PROC_LIST: i32 = 1;
+const OP_PROC_READ: i32 = 2;
+const OP_PROC_STAT: i32 = 3;
+const OP_DEV_LIST: i32 = 1;
+const OP_DEV_READ: i32 = 2;
+const OP_DEV_WRITE: i32 = 3;
+const OP_DEV_STAT: i32 = 4;
+const PROC_REPLY_OK: i32 = 100;
+
+/// Forward a /proc/* read to procfs-server. Returns Some(n) if handled.
+fn forward_proc_read(proc_pid: i32, path: &str, offset: u64, client: i32, buf_ptr: usize, len: usize) -> Option<usize> {
+    // Parse: /proc/<pid>/status
+    let rest = path.strip_prefix("/proc/")?;
+    let (pid_str, sub) = rest.split_once('/').unwrap_or((rest, ""));
+    let pid: i32 = pid_str.parse().ok()?;
+    if sub != "status" && !sub.is_empty() { return None; }
+
+    let cap = len.min(512);
+    let mut local = alloc::vec![0u8; cap];
+
+    let mut req = libos::ipc::Message::new();
+    req.type_ = OP_PROC_READ;
+    req.data[0..4].copy_from_slice(&pid.to_le_bytes());
+    req.data[4..8].copy_from_slice(&(offset as u32).to_le_bytes());
+    req.data[8..12].copy_from_slice(&(cap as u32).to_le_bytes());
+    let lp = local.as_mut_ptr() as u64;
+    req.data[12..20].copy_from_slice(&lp.to_le_bytes());
+
+    libos::msg_send(proc_pid, &req);
+    let mut reply = libos::ipc::Message::new();
+    libos::msg_receive(proc_pid, &mut reply);
+
+    if reply.type_ != PROC_REPLY_OK { return None; }
+    let n = u32::from_le_bytes(reply.data[0..4].try_into().unwrap_or([0; 4])) as usize;
+    if n == 0 { return Some(0); }
+
+    if libos::datacopy(libos::getpid(), local.as_ptr(), client, buf_ptr as *mut u8, n) < 0 {
+        return None;
+    }
+    Some(n)
+}
+
+/// Forward a /proc getdents to procfs-server. Returns Some(n) if handled.
+fn forward_proc_list(proc_pid: i32, client: i32, buf_ptr: usize, max_len: usize) -> Option<usize> {
+    let cap = max_len.min(2048);
+    let mut local = alloc::vec![0u8; cap];
+
+    let mut req = libos::ipc::Message::new();
+    req.type_ = OP_PROC_LIST;
+    let lp = local.as_mut_ptr() as u64;
+    req.data[0..8].copy_from_slice(&lp.to_le_bytes());
+    req.data[8..12].copy_from_slice(&(cap as u32).to_le_bytes());
+
+    libos::msg_send(proc_pid, &req);
+    let mut reply = libos::ipc::Message::new();
+    libos::msg_receive(proc_pid, &mut reply);
+
+    if reply.type_ != PROC_REPLY_OK { return None; }
+    let n = u32::from_le_bytes(reply.data[0..4].try_into().unwrap_or([0; 4])) as usize;
+    if n == 0 { return Some(0); }
+
+    if libos::datacopy(libos::getpid(), local.as_ptr(), client, buf_ptr as *mut u8, n) < 0 {
+        return None;
+    }
+    Some(n)
+}
+
+/// Forward a /proc/* stat to procfs-server. Returns Some((is_dir, size)) if handled.
+fn forward_proc_stat(proc_pid: i32, path: &str) -> Option<(bool, u64)> {
+    let mut req = libos::ipc::Message::new();
+    req.type_ = OP_PROC_STAT;
+
+    if path == "/proc" {
+        req.data[0..4].copy_from_slice(&0i32.to_le_bytes()); // pid=0
+        req.data[4] = 1; // dir query
+    } else if let Some(rest) = path.strip_prefix("/proc/") {
+        let (pid_str, sub) = rest.split_once('/').unwrap_or((rest, ""));
+        let pid: i32 = pid_str.parse().ok()?;
+        req.data[0..4].copy_from_slice(&pid.to_le_bytes());
+        req.data[4] = if sub.is_empty() { 1 } else { 0 }; // dir vs file
+    } else {
+        return None;
+    }
+
+    libos::msg_send(proc_pid, &req);
+    let mut reply = libos::ipc::Message::new();
+    libos::msg_receive(proc_pid, &mut reply);
+
+    if reply.type_ != PROC_REPLY_OK { return None; }
+    let is_dir = reply.data[0] != 0;
+    let size = u32::from_le_bytes(reply.data[4..8].try_into().unwrap_or([0; 4])) as u64;
+    Some((is_dir, size))
+}
+
+// ── dev-server forwarding ─────────────────────────────────────────────────────
+
+fn dev_name_to_id(name: &str) -> Option<u8> {
+    match name { "null" => Some(0), "zero" => Some(1), "tty" => Some(2), _ => None }
+}
+
+/// Forward a /dev/* read to devfs-server. Returns Some(n) if handled.
+fn forward_dev_read(dev_pid: i32, path: &str, offset: u64, client: i32, buf_ptr: usize, len: usize) -> Option<usize> {
+    let name = path.strip_prefix("/dev/")?;
+    let dev_id = dev_name_to_id(name)?;
+
+    let cap = len.min(4096);
+    let mut local = alloc::vec![0u8; cap];
+
+    let mut req = libos::ipc::Message::new();
+    req.type_ = OP_DEV_READ;
+    req.data[0] = dev_id;
+    req.data[4..8].copy_from_slice(&(offset as u32).to_le_bytes());
+    req.data[8..12].copy_from_slice(&(cap as u32).to_le_bytes());
+    let lp = local.as_mut_ptr() as u64;
+    req.data[12..20].copy_from_slice(&lp.to_le_bytes());
+
+    libos::msg_send(dev_pid, &req);
+    let mut reply = libos::ipc::Message::new();
+    libos::msg_receive(dev_pid, &mut reply);
+
+    if reply.type_ != PROC_REPLY_OK { return None; }
+    let n = u32::from_le_bytes(reply.data[0..4].try_into().unwrap_or([0; 4])) as usize;
+    if n == 0 { return Some(0); }
+
+    if libos::datacopy(libos::getpid(), local.as_ptr(), client, buf_ptr as *mut u8, n) < 0 {
+        return None;
+    }
+    Some(n)
+}
+
+/// Forward a /dev/* stat to devfs-server. Returns Some((is_dir, size)) if handled.
+fn forward_dev_stat(dev_pid: i32, path: &str) -> Option<(bool, u64)> {
+    let mut req = libos::ipc::Message::new();
+    req.type_ = OP_DEV_STAT;
+
+    if path == "/dev" {
+        req.data[0] = 0xFF; // dir query
+    } else {
+        let name = path.strip_prefix("/dev/")?;
+        let dev_id = dev_name_to_id(name)?;
+        req.data[0] = dev_id;
+    }
+
+    libos::msg_send(dev_pid, &req);
+    let mut reply = libos::ipc::Message::new();
+    libos::msg_receive(dev_pid, &mut reply);
+
+    if reply.type_ != PROC_REPLY_OK { return None; }
+    let is_dir = reply.data[0] != 0;
+    let size = u32::from_le_bytes(reply.data[4..8].try_into().unwrap_or([0; 4])) as u64;
+    Some((is_dir, size))
+}
+
+/// Forward a /dev getdents to devfs-server. Returns Some(n) if handled.
+fn forward_dev_list(dev_pid: i32, client: i32, buf_ptr: usize, max_len: usize) -> Option<usize> {
+    let cap = max_len.min(256);
+    let mut local = alloc::vec![0u8; cap];
+
+    let mut req = libos::ipc::Message::new();
+    req.type_ = OP_DEV_LIST;
+    let lp = local.as_mut_ptr() as u64;
+    req.data[0..8].copy_from_slice(&lp.to_le_bytes());
+    req.data[8..12].copy_from_slice(&(cap as u32).to_le_bytes());
+
+    libos::msg_send(dev_pid, &req);
+    let mut reply = libos::ipc::Message::new();
+    libos::msg_receive(dev_pid, &mut reply);
+
+    if reply.type_ != PROC_REPLY_OK { return None; }
+    let n = u32::from_le_bytes(reply.data[0..4].try_into().unwrap_or([0; 4])) as usize;
+    if n == 0 { return Some(0); }
+
+    if libos::datacopy(libos::getpid(), local.as_ptr(), client, buf_ptr as *mut u8, n) < 0 {
+        return None;
+    }
+    Some(n)
+}
+
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
 fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Message) {
@@ -691,6 +886,38 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }),
                 None => { reply_err(client, msg); return; }
             };
+
+            // Delegate /proc/* reads to procfs-server if registered.
+            if path.starts_with("/proc/") {
+                let proc_pid = get_proc_server_pid();
+                if proc_pid > 0 {
+                    match forward_proc_read(proc_pid, &path, read_off, client, buf_ptr, len_req) {
+                        Some(n) => {
+                            if let Some(f) = open_table.get_mut(fd) { f.offset = read_off + n as u64; }
+                            pack_u32_reply(&mut msg.data, n as u32);
+                            reply_ok(client, msg);
+                        }
+                        None => reply_err(client, msg),
+                    }
+                    return;
+                }
+            }
+
+            // Delegate /dev/* reads to devfs-server if registered.
+            if path.starts_with("/dev/") {
+                let dev_pid = get_dev_server_pid();
+                if dev_pid > 0 {
+                    match forward_dev_read(dev_pid, &path, read_off, client, buf_ptr, len_req) {
+                        Some(n) => {
+                            if let Some(f) = open_table.get_mut(fd) { f.offset = read_off + n as u64; }
+                            pack_u32_reply(&mut msg.data, n as u32);
+                            reply_ok(client, msg);
+                        }
+                        None => reply_err(client, msg),
+                    }
+                    return;
+                }
+            }
 
             let mut data_buf = alloc::vec![0u8; len_req.min(1024 * 1024)]; // max 1MB per chunk
             let take = data_buf.len();
@@ -741,7 +968,31 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            
+
+            // Delegate /proc getdents to procfs-server if registered.
+            if path == "/proc" || path.starts_with("/proc/") {
+                let proc_pid = get_proc_server_pid();
+                if proc_pid > 0 {
+                    match forward_proc_list(proc_pid, client, buf_ptr, buf_len) {
+                        Some(n) => { pack_u32_reply(&mut msg.data, n as u32); reply_ok(client, msg); }
+                        None => reply_err(client, msg),
+                    }
+                    return;
+                }
+            }
+
+            // Delegate /dev getdents to devfs-server if registered.
+            if path == "/dev" {
+                let dev_pid = get_dev_server_pid();
+                if dev_pid > 0 {
+                    match forward_dev_list(dev_pid, client, buf_ptr, buf_len) {
+                        Some(n) => { pack_u32_reply(&mut msg.data, n as u32); reply_ok(client, msg); }
+                        None => reply_err(client, msg),
+                    }
+                    return;
+                }
+            }
+
             match vfs.readdir(path) {
                 Some(children) => {
                     let mut data_buf = alloc::vec![0u8; buf_len];
@@ -802,6 +1053,37 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
+
+            // Delegate /proc stat to procfs-server if registered.
+            if path == "/proc" || path.starts_with("/proc/") {
+                let proc_pid = get_proc_server_pid();
+                if proc_pid > 0 {
+                    match forward_proc_stat(proc_pid, path) {
+                        Some((is_dir, size)) => {
+                            pack_stat_reply(&mut msg.data, is_dir, size);
+                            reply_ok(client, msg);
+                        }
+                        None => reply_err(client, msg),
+                    }
+                    return;
+                }
+            }
+
+            // Delegate /dev stat to devfs-server if registered.
+            if path == "/dev" || path.starts_with("/dev/") {
+                let dev_pid = get_dev_server_pid();
+                if dev_pid > 0 {
+                    match forward_dev_stat(dev_pid, path) {
+                        Some((is_dir, size)) => {
+                            pack_stat_reply(&mut msg.data, is_dir, size);
+                            reply_ok(client, msg);
+                        }
+                        None => reply_err(client, msg),
+                    }
+                    return;
+                }
+            }
+
             match vfs.stat(path) {
                 Some((is_dir, size)) => {
                     pack_stat_reply(&mut msg.data, is_dir, size);
@@ -1052,6 +1334,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
             };
             if vfs.exists(&path) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
+        _ => { reply_err(client, msg); }
     }
 }
 

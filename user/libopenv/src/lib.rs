@@ -1,6 +1,7 @@
 #![no_std]
 
 pub mod ipc;
+pub mod pm;
 pub mod vfs;
 
 // Re-export the raw syscall layer for convenience.

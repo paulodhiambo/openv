@@ -101,10 +101,16 @@ pub const SYS_SET_RAW: usize = 38;
 pub const SYS_VFS_REGISTER: usize = 63;
 pub const SYS_GET_VFS_PID: usize = 64;
 pub const SYS_INITRD_DATA: usize = 65;
+pub const SYS_PM_REGISTER: usize = 66;
+pub const SYS_GET_PM_PID: usize = 67;
 pub const SYS_PROC_LIST: usize = 110;
 pub const SYS_PROC_STATUS: usize = 111;
 pub const SYS_BLK_REGISTER: usize = 112;
 pub const SYS_GET_BLK_PID: usize = 113;
+pub const SYS_PROC_SERVER_REGISTER: usize = 114;
+pub const SYS_GET_PROC_SERVER_PID: usize = 115;
+pub const SYS_DEV_SERVER_REGISTER: usize = 116;
+pub const SYS_GET_DEV_SERVER_PID: usize = 117;
 
 // Process manager primitives (kernel-only, for pm-server)
 pub const SYS_CLONE_PROCESS: usize = 100;

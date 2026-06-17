@@ -151,10 +151,16 @@ pub fn dispatch(
         63 => fs::sys_vfs_register(tf),
         64 => fs::sys_get_vfs_pid(tf),
         65 => fs::sys_initrd_data(arg0, arg1, arg2, tf),
+        66 => fs::sys_pm_register(tf),
+        67 => fs::sys_get_pm_pid(tf),
         110 => fs::sys_proc_list(arg0, arg1, tf),
         111 => fs::sys_proc_status(arg0, arg1, arg2, tf),
         112 => fs::sys_blk_register(tf),
         113 => fs::sys_get_blk_pid(tf),
+        114 => fs::sys_proc_server_register(tf),
+        115 => fs::sys_get_proc_server_pid(tf),
+        116 => fs::sys_dev_server_register(tf),
+        117 => fs::sys_get_dev_server_pid(tf),
 
         // ipc.rs
         3 => ipc::sys_pipe(arg0, tf),

@@ -1,5 +1,5 @@
 [workspace]
-members = ["libos", "vfs-proto", "pm-proto", "vfs-server", "pm-server", "rs-server", "init", "sh", "ls", "cat", "producer", "consumer", "net-smoltcp", "hello", "doexec", "forktest", "spin", "echo-server", "net-client", "ipc_test", "virtio-blk-driver", "openv_syscall", "libopenv", "pkg", "epolltest"]
+members = ["libos", "vfs-proto", "pm-proto", "vfs-server", "pm-server", "rs-server", "init", "sh", "ls", "cat", "producer", "consumer", "net-smoltcp", "hello", "doexec", "forktest", "spin", "echo-server", "net-client", "ipc_test", "virtio-blk-driver", "openv_syscall", "libopenv", "pkg", "epolltest", "procfs-server", "devfs-server"]
 resolver = "2"
 
 [workspace.lints.rust]

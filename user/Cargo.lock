@@ -85,6 +85,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "devfs-server"
+version = "0.1.0"
+dependencies = [
+ "libos",
+ "openv_syscall",
+]
+
+[[package]]
 name = "doexec"
 version = "0.1.0"
 dependencies = [
@@ -157,6 +165,7 @@ name = "libopenv"
 version = "0.1.0"
 dependencies = [
  "openv_syscall",
+ "pm-proto",
  "vfs-proto",
 ]
 
@@ -260,6 +269,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "procfs-server"
+version = "0.1.0"
+dependencies = [
+ "libos",
+ "openv_syscall",
 ]
 
 [[package]]
