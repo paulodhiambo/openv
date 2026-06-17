@@ -1,0 +1,12 @@
+[package]
+name = "component-manager"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "component-manager"
+path = "src/main.rs"
+
+[dependencies]
+libos = { path = "../libos" }
+openv_syscall = { path = "../openv_syscall" }
