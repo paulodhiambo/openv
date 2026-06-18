@@ -75,7 +75,26 @@
 use crate::mm::pmm::alloc_frame;
 use crate::println;
 use core::arch::asm;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use riscv::register::satp;
+
+unsafe extern "C" {
+    static _text_start: u8;
+    static _text_end: u8;
+    static _rodata_end: u8;
+    static _stack_guard_start: u8;
+    static _stack_start: u8;
+    static _stack_end: u8;
+}
+
+/// Kernel L2 root entries saved after vmm::init() so every new process page
+/// table can share the same L1/L0 subtrees for the kernel mapping.
+static KERNEL_ROOT_ENTRIES: [AtomicUsize; 4] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
 
 /// PTE Valid flag. If set, the PTE is valid.
 pub const PTE_V: usize = 1 << 0;
@@ -134,11 +153,11 @@ impl PageTable {
         // Postconditions: Returns a mutable reference to the 4096-byte frame cast as a `PageTable`. Mutability is safe as we hold exclusive ownership.
         let root = unsafe { &mut *(root_page as *mut PageTable) };
 
-        // Identity map kernel using 1GB mega-pages (0 to 4GB); NOT PTE_U
+        // Copy the kernel L2 entries established by vmm::init().
+        // This shares the physical L1/L0 subtrees (including per-section W^X
+        // mappings) rather than creating new 1GB RWX superpages.
         for i in 0..4 {
-            let pa = i * 0x40000000;
-            let ppn = pa >> 12;
-            root.entries[i] = (ppn << 10) | PTE_V | PTE_R | PTE_W | PTE_X;
+            root.entries[i] = KERNEL_ROOT_ENTRIES[i].load(Ordering::Relaxed);
         }
 
         Ok(root_page)
@@ -176,6 +195,11 @@ impl PageTable {
                 *entry = (ppn << 10) | PTE_V;
                 new_page.into_raw(); // Ownership transferred to PTE
             }
+            // A valid leaf entry (megapage) at this level means the region is
+            // already mapped at a larger granularity — cannot subdivide it.
+            if *entry & (PTE_R | PTE_W | PTE_X) != 0 {
+                return Err("map_page: intermediate PTE is already a leaf (megapage conflict)");
+            }
             let next_pt_pa = (*entry >> 10) << 12;
             // SAFETY:
             // Preconditions: `next_pt_pa` is a physical address derived from a valid PTE we just wrote or verified. It represents a 4096-byte aligned page table frame owned by the process.
@@ -191,6 +215,38 @@ impl PageTable {
         let ppn = pa >> 12;
         *entry = (ppn << 10) | PTE_V | flags;
 
+        Ok(())
+    }
+
+    /// Maps a 2 MB megapage (L1 leaf entry) from `va` to `pa`.
+    ///
+    /// Both `va` and `pa` must be 2 MB-aligned.  An L1 intermediate table is
+    /// allocated on demand and shared across subsequent calls for the same L2
+    /// entry.  Collisions with an existing valid L1 entry are rejected.
+    pub fn map_megapage(&mut self, va: usize, pa: usize, flags: usize) -> Result<(), &'static str> {
+        let vpn2 = (va >> 30) & 0x1FF;
+        let vpn1 = (va >> 21) & 0x1FF;
+
+        let l2e = &mut self.entries[vpn2];
+        if *l2e & PTE_V == 0 {
+            let new_page = alloc_frame().ok_or("Out of memory for L1 table in map_megapage")?;
+            let ppn = new_page.pa() >> 12;
+            *l2e = (ppn << 10) | PTE_V;
+            new_page.into_raw();
+        }
+        if *l2e & (PTE_R | PTE_W | PTE_X) != 0 {
+            return Err("map_megapage: L2 entry is already a 1GB leaf");
+        }
+        let l1_pa = (*l2e >> 10) << 12;
+        // SAFETY: l1_pa is a valid page table physical address derived from a PTE we own.
+        let l1 = unsafe { &mut *(l1_pa as *mut PageTable) };
+
+        let l1e = &mut l1.entries[vpn1];
+        if *l1e & PTE_V != 0 {
+            return Err("map_megapage: 2MB region already mapped");
+        }
+        let ppn = pa >> 12;
+        *l1e = (ppn << 10) | PTE_V | flags;
         Ok(())
     }
 
@@ -581,9 +637,15 @@ pub fn handle_user_page_fault(root_pa: usize, fault_va: usize, extra_flags: usiz
 
     // Map the new page with base R/W/U permissions plus any caller-supplied flags
     // (e.g. PTE_X for instruction-fetch faults so the CPU can re-execute).
+    // Enforce W^X: a page may be writable OR executable, never both.
     // SAFETY: `root_pa` is derived from the active SATP CSR.
     let pt = unsafe { &mut *(root_pa as *mut PageTable) };
-    let flags = PTE_R | PTE_W | PTE_U | extra_flags;
+    let raw_flags = PTE_R | PTE_U | extra_flags;
+    let wants_w = extra_flags & PTE_W == 0; // base flags always have W; extra for X
+    let wants_x = extra_flags & PTE_X != 0;
+    let flags = raw_flags
+        | if wants_x { PTE_X } else { 0 }
+        | if wants_w && !wants_x { PTE_W } else { 0 };
     match pt.map_page(page_va, frame.pa(), flags) {
         Ok(()) => {
             frame.into_raw(); // Ownership transferred to PTE
@@ -695,49 +757,133 @@ pub fn is_user_pointer_valid<T>(
     start >= 0x1_0000_0000 && end <= 0x0000_8000_0000_0000
 }
 
+/// Sets up fine-grained kernel memory protection on `root`.
+///
+/// Replaces the blanket 4×1GB RWX identity map with per-section permissions:
+///
+/// | Region | Flags |
+/// |--------|-------|
+/// | 0–1 GB (MMIO) | R+W (no X) |
+/// | OpenSBI (2MB at 0x8000_0000) | R+W |
+/// | `.text` | R+X (no W) |
+/// | `.rodata` | R only |
+/// | `.data` / `.bss` | R+W |
+/// | Primary HART stack guard page | unmapped (hardware fault on overflow) |
+/// | Primary HART stack | R+W |
+/// | Heap + PMM pages (2MB superpages) | R+W |
+///
+/// The 1–2 GB and 3–4 GB physical ranges are not present on QEMU virt and
+/// are left unmapped.
+fn setup_kernel_memory_protection(root: &mut PageTable) -> Result<(), &'static str> {
+    const PAGE_SIZE: usize = 4096;
+    const MEGAPAGE: usize = 0x200000; // 2 MB
+    const GB2: usize = 0x8000_0000; // base of RAM
+    const GB3: usize = 0xC000_0000; // top of mapped RAM window
+
+    // Read section boundaries from linker-exported symbols.
+    let text_start   = core::ptr::addr_of!(_text_start)      as usize;
+    let text_end     = core::ptr::addr_of!(_text_end)        as usize;
+    let rodata_end   = core::ptr::addr_of!(_rodata_end)      as usize;
+    let stack_guard  = core::ptr::addr_of!(_stack_guard_start) as usize;
+    let stack_start  = core::ptr::addr_of!(_stack_start)     as usize;
+    let stack_end    = core::ptr::addr_of!(_stack_end)       as usize;
+
+    // L2[0]: 0–1 GB identity map as a 1 GB superpage, R+W only.
+    // Covers UART (0x1000_0000), PLIC, VirtIO, etc. MMIO must not be executable.
+    root.entries[0] = PTE_V | PTE_R | PTE_W; // ppn=0 → PA 0x0000_0000
+
+    // L2[1] and L2[3]: no physical memory on QEMU virt — leave invalid (0).
+
+    // L2[2]: 2–3 GB (RAM) — fine-grained via a shared L1 table.
+    //
+    // Phase A: OpenSBI occupies exactly the first 2 MB of RAM (0x8000_0000–0x801F_FFFF).
+    // Map it as a single 2 MB megapage (R+W, not X).
+    root.map_megapage(GB2, GB2, PTE_R | PTE_W)?;
+
+    // Phase B: Kernel binary — 4 KB pages with W^X enforcement.
+    // All section boundaries in the linker script are 4 KB-aligned.
+
+    // .text → R+X
+    let mut pa = text_start;
+    while pa < text_end {
+        root.map_page(pa, pa, PTE_R | PTE_X)?;
+        pa += PAGE_SIZE;
+    }
+
+    // .rodata → R (no write, no execute)
+    let mut pa = text_end;
+    while pa < rodata_end {
+        root.map_page(pa, pa, PTE_R)?;
+        pa += PAGE_SIZE;
+    }
+
+    // .data + .bss → R+W
+    let mut pa = rodata_end;
+    while pa < stack_guard {
+        root.map_page(pa, pa, PTE_R | PTE_W)?;
+        pa += PAGE_SIZE;
+    }
+
+    // Primary HART stack guard page (stack_guard..stack_start): intentionally left UNMAPPED.
+    // A stack overflow will generate an instruction/store page fault, not a silent overwrite.
+
+    // Primary HART stack → R+W
+    let mut pa = stack_start;
+    while pa < stack_end {
+        root.map_page(pa, pa, PTE_R | PTE_W)?;
+        pa += PAGE_SIZE;
+    }
+
+    // Phase C: remainder of RAM (heap, PMM free-list pages, process page tables).
+    // Round stack_end up to the next 2 MB boundary for megapage alignment.
+    let heap_base = (stack_end + MEGAPAGE - 1) & !(MEGAPAGE - 1);
+    let mut pa = heap_base;
+    while pa < GB3 {
+        root.map_megapage(pa, pa, PTE_R | PTE_W)?;
+        pa += MEGAPAGE;
+    }
+
+    Ok(())
+}
+
 /// Initializes the virtual memory manager.
 ///
 /// This function:
 /// 1. Allocates a root page table for the kernel.
-/// 2. Identity-maps the first 4 GB of physical address space.
+/// 2. Sets up fine-grained kernel memory protection (W^X, NX, hardware stack guard).
 /// 3. Enables Sv39 paging by writing the `SATP` CSR.
 /// 4. Flushes the TLB.
 ///
-/// This should be called once during kernel boot, after the PMM is
-/// initialized.
+/// This should be called once during kernel boot, after the PMM is initialized.
 pub fn init() {
     let root_page = alloc_frame().expect("Failed to allocate root page table").into_raw();
     // SAFETY: `ROOT_PAGE_TABLE` is only written here during single-threaded
-    // kernel init before any secondary HARTs are released (SMP_GO_FLAG is
-    // not set yet).  After init(), it is only read.
+    // kernel init before any secondary HARTs are released.  After init() it is only read.
     unsafe {
         ROOT_PAGE_TABLE = root_page;
     }
 
-    // SAFETY:
-    // Preconditions: `root_page` is a valid, 4096-aligned physical address just allocated.
-    // Postconditions: Modifies the root kernel table to identity-map the first 4GB.
+    // SAFETY: `root_page` is a valid, 4096-aligned physical address just allocated.
     let root = unsafe { &mut *(root_page as *mut PageTable) };
 
-    // Identity map the first 4GB of physical address space using 1GB mega-pages
-    // This covers our UART MMIO (0x1000_0000) and RAM (0x8000_0000)
+    setup_kernel_memory_protection(root)
+        .expect("kernel memory protection setup failed");
+
+    // Persist kernel L2 entries so new_process_table() can share the same
+    // L1/L0 subtrees without re-allocating or duplicating page table pages.
     for i in 0..4 {
-        let pa = i * 0x40000000;
-        let ppn = pa >> 12;
-        // Set Valid, Read, Write, Execute flags
-        root.entries[i] = (ppn << 10) | PTE_V | PTE_R | PTE_W | PTE_X;
+        KERNEL_ROOT_ENTRIES[i].store(root.entries[i], Ordering::Relaxed);
     }
 
     let ppn = root_page >> 12;
-    // satp MODE: 8 means Sv39
-    let satp_val = (8 << 60) | ppn;
+    // satp MODE=8 → Sv39
+    let satp_val = (8usize << 60) | ppn;
 
     // SAFETY: satp::write() is a privileged CSR write valid in S-mode.
-    // sfence.vma flushes the TLB after enabling paging so stale entries
-    // from the identity-map phase are evicted before any user code runs.
+    // sfence.vma flushes stale TLB entries accumulated before paging was enabled.
     unsafe {
         satp::write(satp_val);
         asm!("sfence.vma");
     }
-    println!("VMM initialized. Sv39 paging enabled.");
+    println!("VMM: Sv39 paging enabled with W^X kernel protection.");
 }

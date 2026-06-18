@@ -283,6 +283,11 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // fallback.
     crate::net::init(dtb_ptr);
 
+    // Initialize VirtIO GPU 2D framebuffer driver.
+    // Scans QEMU virt MMIO slots for a GPU device and sets up a 640×480
+    // scatter-gather framebuffer. Safe to call even if no GPU is present.
+    crate::drivers::gpu::probe();
+
     // Initrd parsing. The initrd is described in the DTB's `/chosen` node
     // via the `linux,initrd-start` and `linux,initrd-end` properties.
     let fdt = unsafe { fdt::Fdt::from_ptr(dtb_ptr as *const u8).unwrap() };

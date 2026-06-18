@@ -91,12 +91,41 @@ pub fn poll_uart_into_linedisc() {
                 drop(table);
             } else {
                 // No external fg process — the shell itself is reading stdin.
-                // Set ctrlc so sys_read returns 0 (the shell can cancel the
-                // current input line), and push 0x03 into the TTY buffer so
-                // raw-mode readers also see it.
                 tty.ctrlc.store(true, Ordering::Relaxed);
                 let mut buf = tty.buf.lock();
                 buf.push_back(0x03);
+                drop(buf);
+                let waiter = tty.waiter.swap(0, Ordering::Relaxed);
+                if waiter > 0 {
+                    crate::posix::process::enqueue(waiter);
+                }
+                crate::ipc::handle::wake_epoll_waiters(&tty.epoll_waiters);
+            }
+            break;
+        }
+        if c == 0x1A {
+            let fg = crate::posix::process::FOREGROUND_PID.load(Ordering::Relaxed);
+            uart.put_char(b'^');
+            uart.put_char(b'Z');
+            uart.put_char(b'\n');
+            if fg > 0 {
+                let table = crate::posix::process::PROCESS_TABLE.lock();
+                for (pid, proc) in table.iter() {
+                    if proc.pgid.load(Ordering::Relaxed) == fg {
+                        proc.pending_signals.fetch_or(1 << crate::syscall::proc::SIGTSTP, Ordering::Relaxed);
+                        let mut st = proc.state.lock();
+                        if matches!(*st, crate::posix::process::ProcState::Stopped) {
+                            *st = crate::posix::process::ProcState::Running;
+                            crate::posix::process::enqueue_with_prio(*pid, proc.priority.load(core::sync::atomic::Ordering::Relaxed));
+                        }
+                    }
+                }
+                drop(table);
+            } else {
+                // Push 0x1A into the TTY buffer for raw-mode readers.
+                tty.ctrlc.store(true, Ordering::Relaxed);
+                let mut buf = tty.buf.lock();
+                buf.push_back(0x1A);
                 drop(buf);
                 let waiter = tty.waiter.swap(0, Ordering::Relaxed);
                 if waiter > 0 {

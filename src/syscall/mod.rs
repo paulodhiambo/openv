@@ -127,7 +127,9 @@ pub fn dispatch(
         121 => proc::sys_futex(arg0, arg1, arg2, tf),
         122 => proc::sys_gettid(tf),
 
-        // fs.rs — fsync
+        // fs.rs — fstat + fsync
+        78 => fs::sys_fstat(arg0, arg1, tf),
+        79 => fs::sys_fstatat(arg0, arg1, arg2, arg3, tf),
         130 => fs::sys_fsync(arg0, tf),
         131 => fs::sys_fdatasync(arg0, tf),
 

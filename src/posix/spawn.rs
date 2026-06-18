@@ -265,6 +265,9 @@ pub fn exit(pid: Pid, status: i32) {
     // targeting a dead PID no longer cause spurious wakeup attempts.
     crate::trap::interrupt::IRQ_HANDLERS.lock().retain(|_, &mut owner| owner != pid);
 
+    // Release all POSIX file locks held by this process.
+    crate::syscall::ipc::release_all_locks(pid);
+
     // Phase 2: Orphan reparenting — give all children to init (PID 1).
     if !children.is_empty() {
         let table = PROCESS_TABLE.lock();

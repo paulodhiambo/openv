@@ -237,6 +237,17 @@ pub fn vfs_futimens(vfs_fd: u32, atime_sec: i64, atime_nsec: i64, mtime_sec: i64
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
 }
 
+pub fn vfs_fstat(vfs_fd: u32) -> Option<(bool, u64)> {
+    let mut msg = Message::new();
+    msg.type_ = vfs_proto::OP_FSTAT;
+    vfs_proto::pack_fstat_req(&mut msg.data, vfs_fd);
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        Some(vfs_proto::unpack_stat_reply(&msg.data))
+    } else {
+        None
+    }
+}
+
 pub fn vfs_fallocate(vfs_fd: u32, offset: u64, length: u64) -> i32 {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_FALLOCATE;

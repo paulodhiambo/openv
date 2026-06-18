@@ -183,6 +183,8 @@ pub enum IpcState {
     MessageAvailable { msg: crate::ipc::msg::Message },
     /// A send has completed.
     SendComplete,
+    /// Waiting for a POSIX byte-range file lock (F_SETLKW).
+    LockWaiting { lock_id: u64, l_type: i16, l_start: i64, l_end: i64 },
 }
 
 /// A process in the system.
@@ -283,7 +285,7 @@ pub struct Process {
 
     // Namespaces
     /// The set of namespaces this process belongs to.
-    pub ns: crate::namespace::NsSet,
+    pub ns: Mutex<crate::namespace::NsSet>,
 }
 
 /// Canary value written to `kstack_bottom` on process creation.
@@ -343,6 +345,17 @@ static CURRENT_PIDS: [AtomicI32; crate::smp::MAX_HARTS] = [
 /// A unique `Pid`. PIDs are allocated sequentially starting from 1.
 pub fn generate_pid() -> Pid {
     NEXT_PID.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Generates a weak random value from the RISC-V `time` CSR for ASLR.
+/// This is not cryptographically secure but sufficient for address
+/// randomization to prevent simple deterministic-exploit patterns.
+fn aslr_rand() -> usize {
+    let cycle = riscv::register::time::read() as usize;
+    let hart = crate::smp::current_hartid();
+    // Simple linear mixing: multiply by a large odd constant and XOR
+    // with the hart ID so different HARTs produce different layouts.
+    cycle.wrapping_mul(0x9E37_79B9).wrapping_add(hart.wrapping_mul(0x10001))
 }
 
 /// Wakes up any sleeping processes whose sleep time has expired.
@@ -563,7 +576,7 @@ impl Process {
                     parent.blocked_signals.load(Ordering::Relaxed),
                     parent.pgid.load(Ordering::Relaxed),
                     parent.sid.load(Ordering::Relaxed),
-                    crate::namespace::NsSet::fork_from(&parent.ns, 0), // inherit, no new ns
+                    crate::namespace::NsSet::fork_from(&parent.ns.lock(), 0), // inherit, no new ns
                 )
             } else {
                 (0, 0, 0, 0, CAP_NONE, PRIO_NORMAL, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
@@ -604,8 +617,8 @@ impl Process {
             children: Mutex::new(Vec::new()),
             trap_frame: Mutex::new(tf),
             satp_val: AtomicUsize::new(satp_val_bits),
-            next_mmap_va: AtomicUsize::new(0x4_0000_0000), // 16 GB – above 4 GB identity map
-            heap_break: AtomicUsize::new(0x2_0000_0000),   // 8 GB initial brk
+            next_mmap_va: AtomicUsize::new(0x4_0000_0000 + (aslr_rand() & 0x0FFF_FFFF) & !0xFFF), // ASLR offset
+            heap_break: AtomicUsize::new(0x2_0000_0000 + (aslr_rand() & 0x00FF_FFFF)),           // ASLR offset for brk
             kernel_stack_bottom: kstack_bottom,
             cwd: Mutex::new(cwd),
             job,
@@ -624,7 +637,7 @@ impl Process {
             signal_handlers: Mutex::new(handlers),
             signal_restorers: Mutex::new(restorers),
             signal_masks: Mutex::new(masks),
-            ns,
+            ns: Mutex::new(ns),
         });
 
         PROCESS_TABLE.lock().insert(pid, proc.clone());

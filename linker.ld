@@ -8,13 +8,18 @@ SECTIONS
     . = BASE_ADDRESS;
 
     .text : {
+        PROVIDE(_text_start = .);
         *(.text._start)
         *(.text .text.*)
     }
+    . = ALIGN(4096);
+    PROVIDE(_text_end = .);
 
     .rodata : {
         *(.rodata .rodata.*)
     }
+    . = ALIGN(4096);
+    PROVIDE(_rodata_end = .);
 
     .data : {
         *(.data .data.*)

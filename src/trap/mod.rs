@@ -489,6 +489,7 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         sig = deliverable.trailing_zeros();
                         proc.pending_signals.fetch_and(!(1 << sig), core::sync::atomic::Ordering::Relaxed);
 
+                        // SIGKILL — unconditional exit
                         if sig == crate::syscall::proc::SIGKILL as u32 {
                             drop(table);
                             crate::posix::spawn::exit(pid, -9);
@@ -499,29 +500,67 @@ pub extern "C" fn rust_trap_handler(tf: &mut TrapFrame) -> *mut TrapFrame {
                         handler_addr = proc.signal_handlers.lock()[sig as usize];
                         restorer_addr = proc.signal_restorers.lock()[sig as usize];
 
-                        if handler_addr == 0 {
+                        // Determine action: continue, stop, ignore, terminate, or deliver
+                        let sig_is_stop = sig == crate::syscall::proc::SIGSTOP as u32
+                            || sig == crate::syscall::proc::SIGTSTP as u32
+                            || sig == crate::syscall::proc::SIGTTIN as u32
+                            || sig == crate::syscall::proc::SIGTTOU as u32;
+
+                        if sig == crate::syscall::proc::SIGCONT as u32 {
+                            // SIGCONT: resume if stopped, clear pending stop signals
+                            let stop_mask = (1 << crate::syscall::proc::SIGSTOP)
+                                | (1 << crate::syscall::proc::SIGTSTP)
+                                | (1 << crate::syscall::proc::SIGTTIN)
+                                | (1 << crate::syscall::proc::SIGTTOU);
+                            proc.pending_signals.fetch_and(!(stop_mask as u32), core::sync::atomic::Ordering::Relaxed);
+                            let mut st = proc.state.lock();
+                            if matches!(*st, crate::posix::process::ProcState::Stopped) {
+                                *st = crate::posix::process::ProcState::Running;
+                                crate::posix::process::enqueue_with_prio(
+                                    pid,
+                                    proc.priority.load(core::sync::atomic::Ordering::Relaxed),
+                                );
+                            }
+                            drop(st);
+                            drop(table);
+                        } else if sig_is_stop && handler_addr == 0 {
+                            // Stop signal with SIG_DFL: stop the process
+                            let mut st = proc.state.lock();
+                            *st = crate::posix::process::ProcState::Stopped;
+                            drop(st);
+                            drop(table);
+                            crate::posix::process::schedule();
+                            halt_cpu()
+                        } else if handler_addr == 1
+                            || (handler_addr == 0 && sig == crate::syscall::proc::SIGCHLD as u32)
+                        {
+                            // SIG_IGN or ignore-by-default: discard
+                            drop(table);
+                        } else if handler_addr == 0 {
+                            // SIG_DFL for all other signals: terminate
                             drop(table);
                             crate::posix::spawn::exit(pid, -(sig as i32));
                             crate::posix::process::schedule();
                             halt_cpu()
-                        }
+                        } else {
+                            // Deliver to user handler
+                            let sp = mut_tf.regs[2];
+                            if sp < frame_size + 16 || sp > 0x0000_8000_0000_0000 {
+                                drop(table);
+                                crate::posix::spawn::exit(pid, -11); // SIGSEGV
+                                crate::posix::process::schedule();
+                                halt_cpu()
+                            }
 
-                        let sp = mut_tf.regs[2];
-                        if sp < frame_size + 16 || sp > 0x0000_8000_0000_0000 {
-                            drop(table);
-                            crate::posix::spawn::exit(pid, -11); // SIGSEGV
-                            crate::posix::process::schedule();
-                            halt_cpu()
+                            new_sp = (sp - frame_size) & !15;
+                            new_sp_end = new_sp + frame_size - 1;
+                            saved_blocked = blocked;
+                            extra_mask = proc.signal_masks.lock()[sig as usize];
+                            new_blocked = blocked | extra_mask | (1 << sig);
+                            let satp = proc.satp_val.load(Ordering::Relaxed);
+                            root_pa = (satp & 0xFFF_FFFF_FFFF) << 12;
+                            do_deliver = true;
                         }
-
-                        new_sp = (sp - frame_size) & !15;
-                        new_sp_end = new_sp + frame_size - 1;
-                        saved_blocked = blocked;
-                        extra_mask = proc.signal_masks.lock()[sig as usize];
-                        new_blocked = blocked | extra_mask | (1 << sig);
-                        let satp = proc.satp_val.load(Ordering::Relaxed);
-                        root_pa = (satp & 0xFFF_FFFF_FFFF) << 12;
-                        do_deliver = true;
                     }
                 }
             } // PROCESS_TABLE unlocked here

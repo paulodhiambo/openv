@@ -15,7 +15,7 @@ DISK_SIZE_MB := 8
 # Overridable via env or make args
 BINS       ?= init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server pm-server rs-server echo-server net-client ipc_test virtio-blk-driver pkg epolltest procfs-server devfs-server component-manager
 QEMU_MEM   ?= 512M
-QEMU_CPUS  ?= 1
+QEMU_CPUS  ?= 4
 QEMU_FLAGS  = -machine virt -bios default -nographic -m $(QEMU_MEM) -smp $(QEMU_CPUS)
 QEMU_NET    = -netdev user,id=net0 -device virtio-net-device,netdev=net0
 QEMU_DISK   = -drive id=disk0,file=$(DISK_IMG),format=raw,if=none -device virtio-blk-device,drive=disk0
@@ -151,7 +151,6 @@ sd_write:
 # ── Quality ────────────────────────────────────────────────────────────────────
 
 CLIPPY_ALLOW := \
-  -A clippy::missing_safety_doc \
   -A clippy::identity_op \
   -A clippy::collapsible_if \
   -A clippy::unnecessary_cast \
@@ -162,9 +161,7 @@ CLIPPY_ALLOW := \
   -A clippy::manual_is_multiple_of \
   -A clippy::manual_range_contains \
   -A clippy::needless_range_loop \
-  -A clippy::not_unsafe_ptr_arg_deref \
   -A clippy::redundant_pattern_matching \
-  -A clippy::result_unit_err \
   -A clippy::slow_vector_initialization \
   -A clippy::unnecessary_map_or \
   -A clippy::while_let_loop \

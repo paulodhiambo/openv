@@ -12,9 +12,9 @@
 //! OpenV's swap implementation is a simple in-memory zram-style design:
 //!
 //! - **Eviction**: When the PMM is out of memory, [`try_evict_page`]
-//!    walks all process page tables and finds a clean user page to
-//!    evict. The page is compressed and stored in [`SWAP_MAP`], and
-//!    the physical frame is freed.
+//!    walks all Stopped process page tables and finds a clean user page to
+//!    evict. Only evicts from Stopped processes to avoid races with
+//!    concurrent page faults on Running processes.
 //!  - **Swap-in**: When a process accesses a swapped-out page, the
 //!    page-fault handler calls [`swap_in`], which decompresses the
 //!    data into a fresh frame and remaps the page.
@@ -34,8 +34,8 @@
 //!    less due to compression). A future version could swap to disk.
 //!  - Simple RLE compression: not as effective as lz4 or zstd for
 //!    many types of data.
-//!  - No swap accounting: there's no way to tell how much memory is
-//!    being used by swap.
+//!  - Eviction is O(n) in total pages and may block for many
+//!    milliseconds under heavy memory pressure.
 //!
 //! ## Safety
 //!
@@ -45,6 +45,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 use crate::sync::Mutex;
 
 pub struct SwappedPage {
@@ -55,8 +56,24 @@ pub struct SwappedPage {
 /// Map from `(root_pa, page_va)` to compressed page data and flags.
 ///
 /// The key is a tuple of the page table root physical address and the
-/// virtual address of the page. The value is a SwappedPage containing the compressed data and original PTE flags.
+/// virtual address of the page. The value is a SwappedPage containing
+/// the compressed data and original PTE flags.
 static SWAP_MAP: Mutex<BTreeMap<(usize, usize), SwappedPage>> = Mutex::new(BTreeMap::new());
+
+/// Total number of pages currently in the swap pool (evicted).
+static SWAP_TOTAL_PAGES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Total compressed size in bytes of all pages in the swap pool.
+static SWAP_TOTAL_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Returns the number of pages currently swapped out.
+pub fn swap_page_count() -> usize {
+    SWAP_TOTAL_PAGES.load(Ordering::Relaxed)
+}
+
+/// Returns the total compressed size (bytes) of all swapped pages.
+pub fn swap_total_bytes() -> usize {
+    SWAP_TOTAL_BYTES.load(Ordering::Relaxed)
+}
 
 // ── Compression ───────────────────────────────────────────────────────────────
 
@@ -72,6 +89,11 @@ static SWAP_MAP: Mutex<BTreeMap<(usize, usize), SwappedPage>> = Mutex::new(BTree
 /// # Returns
 ///
 /// A [`Vec<u8>`] containing the compressed data.
+///
+/// # Safety
+///
+/// This function is safe because it only reads from the provided byte
+/// slice and does not perform any unsafe operations.
 fn compress_page(src: &[u8; 4096]) -> Vec<u8> {
     let mut out = Vec::with_capacity(256);
     let mut i = 0usize;
@@ -109,7 +131,12 @@ fn decompress_page(src: &[u8], dst: &mut [u8; 4096]) {
 
 // ── Eviction ──────────────────────────────────────────────────────────────────
 
-/// Tries to evict one clean user page from any process to free physical memory.
+/// Tries to evict one clean user page from a Stopped process to free physical memory.
+///
+/// Only considers processes in the [`ProcState::Stopped`] state to avoid
+/// racing with concurrent page faults on Running processes.  This means
+/// the allocator may still fail under heavy memory pressure if no process
+/// is currently blocked.
 ///
 /// # Returns
 ///
@@ -121,7 +148,7 @@ fn decompress_page(src: &[u8], dst: &mut [u8; 4096]) {
 /// The function:
 ///
 /// 1. Locks the process table.
-/// 2. For each process, walks the page table (L2 → L1 → L0).
+/// 2. For each Stopped process, walks the page table (L2 → L1 → L0).
 /// 3. Finds the first valid, user-accessible, managed page.
 /// 4. Reads the page data, compresses it, and stores it in [`SWAP_MAP`].
 /// 5. Clears the PTE and frees the physical frame.
@@ -134,46 +161,46 @@ fn decompress_page(src: &[u8], dst: &mut [u8; 4096]) {
 pub fn try_evict_page() -> bool {
     use crate::mm::vmm::{PageTable, PTE_V, PTE_U, PTE_X, PTE_R};
     use crate::mm::pmm;
+    use crate::posix::process::ProcState;
 
     let table = crate::posix::process::PROCESS_TABLE.lock();
 
     for proc in table.values() {
-        let satp    = proc.satp_val.load(core::sync::atomic::Ordering::Relaxed);
+        // Only evict from Stopped processes to avoid races with page faults
+        // on Running processes.  A Stopped process is blocked in a syscall
+        // (e.g. read, waitpid) and is not accessing user pages.
+        let is_stopped = matches!(*proc.state.lock(), ProcState::Stopped);
+        if !is_stopped {
+            continue;
+        }
+
+        let satp    = proc.satp_val.load(Ordering::Relaxed);
         let root_pa = (satp & 0xFFF_FFFF_FFFF) << 12;
         if root_pa == 0 { continue; }
 
         // Walk L2 (root)
-        // SAFETY: `root_pa` is a valid page table root physical address
-        // read from the process's satp value.
         let root = unsafe { &*(root_pa as *const PageTable) };
-        for l2i in 4..512 {                      // skip kernel identity (0-3)
+        for l2i in 4..512 {
             let l2e = root.entries[l2i];
             if l2e & PTE_V == 0 || (l2e & (PTE_R | PTE_X)) != 0 { continue; }
             let l1_pa = (l2e >> 10) << 12;
-            // SAFETY: `l1_pa` is a valid physical address read from a
-            // valid L2 page table entry.
             let l1 = unsafe { &*(l1_pa as *const PageTable) };
             for l1i in 0..512 {
                 let l1e = l1.entries[l1i];
                 if l1e & PTE_V == 0 || (l1e & (PTE_R | PTE_X)) != 0 { continue; }
                 let l0_pa = (l1e >> 10) << 12;
-                // SAFETY: `l0_pa` is a valid physical address read from a
-                // valid L1 page table entry.
                 let l0 = unsafe { &mut *(l0_pa as *mut PageTable) };
                 for l0i in 0..512 {
                     let pte = l0.entries[l0i];
                     if pte & PTE_V == 0 || pte & PTE_U == 0 { continue; }
-                    // Skip non-managed pages (MMIO etc.)
                     let pa = (pte >> 10) << 12;
                     if !pmm::is_managed_page(pa) { continue; }
-                    // Reconstruct the virtual address from the indices
                     let va = (l2i << 30) | (l1i << 21) | (l0i << 12);
 
                     // Read the page data
-                    // SAFETY: `pa` is a valid, managed physical page.
                     let page_data = unsafe { *(pa as *const [u8; 4096]) };
-                    // Compress and store
                     let compressed = compress_page(&page_data);
+                    let compressed_len = compressed.len();
                     let flags = pte & 0x3FF;
                     SWAP_MAP.lock().insert((root_pa, va), SwappedPage { data: compressed, flags });
 
@@ -181,6 +208,10 @@ pub fn try_evict_page() -> bool {
                     l0.entries[l0i] = 0;
                     unsafe { core::arch::asm!("sfence.vma") };
                     pmm::decr_ref_and_maybe_free(pa);
+
+                    // Update accounting
+                    SWAP_TOTAL_PAGES.fetch_add(1, Ordering::Relaxed);
+                    SWAP_TOTAL_BYTES.fetch_add(compressed_len, Ordering::Relaxed);
                     return true;
                 }
             }
@@ -236,16 +267,19 @@ pub fn swap_in(root_pa: usize, page_va: usize) -> Result<(), &'static str> {
     let swapped = SWAP_MAP.lock().remove(&(root_pa, page_va))
         .ok_or("swap entry not found")?;
 
+    let compressed_len = swapped.data.len();
     let frame = pmm::alloc_frame().ok_or("OOM during swap-in")?;
-    // SAFETY: `frame.pa()` is a valid physical address returned by `alloc_frame`.
     let dst = unsafe { &mut *(frame.pa() as *mut [u8; 4096]) };
     decompress_page(&swapped.data, dst);
 
-    // SAFETY: `root_pa` is a valid page table root physical address.
     let pt = unsafe { &mut *(root_pa as *mut PageTable) };
     pt.map_page(page_va, frame.pa(), swapped.flags)?;
     frame.into_raw();
     unsafe { core::arch::asm!("sfence.vma") };
+
+    // Update accounting
+    SWAP_TOTAL_PAGES.fetch_sub(1, Ordering::Relaxed);
+    SWAP_TOTAL_BYTES.fetch_sub(compressed_len, Ordering::Relaxed);
     Ok(())
 }
 
@@ -258,5 +292,15 @@ pub fn swap_in(root_pa: usize, page_va: usize) -> Result<(), &'static str> {
 ///
 /// * `root_pa` - The physical address of the page table root.
 pub fn evict_all(root_pa: usize) {
-    SWAP_MAP.lock().retain(|&(rp, _), _| rp != root_pa);
+    let mut map = SWAP_MAP.lock();
+    let freed: usize = map.iter()
+        .filter(|&(&(rp, _), _)| rp == root_pa)
+        .map(|(_, sp)| sp.data.len())
+        .sum();
+    let count = map.iter()
+        .filter(|&(&(rp, _), _)| rp == root_pa)
+        .count();
+    map.retain(|&(rp, _), _| rp != root_pa);
+    SWAP_TOTAL_PAGES.fetch_sub(count, Ordering::Relaxed);
+    SWAP_TOTAL_BYTES.fetch_sub(freed, Ordering::Relaxed);
 }

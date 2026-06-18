@@ -219,7 +219,20 @@ pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
 
 pub fn sys_close(arg0: usize, tf: &mut TrapFrame) {
     let proc = crate::get_current_proc_or_esrch!(tf);
-    if proc.fds.lock().remove(arg0 as u32).is_some() {
+    let pid  = crate::posix::process::current_pid();
+    let fd   = arg0 as u32;
+
+    // Release POSIX file locks held by this process on the fd before closing.
+    // POSIX requires releasing all locks a process holds on a file when any
+    // fd to that file is closed.
+    if let Some(obj) = proc.fds.lock().get(fd) {
+        if let crate::ipc::handle::KernelObject::VfsFile(server_fd) = obj {
+            let lock_id = *server_fd as u64;
+            crate::syscall::ipc::release_fd_locks(lock_id, pid);
+        }
+    }
+
+    if proc.fds.lock().remove(fd).is_some() {
         tf.regs[10] = 0;
     } else {
         tf.regs[10] = usize::MAX;
@@ -485,6 +498,75 @@ pub fn sys_getcwd(arg0: usize, arg1: usize, tf: &mut crate::trap::TrapFrame) {
         buf[bytes.len()] = 0;
         tf.regs[10] = bytes.len();
     }
+}
+
+/// syscall 78: stat an open fd.
+/// arg0 = fd, arg1 = *mut stat (user pointer to 144-byte struct)
+pub fn sys_fstat(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, arg1 as *const u8, 144) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    let fds = proc.fds.lock();
+    match fds.get(arg0 as u32) {
+        Some(obj) => {
+            let (mode, rdev) = match &*obj {
+                crate::ipc::handle::KernelObject::Tty(_) => (0o020200u32, 0u64),
+                crate::ipc::handle::KernelObject::PipeRead(_) |
+                crate::ipc::handle::KernelObject::PipeWrite(_) => (0o010644u32, 0u64),
+                crate::ipc::handle::KernelObject::Channel(_) => (0o020000u32, 0u64),
+                crate::ipc::handle::KernelObject::EpollInstance(_) => (0o020000u32, 0u64),
+                _ => {
+                    tf.regs[10] = crate::errno::ENOSYS;
+                    return;
+                }
+            };
+            let dst = arg1 as *mut u8;
+            unsafe {
+                // st_dev (8)
+                core::ptr::write_unaligned(dst as *mut u64, 0u64);
+                // st_ino (8)
+                core::ptr::write_unaligned(dst.add(8) as *mut u64, 0u64);
+                // st_nlink (4)
+                core::ptr::write_unaligned(dst.add(16) as *mut u32, 1u32);
+                // st_mode (4)
+                core::ptr::write_unaligned(dst.add(20) as *mut u32, mode);
+                // st_uid (4)
+                core::ptr::write_unaligned(dst.add(24) as *mut u32, 0u32);
+                // st_gid (4)
+                core::ptr::write_unaligned(dst.add(28) as *mut u32, 0u32);
+                // st_rdev (8) — offset 40 after 4-byte pad
+                core::ptr::write_unaligned(dst.add(40) as *mut u64, rdev);
+                // st_size (8)
+                core::ptr::write_unaligned(dst.add(48) as *mut i64, 0i64);
+                // st_blksize (4)
+                core::ptr::write_unaligned(dst.add(56) as *mut u32, 0u32);
+                // st_blocks (8) — offset 64 after 4-byte pad
+                core::ptr::write_unaligned(dst.add(64) as *mut i64, 0i64);
+                // st_atim (16)
+                core::ptr::write_unaligned(dst.add(72) as *mut i64, 0i64);
+                core::ptr::write_unaligned(dst.add(80) as *mut i64, 0i64);
+                // st_mtim (16)
+                core::ptr::write_unaligned(dst.add(88) as *mut i64, 0i64);
+                core::ptr::write_unaligned(dst.add(96) as *mut i64, 0i64);
+                // st_ctim (16)
+                core::ptr::write_unaligned(dst.add(104) as *mut i64, 0i64);
+                core::ptr::write_unaligned(dst.add(112) as *mut i64, 0i64);
+                // _pad (24) — offset 120
+                core::ptr::write_bytes(dst.add(120), 0u8, 24);
+            }
+            tf.regs[10] = 0;
+        }
+        None => {
+            tf.regs[10] = crate::errno::EBADF;
+        }
+    }
+}
+
+/// syscall 79: fstatat — not needed for openv (handled in userspace).
+pub fn sys_fstatat(_arg0: usize, _arg1: usize, _arg2: usize, _arg3: usize, tf: &mut TrapFrame) {
+    tf.regs[10] = crate::errno::ENOSYS;
 }
 
 /// Registers the calling process as the component manager.

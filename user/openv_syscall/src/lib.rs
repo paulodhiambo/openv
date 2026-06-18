@@ -30,6 +30,8 @@ pub const SYS_CHDIR: usize = 55;
 pub const SYS_GETCWD: usize = 56;
 pub const SYS_FSYNC: usize = 130;
 pub const SYS_FDATASYNC: usize = 131;
+pub const SYS_FSTAT: usize = 78;
+pub const SYS_FSTATAT: usize = 79;
 
 // Memory management
 pub const SYS_MMAP: usize = 135;

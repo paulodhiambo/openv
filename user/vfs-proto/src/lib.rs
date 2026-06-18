@@ -23,6 +23,7 @@ pub const OP_LSEEK:     i32 = 19;
 pub const OP_FPATH:     i32 = 20;
 pub const OP_FUTIMENS:  i32 = 21;
 pub const OP_FALLOCATE: i32 = 22;
+pub const OP_FSTAT:     i32 = 23;
 
 // Reply status codes (for msg.type_)
 pub const REPLY_OK:  i32 = 0;
@@ -229,6 +230,18 @@ pub fn unpack_futimens_req(data: &[u8; 56]) -> (u32, i64, i64, i64, i64) {
     let mts = get_u64(data, &mut off) as i64;
     let mtns = get_u64(data, &mut off) as i64;
     (fd, ats, atns, mts, mtns)
+}
+
+/// OP_FSTAT
+/// Format: fd(4)
+pub fn pack_fstat_req(data: &mut [u8; 56], fd: u32) {
+    let mut off = 0;
+    put_u32(data, &mut off, fd);
+}
+
+pub fn unpack_fstat_req(data: &[u8; 56]) -> u32 {
+    let mut off = 0;
+    get_u32(data, &mut off)
 }
 
 /// OP_FALLOCATE

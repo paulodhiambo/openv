@@ -751,6 +751,18 @@ pub const SIGINT: usize = 2;
 pub const SIGTERM: usize = 15;
 /// `SIGPIPE` signal number (13) — write to closed pipe/socket.
 pub const SIGPIPE: usize = 13;
+/// `SIGCHLD` signal number (17) — child terminated/stopped/continued.
+pub const SIGCHLD: usize = 17;
+/// `SIGCONT` signal number (18) — continue if stopped.
+pub const SIGCONT: usize = 18;
+/// `SIGSTOP` signal number (19) — stop (cannot be caught/ignored).
+pub const SIGSTOP: usize = 19;
+/// `SIGTSTP` signal number (20) — terminal stop (Ctrl-Z).
+pub const SIGTSTP: usize = 20;
+/// `SIGTTIN` signal number (21) — background read on controlling TTY.
+pub const SIGTTIN: usize = 21;
+/// `SIGTTOU` signal number (22) — background write on controlling TTY.
+pub const SIGTTOU: usize = 22;
 
 /// Sends a signal to a process or process group.
 ///
@@ -1017,15 +1029,12 @@ pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, arg3: usize, tf: &mut Tr
     }
 
     // Namespace isolation: create new namespaces for any requested CLONE_NEW* flags.
-    const CLONE_NEWNS:  u32 = 0x0002_0000;
-    const CLONE_NEWPID: u32 = 0x2000_0000;
-    const CLONE_NEWNET: u32 = 0x4000_0000;
-    if flags & (CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET) != 0 {
-        // The child's ns was set to the parent's at Process::new time; override with forks.
-        // We can't easily change it inside Arc, so we accept the parent's ns here —
-        // a full implementation would pass clone_flags into Process::new.
-        // TODO: plumb clone_flags into Process::new so ns is forked at creation time.
-        let _ = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET; // acknowledged
+    // The child inherited the parent's ns at Process::new time.  If clone flags
+    // request new namespaces, fork (create fresh) the relevant ones now.
+    {
+        let parent_ns = parent_proc.ns.lock();
+        let child_ns = crate::namespace::NsSet::fork_from(&parent_ns, flags);
+        *child.ns.lock() = child_ns;
     }
 
     // Copy the current trap frame into the child.  `tf` IS the parent's trap
@@ -1144,7 +1153,7 @@ pub fn sys_futex(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
 /// Returns the calling process's mount namespace ID (for VFS routing).
 pub fn sys_getnsid(tf: &mut TrapFrame) {
     let proc = crate::get_current_proc_or_esrch!(tf);
-    tf.regs[10] = proc.ns.mnt.id as usize;
+    tf.regs[10] = proc.ns.lock().mnt.id as usize;
 }
 
 // ── Priority / capability syscalls ─────────────────────────────────────────────
@@ -1303,13 +1312,29 @@ pub fn sys_abi_version(tf: &mut TrapFrame) {
 /// Supported flags: `CLONE_NEWNS` (0x00020000), `CLONE_NEWPID`
 /// (0x20000000), `CLONE_NEWNET` (0x40000000).
 ///
-/// Currently this is a no-op that records the intent. Full
-/// isolation requires making `Process::ns` a `Mutex<NsSet>`.
+/// Creates fresh namespaces for the calling process.  The process's
+/// existing namespaces are replaced with newly-created ones.
+///
+/// Requires `CAP_SYS_ADMIN` to create new namespaces.
 pub fn sys_unshare(arg0: usize, tf: &mut TrapFrame) {
-    let _flags = arg0 as u32;
-    // Namespace objects are stored inside Process::ns which is not behind a Mutex,
-    // so we can't mutate it after Arc creation.  For now we acknowledge the call
-    // and record the intent.  Full isolation requires making Process::ns a Mutex<NsSet>.
+    const CLONE_NEWNS:  u32 = 0x0002_0000;
+    const CLONE_NEWPID: u32 = 0x2000_0000;
+    const CLONE_NEWNET: u32 = 0x4000_0000;
+
+    let flags = arg0 as u32;
+    if flags & (CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET) == 0 {
+        tf.regs[10] = 0; // nothing to do
+        return;
+    }
+
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    if proc.caps.load(Ordering::Relaxed) & crate::posix::process::CAP_SYS_ADMIN == 0 {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+
+    let mut ns = proc.ns.lock();
+    *ns = crate::namespace::NsSet::fork_from(&ns, flags);
     tf.regs[10] = 0;
 }
 

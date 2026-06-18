@@ -1,7 +1,153 @@
 use crate::trap::TrapFrame;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use crate::sync::Mutex;
+use core::sync::atomic::Ordering;
 
 unsafe extern "C" {
     pub(crate) fn __halt_cpu() -> !;
+}
+
+// ---------------------------------------------------------------------------
+// POSIX byte-range file locking (F_SETLK / F_SETLKW / F_GETLK)
+// ---------------------------------------------------------------------------
+
+/// Lock type constants (l_type field of struct flock).
+pub const F_RDLCK: i16 = 0; // shared/read lock
+pub const F_WRLCK: i16 = 1; // exclusive/write lock
+pub const F_UNLCK: i16 = 2; // unlock
+
+/// Layout of userspace `struct flock` on 64-bit RISC-V (matches musl/glibc).
+#[repr(C)]
+struct FlockArg {
+    l_type:   i16,
+    l_whence: i16,
+    _pad0:    i32,  // alignment padding before 8-byte off_t
+    l_start:  i64,
+    l_len:    i64,
+    l_pid:    i32,
+    _pad1:    i32,  // trailing padding; sizeof = 32
+}
+
+#[derive(Clone)]
+struct LockEntry {
+    pid:     i32,
+    l_type:  i16,
+    l_start: i64,
+    l_end:   i64, // exclusive end; i64::MAX means "to EOF"
+}
+
+/// Global file lock table: file_id → list of active lock entries.
+static FILE_LOCKS: Mutex<BTreeMap<u64, Vec<LockEntry>>> = Mutex::new(BTreeMap::new());
+
+/// file_id → list of (pid, l_type, l_start, l_end) processes blocked in F_SETLKW.
+static LOCK_WAITERS: Mutex<BTreeMap<u64, Vec<(i32, i16, i64, i64)>>> =
+    Mutex::new(BTreeMap::new());
+
+/// Derive a stable file identity from a KernelObject for locking purposes.
+/// VFS files use the server-assigned fd as the global identifier.  Non-lockable
+/// objects return None (caller returns EINVAL).
+fn file_lock_id(obj: &crate::ipc::handle::KernelObject) -> Option<u64> {
+    match obj {
+        crate::ipc::handle::KernelObject::VfsFile(sfd) => Some(*sfd as u64),
+        _ => None,
+    }
+}
+
+/// Compute the absolute (l_start, l_end) pair from the flock fields.
+/// We only support SEEK_SET (whence=0); anything else is treated as SEEK_SET
+/// because the kernel has no access to the current file-position cursor.
+fn resolve_range(l_start: i64, l_len: i64) -> (i64, i64) {
+    let start = l_start.max(0);
+    let end = if l_len == 0 { i64::MAX } else { start.saturating_add(l_len) };
+    (start, end)
+}
+
+fn ranges_overlap(s1: i64, e1: i64, s2: i64, e2: i64) -> bool {
+    s1 < e2 && s2 < e1
+}
+
+/// True if `req` conflicts with `existing` (different pids, overlapping range,
+/// incompatible lock types).
+fn conflicts(req_pid: i32, req_type: i16, rs: i64, re: i64, e: &LockEntry) -> bool {
+    if e.pid == req_pid { return false; }
+    if !ranges_overlap(rs, re, e.l_start, e.l_end) { return false; }
+    // write vs anything, or read vs write
+    matches!((req_type, e.l_type), (F_WRLCK, _) | (F_RDLCK, F_WRLCK))
+}
+
+/// Attempt to acquire `(req_type, rs, re)` for `pid` on `file_id`.
+/// Returns true on success. Does NOT sleep.
+fn try_acquire(file_id: u64, pid: i32, l_type: i16, rs: i64, re: i64) -> bool {
+    let mut table = FILE_LOCKS.lock();
+    let entries = table.entry(file_id).or_insert_with(Vec::new);
+    if entries.iter().any(|e| conflicts(pid, l_type, rs, re, e)) {
+        return false;
+    }
+    // Remove any old locks this pid holds in the range (upgrade / replace).
+    entries.retain(|e| e.pid != pid || !ranges_overlap(rs, re, e.l_start, e.l_end));
+    entries.push(LockEntry { pid, l_type, l_start: rs, l_end: re });
+    true
+}
+
+/// Remove all locks held by `pid` that overlap `(rs, re)` on `file_id`.
+fn release_range(file_id: u64, pid: i32, rs: i64, re: i64) {
+    let mut table = FILE_LOCKS.lock();
+    if let Some(entries) = table.get_mut(&file_id) {
+        entries.retain(|e| e.pid != pid || !ranges_overlap(rs, re, e.l_start, e.l_end));
+        if entries.is_empty() { table.remove(&file_id); }
+    }
+    // After releasing, try to wake waiters blocked on this file_id.
+    drop(table);
+    wake_lock_waiters(file_id);
+}
+
+/// Remove ALL locks held by `pid` across every file (called on process exit).
+pub fn release_all_locks(pid: i32) {
+    let mut table = FILE_LOCKS.lock();
+    let ids: Vec<u64> = table.keys().cloned().collect();
+    for id in &ids {
+        if let Some(v) = table.get_mut(id) {
+            v.retain(|e| e.pid != pid);
+            if v.is_empty() { table.remove(id); }
+        }
+    }
+    drop(table);
+    // Wake any waiters that were blocked behind this pid's locks.
+    let waiter_ids: Vec<u64> = LOCK_WAITERS.lock().keys().cloned().collect();
+    for id in waiter_ids { wake_lock_waiters(id); }
+}
+
+/// Remove all locks held by `pid` on `file_id` (called on fd close).
+pub fn release_fd_locks(file_id: u64, pid: i32) {
+    release_range(file_id, pid, 0, i64::MAX);
+}
+
+/// Wake up any F_SETLKW waiters on `file_id` whose lock can now be acquired.
+fn wake_lock_waiters(file_id: u64) {
+    use crate::posix::process::{PROCESS_TABLE, ProcState, IpcState, enqueue_with_prio};
+    let mut waiters_map = LOCK_WAITERS.lock();
+    let Some(waiters) = waiters_map.get_mut(&file_id) else { return };
+    if waiters.is_empty() { return; }
+
+    let mut still_waiting: Vec<(i32, i16, i64, i64)> = Vec::new();
+    for (wpid, wtype, ws, we) in waiters.drain(..) {
+        if try_acquire(file_id, wpid, wtype, ws, we) {
+            // Lock acquired on behalf of the waiter — wake it with success.
+            let table = PROCESS_TABLE.lock();
+            if let Some(proc) = table.get(&wpid) {
+                proc.trap_frame.lock().regs[10] = 0;
+                *proc.ipc_state.lock() = IpcState::None;
+                *proc.state.lock() = ProcState::Running;
+                let prio = proc.priority.load(Ordering::Relaxed);
+                drop(table);
+                enqueue_with_prio(wpid, prio);
+            }
+        } else {
+            still_waiting.push((wpid, wtype, ws, we));
+        }
+    }
+    *waiters = still_waiting;
 }
 
 pub fn sys_pipe(arg0: usize, tf: &mut TrapFrame) {
@@ -446,70 +592,162 @@ pub fn sys_ipc_sendrec(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     }
 }
 
-pub const F_DUPFD: usize = 0;
-pub const F_GETFD: usize = 1;
-pub const F_SETFD: usize = 2;
-pub const F_GETFL: usize = 3;
-pub const F_SETFL: usize = 4;
-pub const F_SET_VFS_FD: usize = 5;
-pub const F_GET_VFS_FD: usize = 6;
+// Standard POSIX fcntl commands
+pub const F_DUPFD:  usize = 0;
+pub const F_GETFD:  usize = 1;
+pub const F_SETFD:  usize = 2;
+pub const F_GETFL:  usize = 3;
+pub const F_SETFL:  usize = 4;
+pub const F_GETLK:  usize = 5;
+pub const F_SETLK:  usize = 6;
+pub const F_SETLKW: usize = 7;
+
 pub const FD_CLOEXEC: usize = 1;
 
-pub fn sys_fcntl(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
-    let proc = crate::get_current_proc_or_esrch!(tf);
-    let mut fds = proc.fds.lock();
-    let fd = arg0 as u32;
+// Non-POSIX kernel-private commands (high range to avoid clashing with future POSIX additions)
+pub const F_SET_VFS_FD: usize = 1000;
+pub const F_GET_VFS_FD: usize = 1001;
 
-    if arg1 != F_SET_VFS_FD && !fds.get(fd).is_some() {
-        tf.regs[10] = usize::MAX;
-        return;
+pub fn sys_fcntl(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
+    use crate::ipc::handle::KernelObject;
+    use crate::posix::process::{PROCESS_TABLE, ProcState, IpcState, enqueue_with_prio};
+    use crate::mm::vmm::is_user_pointer_valid;
+
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    let pid  = crate::posix::process::current_pid();
+    let fd   = arg0 as u32;
+
+    // All commands except F_SET_VFS_FD need a valid fd.
+    if arg1 != F_SET_VFS_FD {
+        if proc.fds.lock().get(fd).is_none() {
+            tf.regs[10] = crate::errno::EBADF;
+            return;
+        }
     }
 
     match arg1 {
+        // ── standard fd management ───────────────────────────────────────────
         F_DUPFD => {
             let min_fd = arg2 as u32;
+            let mut fds = proc.fds.lock();
             let obj = fds.get(fd).unwrap().clone();
-            // find lowest free fd >= min_fd
             let mut newfd = min_fd;
-            while fds.get(newfd).is_some() {
-                newfd += 1;
-            }
+            while fds.get(newfd).is_some() { newfd += 1; }
             fds.insert_at(newfd, obj);
             tf.regs[10] = newfd as usize;
         }
         F_GETFD => {
-            tf.regs[10] = if fds.is_cloexec(fd) { FD_CLOEXEC } else { 0 };
+            tf.regs[10] = if proc.fds.lock().is_cloexec(fd) { FD_CLOEXEC } else { 0 };
         }
         F_SETFD => {
-            fds.set_cloexec(fd, (arg2 & FD_CLOEXEC) != 0);
+            proc.fds.lock().set_cloexec(fd, (arg2 & FD_CLOEXEC) != 0);
             tf.regs[10] = 0;
         }
-        F_GETFL => {
-            tf.regs[10] = 0; // we don't have file status flags yet
+        F_GETFL => { tf.regs[10] = 0; } // file status flags not yet tracked
+        F_SETFL => { tf.regs[10] = 0; } // accepted but ignored
+
+        // ── POSIX byte-range locking ─────────────────────────────────────────
+        F_GETLK | F_SETLK | F_SETLKW => {
+            // Validate the flock pointer.
+            if !is_user_pointer_valid(tf, arg2 as *const FlockArg, 1) {
+                tf.regs[10] = crate::errno::EFAULT;
+                return;
+            }
+            let fl = unsafe { &*(arg2 as *const FlockArg) };
+            let (rs, re) = resolve_range(fl.l_start, fl.l_len);
+
+            // Resolve file_id; only VFS files support POSIX locks.
+            let lock_id = {
+                let fds = proc.fds.lock();
+                match fds.get(fd) {
+                    Some(obj) => match file_lock_id(obj) {
+                        Some(id) => id,
+                        None => { tf.regs[10] = crate::errno::EINVAL; return; }
+                    },
+                    None => { tf.regs[10] = crate::errno::EBADF; return; }
+                }
+            };
+
+            match arg1 {
+                F_GETLK => {
+                    // Report the first conflicting lock, or set l_type=F_UNLCK if none.
+                    let table = FILE_LOCKS.lock();
+                    let blocking = table.get(&lock_id)
+                        .and_then(|v| v.iter().find(|e| conflicts(pid, fl.l_type, rs, re, e)))
+                        .cloned();
+                    drop(table);
+                    let out = unsafe { &mut *(arg2 as *mut FlockArg) };
+                    if let Some(b) = blocking {
+                        out.l_type   = b.l_type;
+                        out.l_whence = 0; // SEEK_SET
+                        out.l_start  = b.l_start;
+                        out.l_len    = if b.l_end == i64::MAX { 0 } else { b.l_end - b.l_start };
+                        out.l_pid    = b.pid;
+                    } else {
+                        out.l_type = F_UNLCK;
+                    }
+                    tf.regs[10] = 0;
+                }
+                F_SETLK => {
+                    if fl.l_type == F_UNLCK {
+                        release_range(lock_id, pid, rs, re);
+                        tf.regs[10] = 0;
+                    } else if try_acquire(lock_id, pid, fl.l_type, rs, re) {
+                        tf.regs[10] = 0;
+                    } else {
+                        tf.regs[10] = crate::errno::EAGAIN;
+                    }
+                }
+                F_SETLKW => {
+                    if fl.l_type == F_UNLCK {
+                        release_range(lock_id, pid, rs, re);
+                        tf.regs[10] = 0;
+                        return;
+                    }
+                    if try_acquire(lock_id, pid, fl.l_type, rs, re) {
+                        tf.regs[10] = 0;
+                        return;
+                    }
+                    // Lock is not available — block the process.
+                    LOCK_WAITERS.lock()
+                        .entry(lock_id)
+                        .or_insert_with(Vec::new)
+                        .push((pid, fl.l_type, rs, re));
+                    *proc.ipc_state.lock() = IpcState::LockWaiting {
+                        lock_id, l_type: fl.l_type, l_start: rs, l_end: re,
+                    };
+                    *proc.state.lock() = ProcState::Stopped;
+                    drop(proc);
+                    crate::posix::process::schedule();
+                    // NOTE: regs[10] is set to 0 by wake_lock_waiters when woken.
+                    return;
+                }
+                _ => unreachable!(),
+            }
         }
-        F_SETFL => {
-            tf.regs[10] = 0; // ignore for now
-        }
+
+        // ── kernel-private VFS fd plumbing ──────────────────────────────────
         F_SET_VFS_FD => {
             let server_fd = arg2 as u32;
+            let mut fds = proc.fds.lock();
             if fd == u32::MAX {
-                let newfd = fds.insert(crate::ipc::handle::KernelObject::VfsFile(server_fd));
+                let newfd = fds.insert(KernelObject::VfsFile(server_fd));
                 tf.regs[10] = newfd as usize;
             } else {
-                fds.insert_at(fd, crate::ipc::handle::KernelObject::VfsFile(server_fd));
+                fds.insert_at(fd, KernelObject::VfsFile(server_fd));
                 tf.regs[10] = 0;
             }
         }
         F_GET_VFS_FD => {
-            let obj = fds.get(fd).unwrap();
-            if let crate::ipc::handle::KernelObject::VfsFile(server_fd) = obj {
+            let fds = proc.fds.lock();
+            if let Some(KernelObject::VfsFile(server_fd)) = fds.get(fd) {
                 tf.regs[10] = *server_fd as usize;
             } else {
-                tf.regs[10] = usize::MAX;
+                tf.regs[10] = crate::errno::EBADF;
             }
         }
         _ => {
-            tf.regs[10] = usize::MAX;
+            tf.regs[10] = crate::errno::ENOSYS;
         }
     }
 }

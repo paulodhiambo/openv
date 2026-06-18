@@ -9,20 +9,143 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use vfs_proto::*;
 
+mod blockio;
 mod blockfs;
+mod ext2;
 
-// ── In-memory filesystem ──────────────────────────────────────────────────────
+const ITYPE_FILE_ENTRY: u8 = 1;
+const ITYPE_DIR_ENTRY: u8 = 2;
+const ITYPE_SYMLINK_ENTRY: u8 = 3;
+
+// ── Block filesystem dispatch ────────────────────────────────────────────────
+
+enum BlockFs {
+    Ofs(blockfs::OfsState),
+    Ext2(ext2::Ext2State),
+}
+
+impl BlockFs {
+    fn lookup_path(&mut self, path: &str) -> Option<(u32, u8)> {
+        match self {
+            BlockFs::Ofs(s) => s.lookup_path(path),
+            BlockFs::Ext2(s) => s.lookup_path(path),
+        }
+    }
+    fn inode_info(&mut self, ino: u32) -> Option<blockio::InodeInfo> {
+        match self {
+            BlockFs::Ofs(s) => s.inode_info(ino),
+            BlockFs::Ext2(s) => s.inode_info(ino),
+        }
+    }
+    fn create_inode(&mut self, itype: u8) -> Option<u32> {
+        match self {
+            BlockFs::Ofs(s) => s.create_inode(itype),
+            BlockFs::Ext2(s) => s.create_inode(itype),
+        }
+    }
+    fn free_inode(&mut self, ino: u32) {
+        match self {
+            BlockFs::Ofs(s) => s.free_inode(ino),
+            BlockFs::Ext2(s) => s.free_inode(ino),
+        }
+    }
+    fn dir_add_entry(&mut self, dir_ino: u32, name: &str, child_ino: u32, etype: u8) -> bool {
+        match self {
+            BlockFs::Ofs(s) => s.dir_add_entry(dir_ino, name, child_ino, etype),
+            BlockFs::Ext2(s) => s.dir_add_entry(dir_ino, name, child_ino, etype),
+        }
+    }
+    fn dir_unlink(&mut self, dir_ino: u32, name: &str) -> bool {
+        match self {
+            BlockFs::Ofs(s) => s.dir_unlink(dir_ino, name),
+            BlockFs::Ext2(s) => s.dir_unlink(dir_ino, name),
+        }
+    }
+    fn file_read(&mut self, ino: u32, offset: usize, buf: &mut [u8]) -> Result<usize, blockio::FsError> {
+        match self {
+            BlockFs::Ofs(s) => s.file_read(ino, offset, buf),
+            BlockFs::Ext2(s) => s.file_read(ino, offset, buf),
+        }
+    }
+    fn file_write(&mut self, ino: u32, offset: usize, data: &[u8]) -> Result<usize, crate::blockio::FsError> {
+        match self {
+            BlockFs::Ofs(s) => s.file_write(ino, offset, data),
+            BlockFs::Ext2(s) => s.file_write(ino, offset, data),
+        }
+    }
+    fn file_truncate(&mut self, ino: u32) {
+        match self {
+            BlockFs::Ofs(s) => s.file_truncate(ino),
+            BlockFs::Ext2(s) => s.file_truncate(ino),
+        }
+    }
+    fn dir_readall(&mut self, dir_ino: u32) -> alloc::vec::Vec<(alloc::string::String, u32, u8)> {
+        match self {
+            BlockFs::Ofs(s) => s.dir_readall(dir_ino),
+            BlockFs::Ext2(s) => s.dir_readall(dir_ino),
+        }
+    }
+    fn dir_link_entry(&mut self, dir_ino: u32, name: &str, child_ino: u32, etype: u8) -> bool {
+        match self {
+            BlockFs::Ofs(s) => s.dir_link_entry(dir_ino, name, child_ino, etype),
+            BlockFs::Ext2(s) => s.dir_link_entry(dir_ino, name, child_ino, etype),
+        }
+    }
+    fn init_dir(&mut self, ino: u32, parent_ino: u32) -> bool {
+        match self {
+            BlockFs::Ofs(s) => s.init_dir(ino, parent_ino),
+            BlockFs::Ext2(s) => s.init_dir(ino, parent_ino),
+        }
+    }
+    fn fsync(&mut self) -> bool {
+        match self {
+            BlockFs::Ofs(s) => s.fsync(),
+            BlockFs::Ext2(_) => true,
+        }
+    }
+    fn rename(&mut self, old_dir: &str, old_name: &str, new_dir: &str, new_name: &str) -> bool {
+        let (dir_ino, _) = match self.lookup_path(old_dir) { Some(r) => r, None => return false };
+        let (new_dir_ino, _) = match self.lookup_path(new_dir) { Some(r) => r, None => return false };
+        let (child_ino, etype) = match self.lookup_path(
+            &alloc::format!("{}/{}", old_dir, old_name)
+        ) { Some(r) => r, None => return false };
+
+        // Same-inode check: if old and new point to the same entry, no-op
+        let target_path = alloc::format!("{}/{}", new_dir, new_name);
+        if let Some((target_ino, _)) = self.lookup_path(&target_path) {
+            if target_ino == child_ino { return true; }
+            // Remove existing target
+            if !self.dir_unlink(new_dir_ino, new_name) { return false; }
+        }
+
+        // Link child to new name
+        if !self.dir_link_entry(new_dir_ino, new_name, child_ino, etype) { return false; }
+        // Unlink old name
+        if !self.dir_unlink(dir_ino, old_name) { return false; }
+        true
+    }
+}
 
 #[allow(static_mut_refs)]
-fn get_blockfs() -> Option<&'static mut blockfs::OfsState> {
-    static mut STATE: Option<blockfs::OfsState> = None;
+fn get_blockfs() -> Option<&'static mut BlockFs> {
+    static mut STATE: Option<BlockFs> = None;
     unsafe {
         if STATE.is_none() {
-            // Resolve the block driver PID dynamically — never hard-code it.
             let blk_pid = libos::get_blk_pid();
             if blk_pid > 0 {
-                // new() returns None if the driver isn't ready yet; we'll retry next call.
-                STATE = blockfs::OfsState::new(blockfs::VirtioBlkProxy::new(blk_pid));
+                let proxy = blockio::VirtioBlkProxy::new(blk_pid);
+                if let Some(ofs) = blockfs::OfsState::new(proxy) {
+                    STATE = Some(BlockFs::Ofs(ofs));
+                }
+            }
+            if STATE.is_none() {
+                let blk_pid = libos::get_blk_pid();
+                if blk_pid > 0 {
+                    let proxy = blockio::VirtioBlkProxy::new(blk_pid);
+                    if let Some(ext2) = ext2::Ext2State::new(proxy) {
+                        STATE = Some(BlockFs::Ext2(ext2));
+                    }
+                }
             }
         }
         STATE.as_mut()
@@ -86,24 +209,18 @@ impl Vfs {
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 if let Some((parent, name)) = Self::parent_and_name(p)
                     && let Some((dir_ino, etype)) = ofs.lookup_path(&parent)
-                    && etype == blockfs::ITYPE_DIR_ENTRY
+                    && etype == ITYPE_DIR_ENTRY
                 {
-                    let child_ino = match ofs.alloc_inode() {
+                    let child_ino = match ofs.create_inode(ITYPE_DIR_ENTRY) {
                         Some(i) => i,
                         None => return false,
                     };
-                    let new_inode = blockfs::RawInode {
-                        itype: blockfs::ITYPE_DIR,
-                        _pad: [0; 3],
-                        size: 0,
-                        nlink: 1,
-                        used_blocks: 0,
-                        direct: [0u32; 12],
-                        indirect: 0,
-                        _reserved: [0u32; 15],
-                    };
-                    ofs.write_inode(child_ino, &new_inode);
-                    if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_DIR_ENTRY) {
+                    if !ofs.init_dir(child_ino, dir_ino) {
+                        ofs.free_inode(child_ino);
+                        return false;
+                    }
+                    if !ofs.dir_add_entry(dir_ino, &name, child_ino, ITYPE_DIR_ENTRY) {
+                        ofs.file_truncate(child_ino);
                         ofs.free_inode(child_ino);
                         return false;
                     }
@@ -139,33 +256,22 @@ impl Vfs {
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 if let Some((parent, name)) = Self::parent_and_name(p)
                     && let Some((dir_ino, etype)) = ofs.lookup_path(&parent)
-                    && etype == blockfs::ITYPE_DIR_ENTRY
+                    && etype == ITYPE_DIR_ENTRY
                 {
                     // If it exists, truncate it instead of failing
                     if let Some((child_ino, ctype)) = ofs.lookup_path(p) {
-                        if ctype == blockfs::ITYPE_FILE_ENTRY {
+                        if ctype == ITYPE_FILE_ENTRY {
                             ofs.file_truncate(child_ino);
                             return true;
                         }
                         return false; // Is a directory
                     }
 
-                    let child_ino = match ofs.alloc_inode() {
+                    let child_ino = match ofs.create_inode(ITYPE_FILE_ENTRY) {
                         Some(i) => i,
                         None => return false,
                     };
-                    let new_inode = blockfs::RawInode {
-                        itype: blockfs::ITYPE_FILE,
-                        _pad: [0; 3],
-                        size: 0,
-                        nlink: 1,
-                        used_blocks: 0,
-                        direct: [0u32; 12],
-                        indirect: 0,
-                        _reserved: [0u32; 15],
-                    };
-                    ofs.write_inode(child_ino, &new_inode);
-                    if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_FILE_ENTRY) {
+                    if !ofs.dir_add_entry(dir_ino, &name, child_ino, ITYPE_FILE_ENTRY) {
                         ofs.free_inode(child_ino);
                         return false;
                     }
@@ -191,7 +297,7 @@ impl Vfs {
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 if let Some((parent, name)) = Self::parent_and_name(p)
                     && let Some((dir_ino, etype)) = ofs.lookup_path(&parent)
-                    && etype == blockfs::ITYPE_DIR_ENTRY
+                    && etype == ITYPE_DIR_ENTRY
                 {
                     return ofs.dir_unlink(dir_ino, &name);
                 }
@@ -233,7 +339,7 @@ impl Vfs {
             if let Some(ofs) = get_blockfs() {
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 if let Some((ino, etype)) = ofs.lookup_path(p)
-                    && etype == blockfs::ITYPE_FILE_ENTRY
+                    && etype == ITYPE_FILE_ENTRY
                 {
                     match ofs.file_read(ino, offset as usize, buf) {
                         Ok(n) => return Some(n),
@@ -269,7 +375,7 @@ impl Vfs {
             if let Some(ofs) = get_blockfs() {
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 if let Some((ino, etype)) = ofs.lookup_path(p)
-                    && etype == blockfs::ITYPE_FILE_ENTRY
+                    && etype == ITYPE_FILE_ENTRY
                 {
                     match ofs.file_write(ino, offset as usize, data) {
                         Ok(n) => return Some(n),
@@ -331,7 +437,7 @@ impl Vfs {
             if let Some(ofs) = get_blockfs() {
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 if let Some((dir_ino, etype)) = ofs.lookup_path(p)
-                    && etype == blockfs::ITYPE_DIR_ENTRY
+                    && etype == ITYPE_DIR_ENTRY
                 {
                     let entries = ofs.dir_readall(dir_ino);
                     let mut children = Vec::new();
@@ -368,10 +474,10 @@ impl Vfs {
             if let Some(ofs) = get_blockfs() {
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 if let Some((ino, etype)) = ofs.lookup_path(p) {
-                    if etype == blockfs::ITYPE_DIR_ENTRY {
+                    if etype == ITYPE_DIR_ENTRY {
                         return Some((true, 0));
-                    } else if let Some(inode) = ofs.read_inode(ino) {
-                        return Some((false, inode.size as u64));
+                    } else if let Some(info) = ofs.inode_info(ino) {
+                        return Some((false, info.size as u64));
                     }
                 }
             }
@@ -1066,7 +1172,6 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
             }
         }
         OP_RENAME => {
-            // Rename uses root namespace (no path_req ns_id available).
             let (old_ptr, old_len, new_ptr, new_len) = unpack_rename_req(&msg.data);
             let mut old_buf = alloc::vec![0u8; old_len];
             let mut new_buf = alloc::vec![0u8; new_len];
@@ -1076,23 +1181,40 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
             }
             let old = match core::str::from_utf8(&old_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
             let new = match core::str::from_utf8(&new_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            let vfs = ns_vfs(namespaces, 1);
-            if let Some(node) = vfs.nodes.remove(old) {
-                if let Some((op, on)) = Vfs::parent_and_name(old)
-                    && let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&op)
-                {
-                    c.retain(|x| x != &on);
-                }
-                if let Some((np, nn)) = Vfs::parent_and_name(new)
-                    && let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&np)
-                {
-                    c.push(nn);
-                }
-                vfs.nodes.insert(new.to_string(), node);
-                reply_ok(client, msg);
+
+            let ok = if old.starts_with("/mnt") || new.starts_with("/mnt") {
+                let (old_p, new_p) = match (old.strip_prefix("/mnt"), new.strip_prefix("/mnt")) {
+                    (Some(o), Some(n)) => {
+                        let o = if o.is_empty() { "/" } else { o };
+                        let n = if n.is_empty() { "/" } else { n };
+                        (o, n)
+                    }
+                    _ => { reply_err(client, msg); return; } // cross-mount rename not supported
+                };
+                let ofs = match get_blockfs() { Some(o) => o, None => { reply_err(client, msg); return; } };
+                let (old_parent, old_name) = match Vfs::parent_and_name(old_p) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                let (new_parent, new_name) = match Vfs::parent_and_name(new_p) { Some(r) => r, None => { reply_err(client, msg); return; } };
+                ofs.rename(&old_parent, &old_name, &new_parent, &new_name)
             } else {
-                reply_err(client, msg);
-            }
+                let vfs = ns_vfs(namespaces, 1);
+                if let Some(node) = vfs.nodes.remove(old) {
+                    if let Some((op, on)) = Vfs::parent_and_name(old)
+                        && let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&op)
+                    {
+                        c.retain(|x| x != &on);
+                    }
+                    if let Some((np, nn)) = Vfs::parent_and_name(new)
+                        && let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&np)
+                    {
+                        c.push(nn);
+                    }
+                    vfs.nodes.insert(new.to_string(), node);
+                    true
+                } else {
+                    false
+                }
+            };
+            if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_FSYNC => {
             let fd = unpack_close_req(&msg.data);
@@ -1118,9 +1240,9 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 let ofs = match get_blockfs() { Some(o) => o, None => { reply_err(client, msg); return; } };
                 let (ino, etype) = match ofs.lookup_path(p) { Some(r) => r, None => { reply_err(client, msg); return; } };
-                if etype != blockfs::ITYPE_SYMLINK_ENTRY { reply_err(client, msg); return; }
-                let inode = match ofs.read_inode(ino) { Some(i) => i, None => { reply_err(client, msg); return; } };
-                let mut content = alloc::vec![0u8; inode.size as usize];
+                if etype != ITYPE_SYMLINK_ENTRY { reply_err(client, msg); return; }
+                let info = match ofs.inode_info(ino) { Some(i) => i, None => { reply_err(client, msg); return; } };
+                let mut content = alloc::vec![0u8; info.size as usize];
                 if ofs.file_read(ino, 0, &mut content).is_err() { reply_err(client, msg); return; }
                 target_str = content; // keep alive
                 &target_str
@@ -1157,25 +1279,12 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
                 let ofs = match get_blockfs() { Some(o) => o, None => { reply_err(client, msg); return; } };
                 let (parent, name) = match Vfs::parent_and_name(p) { Some(r) => r, None => { reply_err(client, msg); return; } };
                 let (dir_ino, etype) = match ofs.lookup_path(&parent) { Some(r) => r, None => { reply_err(client, msg); return; } };
-                if etype != blockfs::ITYPE_DIR_ENTRY { reply_err(client, msg); return; }
-                // Allocate a new inode for the symlink.
-                let child_ino = match ofs.alloc_inode() { Some(i) => i, None => { reply_err(client, msg); return; } };
-                let new_inode = blockfs::RawInode {
-                    itype: blockfs::ITYPE_SYMLINK,
-                    _pad: [0; 3],
-                    size: 0,
-                    nlink: 1,
-                    used_blocks: 0,
-                    direct: [0u32; 12],
-                    indirect: 0,
-                    _reserved: [0u32; 15],
-                };
-                ofs.write_inode(child_ino, &new_inode);
-                // Write the target path as file content.
+                if etype != ITYPE_DIR_ENTRY { reply_err(client, msg); return; }
+                let child_ino = match ofs.create_inode(ITYPE_SYMLINK_ENTRY) { Some(i) => i, None => { reply_err(client, msg); return; } };
                 if ofs.file_write(child_ino, 0, target.as_bytes()).is_err() {
                     ofs.free_inode(child_ino);
                     false
-                } else if !ofs.dir_add_entry(dir_ino, &name, child_ino, blockfs::ITYPE_SYMLINK_ENTRY) {
+                } else if !ofs.dir_add_entry(dir_ino, &name, child_ino, ITYPE_SYMLINK_ENTRY) {
                     ofs.free_inode(child_ino);
                     false
                 } else {
@@ -1249,7 +1358,7 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
                 let p = if stripped.is_empty() { "/" } else { stripped };
                 let ofs = match get_blockfs() { Some(o) => o, None => { reply_err(client, msg); return; } };
                 let (ino, etype) = match ofs.lookup_path(p) { Some(r) => r, None => { reply_err(client, msg); return; } };
-                if etype != blockfs::ITYPE_FILE_ENTRY { false } else {
+                if etype != ITYPE_FILE_ENTRY { false } else {
                     ofs.file_truncate(ino);
                     true
                 }
@@ -1300,13 +1409,27 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
             let (_fd, _ats, _atns, _mts, _mtns) = unpack_futimens_req(&msg.data);
             reply_ok(client, msg);
         }
-        OP_FALLOCATE => {
+         OP_FALLOCATE => {
             let (fd, _offset, _length) = unpack_fallocate_req(&msg.data);
             let (path, file_ns) = match open_table.get(fd) {
                 Some(f) => (f.path.clone(), f.ns_id),
                 None => { reply_err(client, msg); return; }
             };
             if ns_vfs(namespaces, file_ns).exists(&path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+        }
+        OP_FSTAT => {
+            let fd = unpack_fstat_req(&msg.data);
+            let (path, file_ns) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(), f.ns_id),
+                None => { reply_err(client, msg); return; }
+            };
+            match ns_vfs(namespaces, file_ns).stat(&path) {
+                Some((is_dir, size)) => {
+                    pack_stat_reply(&mut msg.data, is_dir, size);
+                    reply_ok(client, msg);
+                }
+                None => reply_err(client, msg),
+            }
         }
         _ => { reply_err(client, msg); }
     }
