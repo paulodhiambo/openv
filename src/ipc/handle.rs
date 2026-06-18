@@ -68,7 +68,7 @@ pub fn encode_handle(id: u16, generation: u16) -> Handle {
 /// Decode a `Handle` into its id and generation components.
 #[inline]
 fn decode_handle(handle: Handle) -> (u16, u16) {
-    ((handle >> 16) as u16, (handle & 0xFFFF) as u16)
+    ((handle & 0xFFFF) as u16, (handle >> 16) as u16)
 }
 
 /// Byte-stream pipe read half. EOF when all write halves are dropped.
@@ -545,8 +545,9 @@ impl HandleTable {
     ///
     /// `true` on success, `false` if `src` is not found.
     pub fn dup2(&mut self, src: Handle, dst: Handle) -> bool {
-        if let Some(entry) = self.get_entry(src).cloned() {
-            let (dst_id, _) = decode_handle(dst);
+        if let Some(mut entry) = self.get_entry(src).cloned() {
+            let (dst_id, dst_gen) = decode_handle(dst);
+            entry.generation = dst_gen;
             self.map.insert(dst_id, entry);
             self.cloexec.remove(&dst); // POSIX: dup2 always clears FD_CLOEXEC on dst
             true

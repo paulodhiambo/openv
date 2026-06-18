@@ -5,14 +5,19 @@ unsafe extern "C" {
     fn __halt_cpu() -> !;
 }
 
+/// Kernel-level open. All files live in the VFS server; if we reach here the
+/// file was not found by VFS, so return ENOENT.
+pub fn sys_open(_arg0: usize, _arg1: usize, _arg2: usize, tf: &mut TrapFrame) {
+    tf.regs[10] = crate::errno::ENOENT;
+}
+
 pub fn sys_write(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     if !crate::mm::vmm::is_user_pointer_valid(tf, arg1 as *const u8, arg2) {
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
     let buf = unsafe { core::slice::from_raw_parts(arg1 as *const u8, arg2) };
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
     match fds.get_with_rights(arg0 as u32, crate::ipc::handle::Rights::WRITE) {
         Ok(obj) => match obj {
@@ -63,8 +68,7 @@ pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
     match fds.get_with_rights(arg0 as u32, crate::ipc::handle::Rights::READ) {
         Ok(obj) => match obj {
@@ -199,8 +203,7 @@ pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
 
 
 pub fn sys_close(arg0: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if proc.fds.lock().remove(arg0 as u32).is_some() {
         tf.regs[10] = 0;
     } else {
@@ -219,8 +222,7 @@ pub fn sys_close(arg0: usize, tf: &mut TrapFrame) {
 /// arg0 = buf_ptr (*mut u32 in user VA), arg1 = max entries.
 /// Returns number of PIDs written.
 pub fn sys_proc_list(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
         tf.regs[10] = crate::errno::EPERM;
         return;
@@ -245,8 +247,7 @@ pub fn sys_proc_list(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 /// arg0 = pid, arg1 = buf_ptr (*mut u8), arg2 = buf_len.
 /// Returns bytes written, or usize::MAX if the PID does not exist.
 pub fn sys_proc_status(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_PROCESS == 0 {
         tf.regs[10] = crate::errno::EPERM;
         return;
@@ -305,8 +306,7 @@ pub fn sys_get_blk_pid(tf: &mut TrapFrame) {
 }
 
 pub fn sys_vfs_register(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_SYS_ADMIN == 0 {
         tf.regs[10] = crate::errno::EPERM;
         return;
@@ -323,8 +323,7 @@ pub fn sys_get_vfs_pid(tf: &mut TrapFrame) {
 }
 
 pub fn sys_initrd_data(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_DATACOPY == 0 {
         tf.regs[10] = crate::errno::EPERM;
         return;
@@ -446,8 +445,7 @@ pub fn sys_chdir(arg0: usize, arg1: usize, tf: &mut crate::trap::TrapFrame) {
     }
     let path_bytes = unsafe { core::slice::from_raw_parts(arg0 as *const u8, arg1) };
     if let Ok(path) = core::str::from_utf8(path_bytes) {
-        crate::get_current_proc_or_esrch!(tf);
-        let proc = crate::posix::process::get_current_proc().unwrap();
+        let proc = crate::get_current_proc_or_esrch!(tf);
         let mut p = alloc::string::String::from(path);
         if p == "/" { }
         else if p.ends_with('/') { p.pop(); }
@@ -461,8 +459,7 @@ pub fn sys_getcwd(arg0: usize, arg1: usize, tf: &mut crate::trap::TrapFrame) {
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let cwd = proc.cwd.lock();
     let bytes = cwd.as_bytes();
     if bytes.len() + 1 > arg1 {

@@ -433,15 +433,6 @@ impl Vfs {
         }
     }
 
-    fn chmod(&mut self, _path: &str, _mode: u32) -> bool {
-        // Mode is synthesized on stat; can store perms later if needed.
-        self.nodes.contains_key(_path) || is_virtual_path(_path)
-    }
-
-    fn chown(&mut self, _path: &str, _owner: u32, _group: u32) -> bool {
-        self.nodes.contains_key(_path) || is_virtual_path(_path)
-    }
-
     fn truncate(&mut self, path: &str, length: u64) -> bool {
         match self.nodes.get_mut(path) {
             Some(FsNode::MemFile(data)) => {
@@ -459,27 +450,6 @@ impl Vfs {
         }
     }
 
-    fn fallocate(&mut self, path: &str, offset: u64, length: u64) -> bool {
-        let end = (offset + length) as usize;
-        match self.nodes.get_mut(path) {
-            Some(FsNode::MemFile(data)) => {
-                if data.len() < end { data.resize(end, 0); }
-                true
-            }
-            Some(FsNode::TarFile { tar_offset, size }) => {
-                let (to, sz) = (*tar_offset, *size);
-                let mut data = Vec::new();
-                if sz > 0 {
-                    data.resize(sz, 0);
-                    initrd_read(&mut data, to);
-                }
-                if data.len() < end { data.resize(end, 0); }
-                *self.nodes.get_mut(path).unwrap() = FsNode::MemFile(data);
-                true
-            }
-            _ => false,
-        }
-    }
 }
 
 // ── Virtual /proc and /dev helpers ───────────────────────────────────────────
@@ -674,7 +644,6 @@ const OP_PROC_READ: i32 = 2;
 const OP_PROC_STAT: i32 = 3;
 const OP_DEV_LIST: i32 = 1;
 const OP_DEV_READ: i32 = 2;
-const OP_DEV_WRITE: i32 = 3;
 const OP_DEV_STAT: i32 = 4;
 const PROC_REPLY_OK: i32 = 100;
 
@@ -1327,7 +1296,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
             reply_ok(client, msg);
         }
         OP_FALLOCATE => {
-            let (fd, offset, length) = unpack_fallocate_req(&msg.data);
+            let (fd, _offset, _length) = unpack_fallocate_req(&msg.data);
             let path = match open_table.get(fd) {
                 Some(f) => f.path.clone(),
                 None => { reply_err(client, msg); return; }

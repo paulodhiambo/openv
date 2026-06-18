@@ -6,8 +6,7 @@ unsafe extern "C" {
 
 pub fn sys_pipe(arg0: usize, tf: &mut TrapFrame) {
     let (rh, wh) = crate::ipc::handle::create_pipe();
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let mut fds = proc.fds.lock();
     let h_r = fds.insert(crate::ipc::handle::KernelObject::PipeRead(rh));
     let h_w = fds.insert(crate::ipc::handle::KernelObject::PipeWrite(wh));
@@ -27,8 +26,7 @@ pub fn sys_pipe(arg0: usize, tf: &mut TrapFrame) {
 
 pub fn sys_dup(arg0: usize, tf: &mut TrapFrame) {
     let old_fd = arg0 as u32;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let mut fds = proc.fds.lock();
     
     match fds.get_entry(old_fd) {
@@ -58,8 +56,7 @@ pub fn sys_dup2(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         tf.regs[10] = new_fd as usize;
         return;
     }
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let mut fds = proc.fds.lock();
     
     match fds.get_entry(old_fd) {
@@ -126,9 +123,7 @@ pub fn sys_mailbox_receive(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
     let ptr = arg0 as *mut u8;
     let max_len = arg1;
     let from_ptr = arg2 as *mut i32;
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     
     let msg = {
         let mut mb = proc.mailbox.lock();
@@ -461,8 +456,7 @@ pub const F_GET_VFS_FD: usize = 6;
 pub const FD_CLOEXEC: usize = 1;
 
 pub fn sys_fcntl(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let mut fds = proc.fds.lock();
     let fd = arg0 as u32;
 
@@ -528,7 +522,7 @@ pub fn sys_datacopy(
     len: usize,
     tf: &mut TrapFrame,
 ) {
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_DATACOPY == 0 {
         tf.regs[10] = crate::errno::EPERM;
         return;
@@ -646,8 +640,7 @@ pub fn sys_datacopy(
 
 pub fn sys_channel_create(arg0: usize, tf: &mut TrapFrame) {
     let (ep1, ep2) = crate::ipc::channel::ChannelEndpoint::create_pair();
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let mut fds = proc.fds.lock();
     let h1 = fds.insert(crate::ipc::handle::KernelObject::Channel(ep1));
     let h2 = fds.insert(crate::ipc::handle::KernelObject::Channel(ep2));
@@ -703,9 +696,7 @@ pub fn sys_channel_write(
             core::ptr::copy_nonoverlapping(handles_ptr as *const u32, handle_ids.as_mut_ptr(), handles_len);
         }
     }
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     let mut handles = alloc::vec::Vec::with_capacity(handles_len);
     let ep = {
@@ -806,9 +797,7 @@ pub fn sys_channel_read(
         tf.regs[11] = 0;
         return;
     }
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     let ep_arc = {
         let fds = proc.fds.lock();
@@ -919,8 +908,7 @@ pub fn sys_port_create(out_handle_ptr: usize, tf: &mut TrapFrame) {
     }
 
     let port = alloc::sync::Arc::new(crate::ipc::port::Port::new());
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let mut fds = proc.fds.lock();
     let h = fds.insert(crate::ipc::handle::KernelObject::Port(port));
     
@@ -935,9 +923,7 @@ pub fn sys_port_wait(port_fd: usize, out_packet_ptr: usize, tf: &mut TrapFrame) 
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     
     let port = {
         let fds = proc.fds.lock();
@@ -991,9 +977,7 @@ pub fn sys_port_queue(port_fd: usize, packet_ptr: usize, tf: &mut TrapFrame) {
             1,
         );
     }
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let port = {
         let fds = proc.fds.lock();
         match fds.get_with_rights(port_fd as u32, crate::ipc::handle::Rights::WRITE) {
@@ -1016,8 +1000,7 @@ pub fn sys_port_bind(
     trigger_signals: u32,
     tf: &mut TrapFrame,
 ) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     let fds = proc.fds.lock();
     
@@ -1061,8 +1044,7 @@ pub fn sys_port_bind(
 }
 
 pub fn sys_handle_duplicate(handle: usize, rights: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let mut fds = proc.fds.lock();
     
     let entry = match fds.get_entry(handle as u32) {
@@ -1090,8 +1072,7 @@ pub fn sys_handle_duplicate(handle: usize, rights: usize, tf: &mut TrapFrame) {
 }
 
 pub fn sys_handle_get_rights(handle: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
 
     match fds.get_entry(handle as u32) {
@@ -1118,9 +1099,7 @@ pub fn sys_object_wait_one(arg0: usize, arg1: usize, _arg2: usize, arg3: usize, 
     let handle = arg0 as u32;
     let signals_mask = arg1 as u32;
     let observed_ptr = arg3;
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     if observed_ptr != 0
         && !crate::mm::vmm::is_user_pointer_valid(tf, observed_ptr as *const u32, 1)

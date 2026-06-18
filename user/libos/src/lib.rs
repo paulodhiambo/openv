@@ -7,9 +7,11 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 
 // ── User-space heap ────────────────────────────────────────────────────────────
-#[cfg(feature = "large-heap")]
+#[cfg(feature = "huge-heap")]
+const USER_HEAP_SIZE: usize = 32 * 1024 * 1024;
+#[cfg(all(feature = "large-heap", not(feature = "huge-heap")))]
 const USER_HEAP_SIZE: usize = 8 * 1024 * 1024;
-#[cfg(not(feature = "large-heap"))]
+#[cfg(all(not(feature = "large-heap"), not(feature = "huge-heap")))]
 const USER_HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 #[global_allocator]
@@ -233,7 +235,11 @@ pub extern "C" fn open(path_ptr: *const u8, path_len: usize, flags: u32) -> i32 
         if vfs_fd > 0 {
             return syscall(81, usize::MAX, 5, vfs_fd as usize) as i32;
         }
+        // VFS is running but the file was not found — propagate the error
+        // rather than falling through to the kernel-level open.
+        return -1;
     }
+    // VFS not yet started: ask the kernel (returns ENOENT — no native FS).
     syscall(8, path_ptr as usize, path_len, flags as usize) as i32
 }
 
@@ -451,6 +457,18 @@ pub extern "C" fn recv(fd: i32, buf: *mut u8, len: usize, _flags: i32) -> isize 
 
 pub fn try_recv(fd: usize, buf: *mut u8, len: usize) -> isize {
     syscall(49, fd, buf as usize, len) as isize
+}
+
+/// `recv` with a yield-count timeout. Returns -1 when no data arrives within
+/// `max_yields` scheduler turns. Non-blocking per turn; the caller can treat a
+/// negative return as a network error.
+pub fn recv_timeout(fd: usize, buf: *mut u8, len: usize, max_yields: usize) -> isize {
+    for _ in 0..max_yields {
+        let n = try_recv(fd, buf, len);
+        if n != 0 { return n; }
+        sys_yield();
+    }
+    -1
 }
 
 pub fn getpid() -> i32 {
@@ -815,7 +833,7 @@ pub fn vfs_chmod(path: &[u8], mode: u32) -> i32 {
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
 }
 
-pub fn vfs_chown(path: &[u8], owner: u32, group: u32) -> i32 {
+pub fn vfs_chown(path: &[u8], owner: u32, _group: u32) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_CHOWN;
     vfs_proto::pack_path_req(&mut msg.data, owner, path.as_ptr() as usize, path.len());
@@ -866,7 +884,20 @@ pub fn vfs_fallocate(vfs_fd: u32, offset: u64, length: u64) -> i32 {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // Write a minimal message so OOM/assert panics are visible on stderr.
+    let msg = b"panic: process aborted\n";
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") 2usize,   // sys_write
+            in("a0") 2usize,   // fd=2 (stderr)
+            in("a1") msg.as_ptr(),
+            in("a2") msg.len(),
+            options(nostack),
+        );
+    }
+    let _ = info;
     exit(1);
 }
 

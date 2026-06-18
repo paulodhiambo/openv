@@ -244,15 +244,6 @@ fn install_deb(deb_data: &[u8]) -> i32 {
 
 // ── Apt repo commands ──
 
-fn repo_url(suffix: &[u8]) -> Vec<u8> {
-    let mut url = Vec::new();
-    url.extend_from_slice(MIRROR_PATH);
-    url.extend_from_slice(b"/dists/");
-    url.extend_from_slice(SUITE);
-    url.extend_from_slice(suffix);
-    url
-}
-
 fn cmd_update() -> i32 {
     stdout(b"pkg: updating package index from Debian mirror...\n");
 
@@ -280,10 +271,22 @@ fn cmd_update() -> i32 {
     stdout(&pkg_gz_path);
     stdout(b"\n");
 
+    stdout(b"pkg: [1] opening socket\n");
     let (status, body) = match http::http_get(mirror_ip, MIRROR_PORT, MIRROR_HOST, &pkg_gz_path) {
         Some(r) => r,
-        None => { stderr(b"pkg: HTTP request failed (network may be down)\n"); return 1; }
+        None => {
+            stdout(b"pkg: [N] http_get None\n");
+            stderr(b"pkg: HTTP request failed (network may be down)\n");
+            return 1;
+        }
     };
+    stdout(b"pkg: [2] http_get done\n");
+
+    stdout(b"pkg: HTTP ");
+    stdout(status.to_string().as_bytes());
+    stdout(b", received ");
+    stdout(body.len().to_string().as_bytes());
+    stdout(b" bytes\n");
 
     if status != 200 {
         stderr(b"pkg: HTTP ");
@@ -292,36 +295,28 @@ fn cmd_update() -> i32 {
         return 1;
     }
 
-    let index_data = match gzip::gunzip(&body) {
-        Some(d) => d,
-        None => { stderr(b"pkg: failed to decompress Packages.gz\n"); return 1; }
-    };
-
-    let packages = deb::parse_index(&index_data);
-    stdout(b"pkg: found ");
-    stdout(packages.len().to_string().as_bytes());
-    stdout(b" packages in index\n");
-
-    // Save index to /mnt/pkg/cache/Packages
     ensure_dir(CACHE_DIR);
     let index_path = path_join(CACHE_DIR, b"Packages");
-    write_file(&index_path, &index_data);
-
-    // Save the first 5 package names as a preview
-    for (i, pkg) in packages.iter().enumerate() {
-        if i >= 5 { break; }
-        stdout(b"  - ");
-        stdout(&pkg.package);
-        stdout(b"\n");
-        if i == 0 {
-            // Save filename for the first package so we can download it
-            if !pkg.filename.is_empty() {
-                let fn_path = path_join(CACHE_DIR, b"last_filename");
-                write_file(&fn_path, &pkg.filename);
-            }
-        }
+    let index_fd = create(&index_path);
+    if index_fd < 0 {
+        stderr(b"pkg: failed to create index file\n");
+        return 1;
     }
 
+    let bytes = match gzip::gunzip_to_fd(&body, index_fd) {
+        Some(n) => n,
+        None => {
+            close(index_fd);
+            stderr(b"pkg: failed to decompress Packages.gz\n");
+            return 1;
+        }
+    };
+    drop(body);
+    close(index_fd);
+
+    stdout(b"pkg: index updated (");
+    stdout(bytes.to_string().as_bytes());
+    stdout(b" bytes)\n");
     0
 }
 

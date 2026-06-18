@@ -194,7 +194,7 @@ pub fn vfs_chmod(path: &[u8], mode: u32) -> i32 {
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
 }
 
-pub fn vfs_chown(path: &[u8], owner: u32, group: u32) -> i32 {
+pub fn vfs_chown(path: &[u8], owner: u32, _group: u32) -> i32 {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_CHOWN;
     vfs_proto::pack_path_req(&mut msg.data, owner, path.as_ptr() as usize, path.len());

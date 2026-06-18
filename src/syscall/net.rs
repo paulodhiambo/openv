@@ -46,8 +46,7 @@ pub fn sys_net_recv(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 
 pub fn sys_socket(tf: &mut TrapFrame) {
     let (ep_user, ep_net) = crate::ipc::channel::ChannelEndpoint::create_pair();
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let user_fd = proc.fds.lock().insert(crate::ipc::handle::KernelObject::Channel(ep_user));
 
     let sid = crate::net::socket::alloc_socket_id();
@@ -59,8 +58,7 @@ pub fn sys_socket(tf: &mut TrapFrame) {
 
 pub fn sys_daemon_next_socket(tf: &mut TrapFrame) {
     if let Some((sid, ep)) = crate::net::socket::pop_new_socket() {
-        crate::get_current_proc_or_esrch!(tf);
-        let proc = crate::posix::process::get_current_proc().unwrap();
+        let proc = crate::get_current_proc_or_esrch!(tf);
         let fd = proc.fds.lock().insert(crate::ipc::handle::KernelObject::Channel(ep));
         let ret = ((sid as usize) << 32) | (fd as usize);
         tf.regs[10] = ret;
@@ -73,9 +71,7 @@ pub fn sys_daemon_create_conn(arg0: usize, tf: &mut TrapFrame) {
     let listen_sid = arg0 as u32;
     if let Some((owner_pid, _owner_fd)) = crate::net::socket::owner_of(listen_sid) {
         let (user_ep, net_ep) = crate::ipc::channel::ChannelEndpoint::create_pair();
-
-        crate::get_current_proc_or_esrch!(tf);
-        let proc = crate::posix::process::get_current_proc().unwrap();
+        let proc = crate::get_current_proc_or_esrch!(tf);
         let net_fd = proc.fds.lock().insert(crate::ipc::handle::KernelObject::Channel(net_ep));
 
         crate::net::socket::push_pending_accepted(listen_sid, {
@@ -125,8 +121,7 @@ pub fn sys_bind(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
     if let Some(obj) = fds.get(fd) {
         match obj {
@@ -149,8 +144,7 @@ pub fn sys_bind(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
 pub fn sys_listen(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let fd = arg0 as u32;
     let backlog = arg1 as u32;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
     if let Some(obj) = fds.get(fd) {
         match obj {
@@ -177,8 +171,7 @@ pub fn sys_connect(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
     if let Some(obj) = fds.get(fd) {
         match obj {
@@ -206,8 +199,7 @@ pub fn sys_sock_send(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
     if let Some(obj) = fds.get(fd) {
         match obj {
@@ -235,8 +227,7 @@ pub fn sys_sock_recv(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
     if let Some(obj) = fds.get(fd) {
         match obj {
@@ -268,8 +259,7 @@ pub fn sys_try_recv(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let fds = proc.fds.lock();
     if let Some(obj) = fds.get(fd) {
         match obj {

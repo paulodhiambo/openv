@@ -5,7 +5,6 @@ pub struct DebPackage {
     pub version: Vec<u8>,
     pub depends: Vec<Vec<u8>>,
     pub filename: Vec<u8>,
-    pub size: usize,
     pub description: Vec<u8>,
 }
 
@@ -89,11 +88,6 @@ pub fn parse_control(data: &[u8]) -> Option<DebPackage> {
     let description = field_get(&fields, b"description").unwrap_or(&[]);
     let filename = field_get(&fields, b"filename").unwrap_or(&[]);
 
-    let size: usize = field_get(&fields, b"size")
-        .and_then(|s| core::str::from_utf8(s).ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
     let mut depends = Vec::new();
     for dep in depends_str.split(|&b| b == b',') {
         let dep = trim_ascii(dep);
@@ -121,7 +115,6 @@ pub fn parse_control(data: &[u8]) -> Option<DebPackage> {
         version: version.to_vec(),
         depends,
         filename: filename.to_vec(),
-        size,
         description: description.to_vec(),
     })
 }

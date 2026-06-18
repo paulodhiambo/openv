@@ -1,4 +1,4 @@
-use libos::{close, connect, recv, send, socket};
+use libos::{close, connect, recv_timeout, send, socket};
 use alloc::vec::Vec;
 
 const DNS_SERVER: [u8; 4] = [10, 0, 2, 3];
@@ -93,7 +93,7 @@ pub fn resolve_hostname(name: &[u8]) -> Option<[u8; 4]> {
     let mut buf = [0u8; 2048];
     let mut response = Vec::new();
     loop {
-        let n = recv(fd, buf.as_mut_ptr(), buf.len(), 0);
+        let n = recv_timeout(fd as usize, buf.as_mut_ptr(), buf.len(), 8000);
         if n <= 0 { break; }
         response.extend_from_slice(&buf[..n as usize]);
     }
@@ -107,7 +107,6 @@ pub fn resolve_hostname(name: &[u8]) -> Option<[u8; 4]> {
     if pkt.len() < 12 { return None; }
 
     // Check reply code (last 4 bits of flags[1])
-    let flags_hi = pkt[2];
     let flags_lo = pkt[3];
     let rcode = flags_lo & 0x0f;
     if rcode != 0 { return None; }

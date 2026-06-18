@@ -24,14 +24,6 @@ fn register() {
     libos::syscall(116, 0, 0, 0); // SYS_DEV_SERVER_REGISTER
 }
 
-/// Map device name to a numeric ID.
-fn dev_id(name: &[u8]) -> Option<u8> {
-    if name == b"null" { return Some(0); }
-    if name == b"zero" { return Some(1); }
-    if name == b"tty"  { return Some(2); }
-    None
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn main(_argc: usize, _argv: usize) -> i32 {
     register();

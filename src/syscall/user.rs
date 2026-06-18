@@ -2,8 +2,7 @@ use crate::trap::TrapFrame;
 use core::sync::atomic::Ordering;
 
 pub fn sys_setuid(arg0: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if proc.euid.load(Ordering::Relaxed) == 0 {
         let val = arg0 as u32;
         proc.uid.store(val, Ordering::Relaxed);
@@ -18,8 +17,7 @@ pub fn sys_setuid(arg0: usize, tf: &mut TrapFrame) {
 }
 
 pub fn sys_setgid(arg0: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if proc.euid.load(Ordering::Relaxed) == 0 {
         let val = arg0 as u32;
         proc.gid.store(val, Ordering::Relaxed);
@@ -34,26 +32,22 @@ pub fn sys_setgid(arg0: usize, tf: &mut TrapFrame) {
 }
 
 pub fn sys_getuid(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     tf.regs[10] = proc.uid.load(Ordering::Relaxed) as usize;
 }
 
 pub fn sys_geteuid(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     tf.regs[10] = proc.euid.load(Ordering::Relaxed) as usize;
 }
 
 pub fn sys_getgid(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     tf.regs[10] = proc.gid.load(Ordering::Relaxed) as usize;
 }
 
 pub fn sys_getegid(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     tf.regs[10] = proc.egid.load(Ordering::Relaxed) as usize;
 }
 
@@ -80,8 +74,7 @@ pub fn sys_authenticate(arg0: usize, arg1: usize, arg2: usize, arg3: usize, tf: 
 
 pub fn sys_can_sudo(arg0: usize, tf: &mut TrapFrame) {
     let uid = if arg0 == 0 {
-        crate::get_current_proc_or_esrch!(tf);
-        let proc = crate::posix::process::get_current_proc().unwrap();
+        let proc = crate::get_current_proc_or_esrch!(tf);
         proc.uid.load(Ordering::Relaxed)
     } else {
         arg0 as u32

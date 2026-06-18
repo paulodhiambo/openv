@@ -173,6 +173,7 @@ pub fn dispatch(
         // fs.rs
         2 => fs::sys_write(arg0, arg1, arg2, tf),
         5 => fs::sys_read(arg0, arg1, arg2, tf),
+        8 => fs::sys_open(arg0, arg1, arg2, tf),
         9 => fs::sys_close(arg0, tf),
         55 => fs::sys_chdir(arg0, arg1, tf),
         56 => fs::sys_getcwd(arg0, arg1, tf),

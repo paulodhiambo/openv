@@ -66,7 +66,7 @@ pub extern "C" fn main() -> i32 {
 
     // Pre-allocate shared message buffers on the heap to avoid large stack frames
     let mut ctrl_buf: Vec<u8> = alloc::vec![0u8; 1500];
-    let mut recv_buf: Vec<u8> = alloc::vec![0u8; 1500];
+    let mut recv_buf: Vec<u8> = alloc::vec![0u8; 4096];
 
     libos::write(1, b"net: ready (10.0.2.15/24)\n".as_ptr(), 26);
 
@@ -128,8 +128,8 @@ pub extern "C" fn main() -> i32 {
                             if EPHEMERAL_PORT < 49152 { EPHEMERAL_PORT = 49152; }
                             p
                         };
-                        let rx = tcp::SocketBuffer::new(alloc::vec![0u8; 4096]);
-                        let tx = tcp::SocketBuffer::new(alloc::vec![0u8; 4096]);
+                        let rx = tcp::SocketBuffer::new(alloc::vec![0u8; 32768]);
+                        let tx = tcp::SocketBuffer::new(alloc::vec![0u8; 32768]);
                         let mut sock = tcp::Socket::new(rx, tx);
                         sock.connect(iface.context(), (ip, port), local_port).ok();
                         let handle = sockets.add(sock);

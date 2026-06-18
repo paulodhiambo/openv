@@ -385,9 +385,7 @@ pub fn sys_phys_map(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let va = arg0;
     let pa = arg1;
     let len = arg2;
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     
     let caps = proc.caps.load(core::sync::atomic::Ordering::Relaxed);
     if caps & (crate::posix::process::CAP_MMIO | crate::posix::process::CAP_DRIVER) == 0 {
@@ -432,8 +430,7 @@ pub fn sys_phys_map(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
 /// mapped.
 pub fn sys_virt_to_phys(arg0: usize, tf: &mut TrapFrame) {
     let va = arg0;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let root_pa = (proc.satp_val.load(core::sync::atomic::Ordering::Relaxed) & 0xFFFFFFFFFFF) << 12;
 
     match crate::mm::vmm::PageTable::walk_page_table(root_pa, va) {
@@ -452,8 +449,7 @@ pub fn sys_virt_to_phys(arg0: usize, tf: &mut TrapFrame) {
 /// * `arg1` (`a1`) — Size in bytes of the MMIO region (0 if IRQ-only).
 /// * `arg2` (`a2`) — IRQ number, or `u32::MAX` (0xffffffff) if no IRQ.
 pub fn sys_create_resource(arg0: usize, arg1: usize, arg2: usize, tf: &mut crate::trap::TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     if proc.caps.load(core::sync::atomic::Ordering::Relaxed)
         & crate::posix::process::CAP_SYS_ADMIN
@@ -477,8 +473,7 @@ pub fn sys_create_resource(arg0: usize, arg1: usize, arg2: usize, tf: &mut crate
 /// # Arguments
 /// * `arg0` (`a0`) — PID of the target process.
 pub fn sys_grant_driver_cap(arg0: usize, tf: &mut crate::trap::TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let caller = crate::posix::process::get_current_proc().unwrap();
+    let caller = crate::get_current_proc_or_esrch!(tf);
 
     if caller.caps.load(core::sync::atomic::Ordering::Relaxed)
         & crate::posix::process::CAP_SYS_ADMIN

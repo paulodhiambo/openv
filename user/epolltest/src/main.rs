@@ -18,11 +18,8 @@ const SYS_EPOLL_CTL: usize = 233;
 const SYS_EPOLL_PWAIT: usize = 244;
 
 const EPOLL_CTL_ADD: usize = 1;
-const EPOLL_CTL_DEL: usize = 2;
-const EPOLL_CTL_MOD: usize = 3;
 
 const EPOLLIN: u32 = 0x001;
-const EPOLLOUT: u32 = 0x004;
 const EPOLLET: u32 = 1 << 31;
 const EPOLL_CLOEXEC: usize = 1 << 19;
 

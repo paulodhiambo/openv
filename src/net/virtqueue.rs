@@ -309,6 +309,22 @@ impl VirtQueue {
         out
     }
 
+    /// Pops exactly one completed entry from the used ring, or returns None if
+    /// the ring is empty. Callers that process one packet at a time should use
+    /// this instead of `pop_used` to avoid silently discarding completions.
+    pub fn pop_one_used(&mut self) -> Option<(u16, u32)> {
+        fence(Ordering::Acquire);
+        let used_i = unsafe { read_volatile(self.used_idx) };
+        if self.last_used_idx as u16 == used_i {
+            return None;
+        }
+        let idx = (self.last_used_idx as usize) % self.size;
+        let ue = unsafe { &*self.used_ring.add(idx) };
+        let entry = (ue.id as u16, ue.len);
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        Some(entry)
+    }
+
     /// Walks a descriptor chain starting at `start` and returns the list of
     /// `(physical_address, length)` pairs for each buffer in the chain.
     ///

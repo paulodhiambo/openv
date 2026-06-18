@@ -569,8 +569,7 @@ pub fn sys_getpid(tf: &mut TrapFrame) {
 
 /// Returns the parent PID of the current process.
 pub fn sys_getppid(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     tf.regs[10] = proc.ppid.load(Ordering::Relaxed) as usize;
 }
 
@@ -674,8 +673,7 @@ pub fn sys_nanosleep(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
 pub fn sys_setpgid(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let mut pid = arg0 as i32;
     let mut pgid = arg1 as i32;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if pid == 0 {
         pid = proc.pid;
     }
@@ -694,8 +692,7 @@ pub fn sys_setpgid(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 /// Returns the process group ID of the current process.
 pub fn sys_getpgid(arg0: usize, tf: &mut TrapFrame) {
     let mut pid = arg0 as i32;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if pid == 0 {
         pid = proc.pid;
     }
@@ -709,8 +706,7 @@ pub fn sys_getpgid(arg0: usize, tf: &mut TrapFrame) {
 /// Creates a new session with the current process as the leader
 /// and allocates a fresh TTY for the new session.
 pub fn sys_setsid(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let pid = proc.pid;
     proc.pgid.store(pid, core::sync::atomic::Ordering::Relaxed);
     proc.sid.store(pid, core::sync::atomic::Ordering::Relaxed);
@@ -822,9 +818,7 @@ pub fn sys_sigaction(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     
     if arg2 != 0 {
         let old_act = unsafe { &mut *(arg2 as *mut SigAction) };
@@ -1210,8 +1204,7 @@ pub const JOB_POLICY_MAX_MEMORY: usize = 1;
 
 pub fn sys_job_create(parent_handle: usize, options: usize, tf: &mut TrapFrame) {
     let _ = options;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     let parent_job = if parent_handle == 0 {
         proc.job.clone()
@@ -1233,8 +1226,7 @@ pub fn sys_job_create(parent_handle: usize, options: usize, tf: &mut TrapFrame) 
 }
 
 pub fn sys_job_set_policy(job_handle: usize, policy_type: usize, value: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     let job = if job_handle == 0 {
         proc.job.clone()
@@ -1312,9 +1304,7 @@ pub fn sys_task_kill(handle: usize, tf: &mut TrapFrame) {
         crate::posix::process::schedule();
         unsafe { __halt_cpu() }
     }
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     let job = match proc.fds.lock().get(handle as u32) {
         Some(crate::ipc::handle::KernelObject::Job(j)) => j.clone(),

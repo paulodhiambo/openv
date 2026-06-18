@@ -7,6 +7,9 @@ edition = "2024"
 # Use an 8 MiB heap instead of the default 2 MiB.  Enable for vfs-server which
 # needs to cache the entire initrd TAR in memory.
 large-heap = []
+# Use a 32 MiB heap.  Enable for pkg which must buffer Packages.gz (compressed
+# + decompressed) entirely in memory before writing the index to disk.
+huge-heap = []
 
 [dependencies]
 buddy_system_allocator = "0.11.0"

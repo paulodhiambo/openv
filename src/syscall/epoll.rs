@@ -129,7 +129,7 @@ fn check_fd_readiness(fd: i32, interest: u32) -> u32 {
 }
 
 pub fn sys_epoll_create1(flags: usize, tf: &mut TrapFrame) {
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     let instance = Arc::new(EpollInstance {
         items: crate::sync::Mutex::new(alloc::collections::BTreeMap::new()),
@@ -203,8 +203,7 @@ fn deregister_epoll_with_fd(
 }
 
 pub fn sys_epoll_ctl(epfd: usize, op: usize, fd: usize, event_ptr: usize, tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
 
     // Release fds lock immediately after cloning ep. check_fd_readiness also
     // acquires proc.fds, so holding fds across that call deadlocks on the
@@ -346,8 +345,7 @@ pub fn sys_epoll_pwait(
     timeout: usize,
     tf: &mut TrapFrame,
 ) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let ep = {
         let fds = proc.fds.lock();
         match fds.get(epfd as u32) {
