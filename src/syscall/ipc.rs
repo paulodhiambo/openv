@@ -110,7 +110,7 @@ pub fn sys_mailbox_send(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFram
             let mut state = target.state.lock();
             if matches!(*state, crate::posix::process::ProcState::Stopped) {
                 *state = crate::posix::process::ProcState::Running;
-                crate::posix::process::RUN_QUEUE.lock().push_back(to_pid);
+                crate::posix::process::enqueue_with_prio(to_pid, target.priority.load(core::sync::atomic::Ordering::Relaxed));
             }
         }
         tf.regs[10] = 0;
@@ -163,7 +163,7 @@ pub fn kernel_send_msg(target_pid: i32, msg: crate::ipc::msg::Message) {
         match *target_state {
             crate::posix::process::IpcState::Receiving { source, msg_ptr: _ } if source == msg.source || source == -1 => {
                 *target_state = crate::posix::process::IpcState::MessageAvailable { msg };
-                crate::posix::process::RUN_QUEUE.lock().push_back(target_pid);
+                crate::posix::process::enqueue_with_prio(target_pid, target.priority.load(core::sync::atomic::Ordering::Relaxed));
             }
             crate::posix::process::IpcState::None => {
                 *target_state = crate::posix::process::IpcState::MessageAvailable { msg };
@@ -216,7 +216,7 @@ pub fn sys_ipc_send(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
             crate::posix::process::IpcState::ReceivingReply { source, msg_ptr: _ } if source == sender_pid || source == -1 => {
                 // Target is waiting. Give them the message.
                 *target_state = crate::posix::process::IpcState::MessageAvailable { msg: local_msg };
-                crate::posix::process::RUN_QUEUE.lock().push_back(to_pid);
+                crate::posix::process::enqueue_with_prio(to_pid, target.priority.load(core::sync::atomic::Ordering::Relaxed));
                 tf.regs[10] = 0; // Success immediately, no need to block
             }
             _ => {
@@ -340,7 +340,7 @@ pub fn sys_ipc_receive(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
             } else {
                 // Sender was using send, they are done
                 *sender_state = crate::posix::process::IpcState::SendComplete;
-                crate::posix::process::RUN_QUEUE.lock().push_back(sender_pid);
+                crate::posix::process::enqueue_with_prio(sender_pid, sender.priority.load(core::sync::atomic::Ordering::Relaxed));
             }
             
             tf.regs[10] = sender_pid_actual as usize; // Return sender PID
@@ -404,8 +404,8 @@ pub fn sys_ipc_sendrec(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
                     crate::posix::process::IpcState::Receiving { source, msg_ptr: _ } if source == sender_pid || source == -1 => {
                         // Target is ready. Deposit message and transition to ReceivingReply.
                         *target_state = crate::posix::process::IpcState::MessageAvailable { msg: local_msg };
-                        crate::posix::process::RUN_QUEUE.lock().push_back(to_pid);
-                        
+                        crate::posix::process::enqueue_with_prio(to_pid, target.priority.load(core::sync::atomic::Ordering::Relaxed));
+
                         *state = crate::posix::process::IpcState::ReceivingReply {
                             source: to_pid,
                             msg_ptr,
@@ -764,10 +764,8 @@ pub fn sys_channel_write(
             tf.regs[10] = 0;
             if let Some(waiter) = waiter_pid {
                 let current_pid = crate::posix::process::current_pid();
-                let mut rq = crate::posix::process::RUN_QUEUE.lock();
-                rq.push_back(current_pid);
-                rq.push_front(waiter);
-                drop(rq);
+                crate::posix::process::enqueue(current_pid);
+                crate::posix::process::enqueue(waiter);
                 crate::posix::process::schedule();
                 unsafe { __halt_cpu() }
             }

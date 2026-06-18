@@ -56,19 +56,21 @@ pub fn get_u64(buf: &[u8], off: &mut usize) -> u64 {
 
 /// OP_OPEN / OP_CREATE / OP_MKDIR / OP_UNLINK / OP_STAT
 /// Format: flags(4), path_ptr(8), path_len(4)
-pub fn pack_path_req(data: &mut [u8; 56], flags: u32, path_ptr: usize, path_len: usize) {
+pub fn pack_path_req(data: &mut [u8; 56], flags: u32, path_ptr: usize, path_len: usize, ns_id: u32) {
     let mut off = 0;
     put_u32(data, &mut off, flags);
     put_u64(data, &mut off, path_ptr as u64);
     put_u32(data, &mut off, path_len as u32);
+    put_u32(data, &mut off, ns_id);
 }
 
-pub fn unpack_path_req(data: &[u8; 56]) -> (u32, usize, usize) {
+pub fn unpack_path_req(data: &[u8; 56]) -> (u32, usize, usize, u32) {
     let mut off = 0;
     let flags = get_u32(data, &mut off);
     let path_ptr = get_u64(data, &mut off) as usize;
     let path_len = get_u32(data, &mut off) as usize;
-    (flags, path_ptr, path_len)
+    let ns_id = get_u32(data, &mut off);
+    (flags, path_ptr, path_len, ns_id)
 }
 
 /// OP_READ / OP_WRITE

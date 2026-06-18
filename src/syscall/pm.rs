@@ -170,7 +170,9 @@ pub fn sys_set_process_state(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         if state == 1 {
             if *st == crate::posix::process::ProcState::Stopped {
                 *st = crate::posix::process::ProcState::Running;
-                crate::posix::process::RUN_QUEUE.lock().push_back(target_pid);
+                let prio = proc.priority.load(core::sync::atomic::Ordering::Relaxed);
+                drop(st);
+                crate::posix::process::enqueue_with_prio(target_pid, prio);
             }
         } else {
             *st = crate::posix::process::ProcState::Stopped;

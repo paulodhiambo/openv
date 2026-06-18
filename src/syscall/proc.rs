@@ -30,10 +30,9 @@ unsafe extern "C" {
 /// If the run queue is non-empty, the current process is pushed to
 /// the back and [`crate::posix::process::schedule`] is called.
 pub fn sys_yield(_tf: &mut TrapFrame) {
-    let mut rq = crate::posix::process::RUN_QUEUE.lock();
-    if !rq.is_empty() {
-        rq.push_back(crate::posix::process::current_pid());
-        drop(rq);
+    let is_empty = crate::posix::process::RUN_QUEUE.lock().is_empty();
+    if !is_empty {
+        crate::posix::process::enqueue(crate::posix::process::current_pid());
         crate::posix::process::schedule();
         unsafe { __halt_cpu() }
     }
@@ -750,6 +749,8 @@ pub const SIGKILL: usize = 9;
 pub const SIGINT: usize = 2;
 /// `SIGTERM` signal number (15) — termination request.
 pub const SIGTERM: usize = 15;
+/// `SIGPIPE` signal number (13) — write to closed pipe/socket.
+pub const SIGPIPE: usize = 13;
 
 /// Sends a signal to a process or process group.
 ///
@@ -761,40 +762,108 @@ pub const SIGTERM: usize = 15;
 /// * `arg1` (`a1`) - Signal number (0..31). `0` is a permission
 ///   check that does not actually deliver.
 /// * `tf` - Caller's trap frame.
+/// Wake a Stopped process with EINTR so a pending signal is delivered on the
+/// next return-to-user-space.  Must be called while PROCESS_TABLE is held.
+///
+/// If the process is blocked in a rendezvous-IPC send, it is also removed from
+/// the target's senders queue so the target never tries to deliver to it.
+fn wake_with_eintr(
+    pid: i32,
+    proc: &alloc::sync::Arc<crate::posix::process::Process>,
+    table: &alloc::collections::BTreeMap<i32, alloc::sync::Arc<crate::posix::process::Process>>,
+) {
+    use crate::posix::process::{IpcState, ProcState, enqueue_with_prio};
+
+    if !matches!(*proc.state.lock(), ProcState::Stopped) {
+        return;
+    }
+
+    // If the process is mid-send, pull it out of the target's senders queue so
+    // the target won't try to deliver to an IPC state we're about to clear.
+    {
+        let ipc = proc.ipc_state.lock().clone();
+        if let IpcState::Sending { target, .. } = ipc {
+            if let Some(target_proc) = table.get(&target) {
+                target_proc.senders.lock().retain(|&s| s != pid);
+            }
+        }
+        *proc.ipc_state.lock() = IpcState::None;
+    }
+
+    {
+        let mut tf = proc.trap_frame.lock();
+        tf.sepc += 4; // undo the sepc -= 4 that armed the retry
+        tf.regs[10] = crate::errno::EINTR;
+    }
+
+    let mut st = proc.state.lock();
+    *st = ProcState::Running;
+    let prio = proc.priority.load(Ordering::Relaxed);
+    drop(st);
+    enqueue_with_prio(pid, prio);
+}
+
 pub fn sys_kill(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     let sig = arg1 as u32;
-    
+
     if sig >= 32 {
         tf.regs[10] = usize::MAX; // EINVAL
         return;
     }
-    
-    let table = crate::posix::process::PROCESS_TABLE.lock();
-    let current_proc = table.get(&crate::posix::process::current_pid()).unwrap().clone();
-    
+
+    let current_pid = crate::posix::process::current_pid();
+    let mut to_kill: Vec<i32> = Vec::new();
     let mut sent = false;
-    
-    for (pid, proc) in table.iter() {
-        let matches = if target_pid > 0 {
-            *pid == target_pid
-        } else if target_pid == 0 {
-            proc.pgid.load(core::sync::atomic::Ordering::Relaxed) == current_proc.pgid.load(core::sync::atomic::Ordering::Relaxed)
-        } else if target_pid == -1 {
-            *pid > 1 && *pid != current_proc.pid // Broadcast to all except init and self (simplified)
-        } else {
-            proc.pgid.load(core::sync::atomic::Ordering::Relaxed) == -target_pid
-        };
-        
-        if matches {
-            if sig != 0 {
-                proc.pending_signals.fetch_or(1 << sig, core::sync::atomic::Ordering::Relaxed);
+
+    {
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        let current_pgid = table
+            .get(&current_pid)
+            .map(|p| p.pgid.load(Ordering::Relaxed))
+            .unwrap_or(0);
+
+        for (pid, proc) in table.iter() {
+            let matches = if target_pid > 0 {
+                *pid == target_pid
+            } else if target_pid == 0 {
+                proc.pgid.load(Ordering::Relaxed) == current_pgid
+            } else if target_pid == -1 {
+                *pid > 1 && *pid != current_pid
+            } else {
+                proc.pgid.load(Ordering::Relaxed) == -target_pid
+            };
+
+            if matches && sig != 0 {
+                if sig == SIGKILL as u32 {
+                    // SIGKILL is unblockable — collect for direct exit() after lock drop.
+                    to_kill.push(*pid);
+                } else {
+                    proc.pending_signals.fetch_or(1 << sig, Ordering::Relaxed);
+                    // Wake a sleeping process so signal is delivered on next return-to-user.
+                    let blocked = proc.blocked_signals.load(Ordering::Relaxed);
+                    if (1u32 << sig) & !blocked != 0 {
+                        wake_with_eintr(*pid, proc, &table);
+                    }
+                }
+                sent = true;
             }
-            sent = true;
         }
+    } // PROCESS_TABLE released
+
+    // Kill collected SIGKILL targets.  Call exit() with no lock held so it can
+    // acquire PROCESS_TABLE itself.  Handle the self-kill case last.
+    let kill_self = to_kill.contains(&current_pid);
+    for &pid in to_kill.iter().filter(|&&p| p != current_pid) {
+        crate::posix::spawn::exit(pid, -9);
     }
-    
-    if sent {
+    if kill_self {
+        crate::posix::spawn::exit(current_pid, -9);
+        crate::posix::process::schedule();
+        unsafe { __halt_cpu() }
+    }
+
+    if sent || !to_kill.is_empty() {
         tf.regs[10] = 0;
     } else {
         tf.regs[10] = usize::MAX; // ESRCH
@@ -986,7 +1055,7 @@ pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, arg3: usize, tf: &mut Tr
         child.clear_tid_ptr.store(child_tid_ptr, Ordering::Relaxed);
     }
 
-    crate::posix::process::RUN_QUEUE.lock().push_back(child_pid);
+    crate::posix::process::enqueue_with_prio(child_pid, child.priority.load(Ordering::Relaxed));
     tf.regs[10] = child_pid as usize;
 }
 
@@ -1063,12 +1132,56 @@ pub fn sys_futex(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                     crate::posix::process::PROCESS_TABLE.lock().get(&waker_pid).cloned()
                 {
                     *proc.state.lock() = crate::posix::process::ProcState::Running;
+                    crate::posix::process::enqueue_with_prio(waker_pid, proc.priority.load(Ordering::Relaxed));
                 }
-                crate::posix::process::RUN_QUEUE.lock().push_back(waker_pid);
             }
             tf.regs[10] = woken;
         }
         _ => { tf.regs[10] = usize::MAX; }
+    }
+}
+
+/// Returns the calling process's mount namespace ID (for VFS routing).
+pub fn sys_getnsid(tf: &mut TrapFrame) {
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    tf.regs[10] = proc.ns.mnt.id as usize;
+}
+
+// ── Priority / capability syscalls ─────────────────────────────────────────────
+
+/// Sets the calling process's scheduling priority (0 = realtime, 31 = idle).
+pub fn sys_setpriority(prio: i32, tf: &mut TrapFrame) {
+    let clamped = prio.clamp(
+        crate::posix::process::PRIO_REALTIME,
+        crate::posix::process::PRIO_IDLE,
+    );
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    proc.priority.store(clamped, Ordering::Relaxed);
+    tf.regs[10] = 0;
+}
+
+/// Returns the calling process's scheduling priority.
+pub fn sys_getpriority(tf: &mut TrapFrame) {
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    tf.regs[10] = proc.priority.load(Ordering::Relaxed) as usize;
+}
+
+/// Grants a subset of the caller's capability mask to `target_pid`.
+///
+/// Only bits present in the caller's own caps may be granted.
+pub fn sys_cap_grant(target_pid: i32, caps: u64, tf: &mut TrapFrame) {
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    let my_caps = proc.caps.load(Ordering::Relaxed);
+    if caps & !my_caps != 0 {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+    let table = crate::posix::process::PROCESS_TABLE.lock();
+    if let Some(target) = table.get(&target_pid) {
+        target.caps.fetch_or(caps, Ordering::Relaxed);
+        tf.regs[10] = 0;
+    } else {
+        tf.regs[10] = crate::errno::ESRCH;
     }
 }
 

@@ -43,7 +43,7 @@ impl Port {
         // so the waiter sees the queued packet before being re-scheduled.
         let waiter = self.waiter.swap(0, Ordering::AcqRel);
         if waiter > 0 {
-            crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+            crate::posix::process::enqueue(waiter);
         }
     }
 

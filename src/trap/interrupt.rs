@@ -84,7 +84,7 @@ pub fn poll_uart_into_linedisc() {
                         let mut st = proc.state.lock();
                         if matches!(*st, crate::posix::process::ProcState::Stopped) {
                             *st = crate::posix::process::ProcState::Running;
-                            crate::posix::process::RUN_QUEUE.lock().push_back(*pid);
+                            crate::posix::process::enqueue_with_prio(*pid, proc.priority.load(core::sync::atomic::Ordering::Relaxed));
                         }
                     }
                 }
@@ -100,7 +100,7 @@ pub fn poll_uart_into_linedisc() {
                 drop(buf);
                 let waiter = tty.waiter.swap(0, Ordering::Relaxed);
                 if waiter > 0 {
-                    crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+                    crate::posix::process::enqueue(waiter);
                 }
                 crate::ipc::handle::wake_epoll_waiters(&tty.epoll_waiters);
             }
@@ -140,7 +140,7 @@ pub fn poll_uart_into_linedisc() {
     if any_pushed {
         let waiter = tty.waiter.swap(0, Ordering::Relaxed);
         if waiter > 0 {
-            crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+            crate::posix::process::enqueue(waiter);
         }
         crate::ipc::handle::wake_epoll_waiters(&tty.epoll_waiters);
     }
@@ -203,7 +203,7 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
                         tf as *mut _
                     } else {
                         if pid != 0 {
-                            crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                            crate::posix::process::enqueue(pid);
                         }
                         crate::posix::process::schedule();
                         unsafe { crate::trap::halt_cpu() }

@@ -186,7 +186,7 @@ impl ChannelEndpoint {
         // Wake any synchronous (non-async) reader blocked in sys_read.
         let waiter = peer_arc.waiter.swap(0, Ordering::Relaxed);
         if waiter > 0 {
-            crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+            crate::posix::process::enqueue(waiter);
         }
         // Wake epoll waiters watching the peer for readability.
         crate::ipc::handle::wake_epoll_waiters(&peer_arc.epoll_waiters);
@@ -312,7 +312,7 @@ impl ChannelEndpoint {
                 let (pid, mask) = waiters[i];
                 if active_signals & mask != 0 {
                     waiters.remove(i);
-                    crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                    crate::posix::process::enqueue(pid);
                 } else {
                     i += 1;
                 }
@@ -353,11 +353,11 @@ impl Drop for ChannelEndpoint {
             // Also wake any synchronous reader so it can observe EOF.
             let waiter = peer_arc.waiter.swap(0, Ordering::Relaxed);
             if waiter > 0 {
-                crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+                crate::posix::process::enqueue(waiter);
             }
             // Also wake any direct sys_object_wait_one waiters watching the peer.
             for (pid, _) in peer_arc.signal_waiters.lock().drain(..) {
-                crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                crate::posix::process::enqueue(pid);
             }
             peer_arc.notify_signals(peer_arc.get_signals());
         }

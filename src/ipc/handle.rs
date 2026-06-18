@@ -92,6 +92,10 @@ pub struct PipeReadHalf {
     pub waiter: Arc<AtomicI32>,
     /// Epoll instances watching this pipe for readability. Shared with the write half.
     pub epoll_waiters: Arc<Mutex<Vec<Weak<EpollInstance>>>>,
+    /// Strong sentinel for the read side: `PipeWriteHalf::read_open` is a Weak to
+    /// this.  When all read halves are dropped, the write side observes
+    /// `read_open.upgrade() == None` and returns EPIPE / delivers SIGPIPE.
+    _read_sentinel: Arc<()>,
 }
 
 /// Byte-stream pipe write half. Dropping the last clone signals EOF to the reader.
@@ -112,6 +116,9 @@ pub struct PipeWriteHalf {
     pub waiter: Arc<AtomicI32>,
     /// Epoll instances watching the paired read half. Shared with the read half.
     pub epoll_waiters: Arc<Mutex<Vec<Weak<EpollInstance>>>>,
+    /// Weak reference to the read-side sentinel.  Fails to upgrade when all
+    /// `PipeReadHalf` instances are dropped, indicating a broken pipe.
+    pub read_open: Weak<()>,
 }
 
 impl Drop for PipeWriteHalf {
@@ -127,7 +134,7 @@ impl Drop for PipeWriteHalf {
         if Arc::strong_count(&self._sentinel) == 1 {
             let waiter = self.waiter.swap(0, Ordering::Relaxed);
             if waiter > 0 {
-                crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+                crate::posix::process::enqueue(waiter);
             }
             wake_epoll_waiters(&self.epoll_waiters);
         }
@@ -158,7 +165,7 @@ impl Drop for EpollInstance {
     fn drop(&mut self) {
         let waiter = self.waiter.swap(0, Ordering::Relaxed);
         if waiter > 0 {
-            crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+            crate::posix::process::enqueue(waiter);
         }
     }
 }
@@ -171,7 +178,7 @@ pub fn wake_epoll_waiters(waiters: &Mutex<Vec<alloc::sync::Weak<EpollInstance>>>
         if let Some(ep) = weak.upgrade() {
             let pid = ep.waiter.swap(0, Ordering::Relaxed);
             if pid > 0 {
-                crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                crate::posix::process::enqueue(pid);
             }
             true
         } else {
@@ -188,20 +195,23 @@ pub fn wake_epoll_waiters(waiters: &Mutex<Vec<alloc::sync::Weak<EpollInstance>>>
 /// of the pipe.
 pub fn create_pipe() -> (PipeReadHalf, PipeWriteHalf) {
     let data = Arc::new(Mutex::new(VecDeque::new()));
-    let sentinel = Arc::new(());
+    let write_sentinel = Arc::new(());
+    let read_sentinel = Arc::new(());
     let waiter = Arc::new(AtomicI32::new(0));
     let epoll_waiters = Arc::new(Mutex::new(Vec::new()));
     let read = PipeReadHalf {
         data: data.clone(),
-        write_open: Arc::downgrade(&sentinel),
+        write_open: Arc::downgrade(&write_sentinel),
         waiter: waiter.clone(),
         epoll_waiters: epoll_waiters.clone(),
+        _read_sentinel: read_sentinel.clone(),
     };
     let write = PipeWriteHalf {
         data,
-        _sentinel: sentinel,
+        _sentinel: write_sentinel,
         waiter,
         epoll_waiters,
+        read_open: Arc::downgrade(&read_sentinel),
     };
     (read, write)
 }

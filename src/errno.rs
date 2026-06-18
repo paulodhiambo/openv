@@ -158,6 +158,14 @@ pub const ENOSYS: usize = usize::MAX - 37; // -38
 /// **POSIX name**: `EEXIST` (17)
 pub const EEXIST: usize = usize::MAX - 16; // -17
 
+/// Broken pipe.
+///
+/// Returned when a write is attempted on a pipe or socket whose read end
+/// has been closed. The process is also sent SIGPIPE (unless blocked/ignored).
+///
+/// **POSIX name**: `EPIPE` (32)
+pub const EPIPE: usize = usize::MAX - 31; // -32
+
 /// Connection refused.
 ///
 /// Returned when a connection attempt is refused by the remote host.

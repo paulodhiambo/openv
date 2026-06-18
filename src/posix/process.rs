@@ -138,7 +138,24 @@ pub const CAP_INTERRUPT: u64 = 1 << 4;
 /// Perform system administration tasks.
 pub const CAP_SYS_ADMIN: u64 = 1 << 5;
 /// Driver access: MMIO mapping and IRQ registration.
-pub const CAP_DRIVER: u64 = 1 << 6;
+pub const CAP_DRIVER: u64    = 1 << 6;
+/// Configure network interfaces (IP, routes, etc.).
+pub const CAP_NET_ADMIN: u64 = 1 << 7;
+/// Mount/unmount filesystems.
+pub const CAP_MOUNT: u64     = 1 << 8;
+/// Send signals to any process regardless of ownership.
+pub const CAP_KILL_ANY: u64  = 1 << 9;
+
+/// Real-time priority (highest): 0.
+pub const PRIO_REALTIME: i32 = 0;
+/// High priority (IPC-intensive servers): 8.
+pub const PRIO_HIGH: i32     = 8;
+/// Normal user-space priority: 16.
+pub const PRIO_NORMAL: i32   = 16;
+/// Low background priority: 24.
+pub const PRIO_LOW: i32      = 24;
+/// Idle-only priority (lowest): 31.
+pub const PRIO_IDLE: i32     = 31;
 
 /// The state of a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +217,8 @@ pub struct Process {
     pub egid: AtomicU32,
     /// Capability mask.
     pub caps: AtomicU64,
+    /// Scheduling priority: 0 (highest / PRIO_REALTIME) … 31 (lowest / PRIO_IDLE).
+    pub priority: AtomicI32,
     /// The current state of the process.
     pub state: Mutex<ProcState>,
     /// The file descriptor table.
@@ -281,9 +300,30 @@ pub static FOREGROUND_PID: AtomicI32 = AtomicI32::new(-1);
 
 /// Global process table, mapping PIDs to [`Process`] arcs.
 pub static PROCESS_TABLE: Mutex<BTreeMap<Pid, Arc<Process>>> = Mutex::new(BTreeMap::new());
-/// Global run queue of ready processes.
-pub static RUN_QUEUE: Mutex<alloc::collections::VecDeque<Pid>> =
-    Mutex::new(alloc::collections::VecDeque::new());
+/// Global run queue: BTreeMap keyed by priority (0 = highest), each bucket a FIFO.
+pub static RUN_QUEUE: Mutex<BTreeMap<i32, VecDeque<Pid>>> = Mutex::new(BTreeMap::new());
+
+/// Enqueue `pid` into the run queue at an explicit priority level.
+///
+/// Callers that already hold a reference to the process or hold PROCESS_TABLE
+/// must use this variant to avoid a second PROCESS_TABLE lock.
+pub fn enqueue_with_prio(pid: Pid, prio: i32) {
+    RUN_QUEUE.lock()
+        .entry(prio)
+        .or_insert_with(VecDeque::new)
+        .push_back(pid);
+}
+
+/// Enqueue `pid` using the process's stored priority.
+///
+/// Must NOT be called while PROCESS_TABLE is already locked on this HART.
+pub fn enqueue(pid: Pid) {
+    let prio = PROCESS_TABLE.lock()
+        .get(&pid)
+        .map(|p| p.priority.load(Ordering::Relaxed))
+        .unwrap_or(PRIO_NORMAL);
+    enqueue_with_prio(pid, prio);
+}
 
 /// Queue of `(Pid, wakeup_mtime_ticks)` for sleeping processes.
 pub static SLEEP_QUEUE: Mutex<alloc::vec::Vec<(Pid, u64)>> = Mutex::new(alloc::vec::Vec::new());
@@ -322,8 +362,8 @@ pub fn wake_sleepers() {
             // can't observe the process as Stopped after it appears in the queue.
             if let Some(proc) = PROCESS_TABLE.lock().get(&pid).cloned() {
                 *proc.state.lock() = ProcState::Running;
+                enqueue_with_prio(pid, proc.priority.load(Ordering::Relaxed));
             }
-            RUN_QUEUE.lock().push_back(pid);
         } else {
             i += 1;
         }
@@ -368,7 +408,16 @@ pub fn schedule() -> ! {
         unsafe { riscv::register::sstatus::clear_sie(); }
         let next_pid = {
             let mut rq = RUN_QUEUE.lock();
-            rq.pop_front()
+            // Pop from the lowest-numbered (highest-priority) non-empty bucket.
+            let prio = rq.keys().next().copied();
+            if let Some(p) = prio {
+                let bucket = rq.get_mut(&p).unwrap();
+                let pid = bucket.pop_front();
+                if bucket.is_empty() { rq.remove(&p); }
+                pid
+            } else {
+                None
+            }
         };
 
         if let Some(pid) = next_pid {
@@ -433,6 +482,14 @@ impl Process {
     /// Callers in syscall handlers should translate errors to
     /// [`crate::errno::ENOMEM`].
     pub fn new(ppid: Pid) -> Result<Arc<Self>, &'static str> {
+        // Enforce a per-system process-count ceiling to prevent unbounded resource
+        // exhaustion.  512 concurrent processes is far more than any realistic
+        // workload on this platform.
+        const MAX_PROCESSES: usize = 512;
+        if PROCESS_TABLE.lock().len() >= MAX_PROCESSES {
+            return Err("process limit reached");
+        }
+
         let pid = generate_pid();
 
         let pt_addr = crate::mm::vmm::PageTable::new_process_table()
@@ -490,7 +547,7 @@ impl Process {
             fds
         };
 
-        let (uid, gid, euid, egid, caps, cwd, handlers, restorers, masks, blocked, pgid, sid, ns) = if ppid != 0 {
+        let (uid, gid, euid, egid, caps, prio, cwd, handlers, restorers, masks, blocked, pgid, sid, ns) = if ppid != 0 {
             if let Some(parent) = PROCESS_TABLE.lock().get(&ppid) {
                 (
                     parent.uid.load(Ordering::Relaxed),
@@ -498,6 +555,7 @@ impl Process {
                     parent.euid.load(Ordering::Relaxed),
                     parent.egid.load(Ordering::Relaxed),
                     parent.caps.load(Ordering::Relaxed),
+                    parent.priority.load(Ordering::Relaxed),
                     parent.cwd.lock().clone(),
                     *parent.signal_handlers.lock(),
                     *parent.signal_restorers.lock(),
@@ -508,11 +566,11 @@ impl Process {
                     crate::namespace::NsSet::fork_from(&parent.ns, 0), // inherit, no new ns
                 )
             } else {
-                (0, 0, 0, 0, CAP_NONE, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
+                (0, 0, 0, 0, CAP_NONE, PRIO_NORMAL, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
                  crate::namespace::NsSet::root())
             }
         } else {
-            (0, 0, 0, 0, CAP_NONE, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
+            (0, 0, 0, 0, CAP_NONE, PRIO_NORMAL, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
              crate::namespace::NsSet::root())
         };
 
@@ -540,6 +598,7 @@ impl Process {
             euid: AtomicU32::new(euid),
             egid: AtomicU32::new(egid),
             caps: AtomicU64::new(caps),
+            priority: AtomicI32::new(prio),
             state: Mutex::new(ProcState::Running),
             fds: Mutex::new(fds),
             children: Mutex::new(Vec::new()),

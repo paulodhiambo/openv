@@ -165,6 +165,12 @@ pub fn dispatch(
         165 => pm::sys_create_resource(arg0, arg1, arg2, tf),
         166 => pm::sys_grant_driver_cap(arg0, tf),
 
+        // proc.rs — priority + capability delegation
+        167 => proc::sys_setpriority(arg0 as i32, tf),
+        168 => proc::sys_getpriority(tf),
+        169 => proc::sys_cap_grant(arg0 as i32, arg1 as u64, tf),
+        170 => proc::sys_getnsid(tf),
+
         // trace.rs — eBPF-compatible observability
         140 => crate::trace::sys_trace_load(arg0, arg1, tf),
         141 => crate::trace::sys_trace_attach(arg0, arg1, tf),

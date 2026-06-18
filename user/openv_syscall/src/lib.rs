@@ -161,6 +161,12 @@ pub const SYS_GET_CM_PID: usize = 164;
 pub const SYS_CREATE_RESOURCE: usize = 165;
 pub const SYS_GRANT_DRIVER_CAP: usize = 166;
 
+// Priority scheduling + capability delegation
+pub const SYS_SETPRIORITY: usize = 167;
+pub const SYS_GETPRIORITY: usize = 168;
+pub const SYS_CAP_GRANT: usize = 169;
+pub const SYS_GETNSID: usize = 170;
+
 // ── Job / handle management (Zircon/Fuchsia-compatible) ─────────────────────
 pub const SYS_JOB_CREATE: usize = 74;
 pub const SYS_JOB_SET_POLICY: usize = 75;
@@ -431,3 +437,47 @@ pub fn brk(addr: usize) -> usize {
 pub fn abi_version() -> usize {
     unsafe { syscall0(SYS_ABI_VERSION) }
 }
+
+// ── Priority constants ────────────────────────────────────────────────────────
+
+pub const PRIO_REALTIME: i32 = 0;
+pub const PRIO_HIGH: i32     = 8;
+pub const PRIO_NORMAL: i32   = 16;
+pub const PRIO_LOW: i32      = 24;
+pub const PRIO_IDLE: i32     = 31;
+
+/// Sets the calling process's scheduling priority (0 = highest, 31 = lowest).
+pub fn setpriority(prio: i32) -> Result<(), Error> {
+    let ret = unsafe { syscall1(SYS_SETPRIORITY, prio as usize) };
+    if ret == 0 { Ok(()) } else { Err(error_from_ret(ret)) }
+}
+
+/// Returns the calling process's scheduling priority.
+pub fn getpriority() -> i32 {
+    unsafe { syscall0(SYS_GETPRIORITY) as i32 }
+}
+
+/// Grants a subset of the caller's capability mask to `target_pid`.
+pub fn cap_grant(target_pid: i32, caps: u64) -> Result<(), Error> {
+    let ret = unsafe { syscall2(SYS_CAP_GRANT, target_pid as usize, caps as usize) };
+    if ret == 0 { Ok(()) } else { Err(error_from_ret(ret)) }
+}
+
+/// Returns the calling process's mount namespace ID.
+pub fn getnsid() -> u32 {
+    unsafe { syscall0(SYS_GETNSID) as u32 }
+}
+
+// ── Capability bit constants ─────────────────────────────────────────────────
+
+pub const CAP_NONE: u64      = 0;
+pub const CAP_MMIO: u64      = 1 << 0;
+pub const CAP_DATACOPY: u64  = 1 << 1;
+pub const CAP_NET_RAW: u64   = 1 << 2;
+pub const CAP_PROCESS: u64   = 1 << 3;
+pub const CAP_INTERRUPT: u64 = 1 << 4;
+pub const CAP_SYS_ADMIN: u64 = 1 << 5;
+pub const CAP_DRIVER: u64    = 1 << 6;
+pub const CAP_NET_ADMIN: u64 = 1 << 7;
+pub const CAP_MOUNT: u64     = 1 << 8;
+pub const CAP_KILL_ANY: u64  = 1 << 9;

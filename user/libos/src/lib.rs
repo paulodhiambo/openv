@@ -659,7 +659,7 @@ fn vfs_call(msg: &mut ipc::Message) -> bool {
 pub fn vfs_open(path: &[u8], flags: u32) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_OPEN;
-    vfs_proto::pack_path_req(&mut msg.data, flags, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, flags, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as i32
     } else {
@@ -670,7 +670,7 @@ pub fn vfs_open(path: &[u8], flags: u32) -> i32 {
 pub fn vfs_create(path: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_CREATE;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as i32
     } else {
@@ -743,7 +743,7 @@ pub fn vfs_getdents(path: &[u8], buf: &mut [u8]) -> isize {
 pub fn vfs_mkdir(path: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_MKDIR;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         0
     } else {
@@ -754,7 +754,7 @@ pub fn vfs_mkdir(path: &[u8]) -> i32 {
 pub fn vfs_unlink(path: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_UNLINK;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         0
     } else {
@@ -782,7 +782,7 @@ pub fn vfs_rename(old: &[u8], new: &[u8]) -> i32 {
 pub fn vfs_stat(path: &[u8]) -> Option<(bool, u64)> {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_STAT;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         Some(vfs_proto::unpack_stat_reply(&msg.data))
     } else {
@@ -829,14 +829,14 @@ pub fn vfs_link(old: &[u8], new: &[u8]) -> i32 {
 pub fn vfs_chmod(path: &[u8], mode: u32) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_CHMOD;
-    vfs_proto::pack_path_req(&mut msg.data, mode, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, mode, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
 }
 
 pub fn vfs_chown(path: &[u8], owner: u32, _group: u32) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_CHOWN;
-    vfs_proto::pack_path_req(&mut msg.data, owner, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, owner, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
 }
 
@@ -1216,4 +1216,51 @@ pub extern "C" fn handle_duplicate(handle: u32, rights: u32, out_handle: *mut u3
     0
 }
 
+// ── Namespace ─────────────────────────────────────────────────────────────────
+
+/// Returns the calling process's mount namespace ID.
+pub fn getnsid() -> u32 {
+    syscall(170, 0, 0, 0) as u32
+}
+
+// ── Priority scheduling ────────────────────────────────────────────────────────
+
+pub const PRIO_REALTIME: i32 = 0;
+pub const PRIO_HIGH: i32     = 8;
+pub const PRIO_NORMAL: i32   = 16;
+pub const PRIO_LOW: i32      = 24;
+pub const PRIO_IDLE: i32     = 31;
+
+/// Sets the calling process's scheduling priority (0 = highest, 31 = lowest).
+pub fn setpriority(prio: i32) -> i32 {
+    syscall(167, prio as usize, 0, 0) as i32
+}
+
+/// Returns the calling process's scheduling priority.
+pub fn getpriority() -> i32 {
+    syscall(168, 0, 0, 0) as i32
+}
+
+/// Grants a subset of the caller's capability mask to another process.
+pub fn cap_grant(target_pid: i32, caps: u64) -> i32 {
+    syscall(169, target_pid as usize, caps as usize, 0) as i32
+}
+
+// ── VMO wrappers ───────────────────────────────────────────────────────────────
+
+/// Creates a Virtual Memory Object of `size` bytes. Returns a handle or negative errno.
+pub fn vmo_create(size: usize) -> i32 {
+    syscall(150, size, 0, 0) as i32
+}
+
+/// Maps a VMO handle into the calling process's address space.
+/// Returns the mapped virtual address or `usize::MAX` on error.
+pub fn vmo_map(handle: i32, addr: usize, size: usize, prot: u32) -> usize {
+    syscall(151, handle as usize, addr, size | ((prot as usize) << 32))
+}
+
+/// Unmaps a previously mapped VMO region.
+pub fn vmo_unmap(addr: usize, size: usize) -> i32 {
+    syscall(152, addr, size, 0) as i32
+}
 

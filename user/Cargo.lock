@@ -108,6 +108,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-abi"
+version = "0.1.0"
+
+[[package]]
 name = "echo-server"
 version = "0.1.0"
 dependencies = [
@@ -219,6 +223,7 @@ dependencies = [
 name = "net-smoltcp"
 version = "0.1.0"
 dependencies = [
+ "driver-abi",
  "heapless",
  "libos",
  "smoltcp",
@@ -307,6 +312,7 @@ dependencies = [
 name = "rs-server"
 version = "0.1.0"
 dependencies = [
+ "driver-abi",
  "libos",
 ]
 
@@ -412,6 +418,7 @@ dependencies = [
 name = "virtio-blk-driver"
 version = "0.1.0"
 dependencies = [
+ "driver-abi",
  "libos",
  "spin 0.9.8",
 ]

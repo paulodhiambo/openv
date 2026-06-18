@@ -1,6 +1,6 @@
 use crate::ipc::Message;
 use core::sync::atomic::{AtomicI32, Ordering};
-use openv_syscall::{syscall0, syscall3, SYS_GET_VFS_PID, SYS_IPC_SENDREC};
+use openv_syscall::{getnsid, syscall0, syscall3, SYS_GET_VFS_PID, SYS_IPC_SENDREC};
 
 /// PID of the VFS server (cached after first lookup).
 static VFS_SERVER_PID: AtomicI32 = AtomicI32::new(0);
@@ -33,7 +33,7 @@ fn vfs_call(msg: &mut Message) -> bool {
 pub fn vfs_open(path: &[u8], flags: u32) -> i32 {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_OPEN;
-    vfs_proto::pack_path_req(&mut msg.data, flags, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, flags, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as i32
     } else {
@@ -44,7 +44,7 @@ pub fn vfs_open(path: &[u8], flags: u32) -> i32 {
 pub fn vfs_create(path: &[u8]) -> i32 {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_CREATE;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as i32
     } else {
@@ -99,7 +99,7 @@ pub fn vfs_getdents(path: &[u8], buf: &mut [u8]) -> isize {
 pub fn vfs_mkdir(path: &[u8]) -> i32 {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_MKDIR;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         0
     } else {
@@ -110,7 +110,7 @@ pub fn vfs_mkdir(path: &[u8]) -> i32 {
 pub fn vfs_unlink(path: &[u8]) -> i32 {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_UNLINK;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         0
     } else {
@@ -132,7 +132,7 @@ pub fn vfs_rename(old: &[u8], new: &[u8]) -> i32 {
 pub fn vfs_stat(path: &[u8]) -> Option<(bool, u64)> {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_STAT;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         Some(vfs_proto::unpack_stat_reply(&msg.data))
     } else {
@@ -190,14 +190,14 @@ pub fn vfs_link(old: &[u8], new: &[u8]) -> i32 {
 pub fn vfs_chmod(path: &[u8], mode: u32) -> i32 {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_CHMOD;
-    vfs_proto::pack_path_req(&mut msg.data, mode, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, mode, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
 }
 
 pub fn vfs_chown(path: &[u8], owner: u32, _group: u32) -> i32 {
     let mut msg = Message::new();
     msg.type_ = vfs_proto::OP_CHOWN;
-    vfs_proto::pack_path_req(&mut msg.data, owner, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, owner, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
 }
 

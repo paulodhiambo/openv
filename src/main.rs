@@ -385,37 +385,34 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         // different set of capabilities based on its role.
         let table = crate::posix::process::PROCESS_TABLE.lock();
         if let Some(init_proc) = table.get(&init_pid) {
-            // The init process has no special capabilities.
             init_proc.caps.store(posix::process::CAP_NONE, core::sync::atomic::Ordering::Relaxed);
+            init_proc.priority.store(posix::process::PRIO_NORMAL, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(pm_proc) = table.get(&pm_pid) {
-            // The process manager (pm-server) can create and manage processes
-            // and copy data between processes.
             pm_proc.caps.store(posix::process::CAP_PROCESS | posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+            pm_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(vfs_proc) = table.get(&vfs_pid) {
-            // The virtual file system server (vfs-server) can copy data and
-            // perform system administration tasks.
             vfs_proc.caps.store(
                 posix::process::CAP_DATACOPY | posix::process::CAP_SYS_ADMIN,
                 core::sync::atomic::Ordering::Relaxed,
             );
+            vfs_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(rs_proc) = table.get(&rs_pid) {
-            // The resource server (rs-server) can manage processes, perform
-            // system administration, and copy data.
             rs_proc.caps.store(
                 posix::process::CAP_PROCESS | posix::process::CAP_SYS_ADMIN | posix::process::CAP_DATACOPY,
                 core::sync::atomic::Ordering::Relaxed
             );
+            rs_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(procfs_proc) = table.get(&procfs_pid) {
-            // procfs-server needs CAP_DATACOPY to write process data into callers' address spaces.
             procfs_proc.caps.store(posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+            procfs_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(devfs_proc) = table.get(&devfs_pid) {
-            // devfs-server needs CAP_DATACOPY to write device data into callers' address spaces.
             devfs_proc.caps.store(posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+            devfs_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
         }
         drop(table);
         

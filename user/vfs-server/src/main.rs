@@ -518,7 +518,7 @@ fn tar_name_to_path(name: &str) -> String {
     path
 }
 
-fn scan_initrd(vfs: &mut Vfs) {
+fn scan_initrd(vfs: &mut Vfs) {  // receives the root-namespace Vfs (ns_id = 1)
     let mut offset = 0usize;
     let mut header = [0u8; 512];
     let mut consecutive_empty = 0u32;
@@ -588,15 +588,15 @@ fn scan_initrd(vfs: &mut Vfs) {
 
 // ── Open-file table ───────────────────────────────────────────────────────────
 
-struct OpenFile { path: String, offset: u64 }
+struct OpenFile { path: String, offset: u64, ns_id: u32 }
 
 struct OpenTable { files: BTreeMap<u32, OpenFile>, next_fd: u32 }
 
 impl OpenTable {
     fn new() -> Self { Self { files: BTreeMap::new(), next_fd: 1 } }
-    fn open(&mut self, path: &str) -> u32 {
+    fn open(&mut self, path: &str, ns_id: u32) -> u32 {
         let fd = self.next_fd; self.next_fd += 1;
-        self.files.insert(fd, OpenFile { path: String::from(path), offset: 0 });
+        self.files.insert(fd, OpenFile { path: String::from(path), offset: 0, ns_id });
         fd
     }
     fn get(&self, fd: u32) -> Option<&OpenFile> { self.files.get(&fd) }
@@ -606,7 +606,7 @@ impl OpenTable {
         let file = self.files.get(&fd)?;
         let new_fd = self.next_fd;
         self.next_fd += 1;
-        self.files.insert(new_fd, OpenFile { path: file.path.clone(), offset: file.offset });
+        self.files.insert(new_fd, OpenFile { path: file.path.clone(), offset: file.offset, ns_id: file.ns_id });
         Some(new_fd)
     }
 }
@@ -818,22 +818,26 @@ fn forward_dev_list(dev_pid: i32, client: i32, buf_ptr: usize, max_len: usize) -
 
 // ── Dispatch ──────────────────────────────────────────────────────────────────
 
-fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Message) {
+fn ns_vfs(namespaces: &mut BTreeMap<u32, Vfs>, ns_id: u32) -> &mut Vfs {
+    namespaces.entry(ns_id).or_insert_with(Vfs::new)
+}
+
+fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut msg: libos::ipc::Message) {
     let client = msg.source;
     let op = msg.type_;
 
     match op {
         OP_OPEN => {
-            let (_flags, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let (_flags, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            
-            if vfs.exists(path) {
-                let fd = open_table.open(path);
+
+            if ns_vfs(namespaces, ns_id).exists(path) {
+                let fd = open_table.open(path, ns_id);
                 pack_u32_reply(&mut msg.data, fd);
                 reply_ok(client, msg);
             } else {
@@ -851,8 +855,8 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
         }
         OP_READ => {
             let (fd, offset, buf_ptr, len_req) = unpack_rw_req(&msg.data);
-            let (path, read_off) = match open_table.get(fd) {
-                Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }),
+            let (path, read_off, file_ns) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }, f.ns_id),
                 None => { reply_err(client, msg); return; }
             };
 
@@ -890,7 +894,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
 
             let mut data_buf = alloc::vec![0u8; len_req.min(1024 * 1024)]; // max 1MB per chunk
             let take = data_buf.len();
-            match vfs.read(&path, read_off, &mut data_buf[..take]) {
+            match ns_vfs(namespaces, file_ns).read(&path, read_off, &mut data_buf[..take]) {
                 Some(n) => {
                     if libos::datacopy(libos::getpid(), data_buf.as_ptr(), client, buf_ptr as *mut u8, n) < 0 {
                         reply_err(client, msg); return;
@@ -904,8 +908,8 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
         }
         OP_WRITE => {
             let (fd, offset, buf_ptr, len_req) = unpack_rw_req(&msg.data);
-            let (path, write_off) = match open_table.get(fd) {
-                Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }),
+            let (path, write_off, file_ns) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(), if offset == u64::MAX { f.offset } else { offset }, f.ns_id),
                 None => { reply_err(client, msg); return; }
             };
 
@@ -915,7 +919,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 reply_err(client, msg); return;
             }
 
-            match vfs.write(&path, write_off, &data_buf) {
+            match ns_vfs(namespaces, file_ns).write(&path, write_off, &data_buf) {
                 Some(written) => {
                     if let Some(f) = open_table.get_mut(fd) { f.offset = write_off + written as u64; }
                     pack_u32_reply(&mut msg.data, written as u32);
@@ -962,7 +966,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 }
             }
 
-            match vfs.readdir(path) {
+            match ns_vfs(namespaces, 1).readdir(path) {
                 Some(children) => {
                     let mut data_buf = alloc::vec![0u8; buf_len];
                     let mut pos = 0usize;
@@ -983,23 +987,23 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
             }
         }
         OP_MKDIR => {
-            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let (_, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            if vfs.mkdir(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+            if ns_vfs(namespaces, ns_id).mkdir(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_CREATE => {
-            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let (_, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            if vfs.create(path) {
-                let fd = open_table.open(path);
+            if ns_vfs(namespaces, ns_id).create(path) {
+                let fd = open_table.open(path, ns_id);
                 pack_u32_reply(&mut msg.data, fd);
                 reply_ok(client, msg);
             } else {
@@ -1007,16 +1011,16 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
             }
         }
         OP_UNLINK => {
-            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let (_, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            if vfs.unlink(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+            if ns_vfs(namespaces, ns_id).unlink(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_STAT => {
-            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let (_, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
@@ -1053,7 +1057,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 }
             }
 
-            match vfs.stat(path) {
+            match ns_vfs(namespaces, ns_id).stat(path) {
                 Some((is_dir, size)) => {
                     pack_stat_reply(&mut msg.data, is_dir, size);
                     reply_ok(client, msg);
@@ -1062,6 +1066,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
             }
         }
         OP_RENAME => {
+            // Rename uses root namespace (no path_req ns_id available).
             let (old_ptr, old_len, new_ptr, new_len) = unpack_rename_req(&msg.data);
             let mut old_buf = alloc::vec![0u8; old_len];
             let mut new_buf = alloc::vec![0u8; new_len];
@@ -1071,7 +1076,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
             }
             let old = match core::str::from_utf8(&old_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
             let new = match core::str::from_utf8(&new_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-
+            let vfs = ns_vfs(namespaces, 1);
             if let Some(node) = vfs.nodes.remove(old) {
                 if let Some((op, on)) = Vfs::parent_and_name(old)
                     && let Some(FsNode::Dir(c)) = vfs.nodes.get_mut(&op)
@@ -1120,7 +1125,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 target_str = content; // keep alive
                 &target_str
             } else {
-                match vfs.readlink(path) {
+                match ns_vfs(namespaces, 1).readlink(path) {
                     Some(t) => t.as_bytes(),
                     None => { reply_err(client, msg); return; }
                 }
@@ -1177,7 +1182,7 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                     true
                 }
             } else {
-                vfs.symlink(link, target)
+                ns_vfs(namespaces, 1).symlink(link, target)
             };
             if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
@@ -1210,34 +1215,34 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                 let (dir_ino, _) = match ofs.lookup_path(&parent) { Some(r) => r, None => { reply_err(client, msg); return; } };
                 ofs.dir_link_entry(dir_ino, &name, old_ino, etype)
             } else {
-                vfs.link(old, new)
+                ns_vfs(namespaces, 1).link(old, new)
             };
             if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_CHMOD => {
-            let (_mode, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let (_mode, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            if vfs.exists(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+            if ns_vfs(namespaces, ns_id).exists(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_CHOWN => {
-            let (_, path_ptr, path_len) = unpack_path_req(&msg.data);
+            let (_, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            if vfs.exists(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+            if ns_vfs(namespaces, ns_id).exists(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_FTRUNCATE => {
             let (fd, length) = unpack_ftruncate_req(&msg.data);
-            let path = match open_table.get(fd) {
-                Some(f) => f.path.clone(),
+            let (path, file_ns) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(), f.ns_id),
                 None => { reply_err(client, msg); return; }
             };
             let ok = if let Some(stripped) = path.strip_prefix("/mnt") {
@@ -1249,21 +1254,21 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
                     true
                 }
             } else {
-                vfs.truncate(&path, length)
+                ns_vfs(namespaces, file_ns).truncate(&path, length)
             };
             if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_LSEEK => {
             let (fd, offset, whence) = unpack_lseek_req(&msg.data);
-            let file = match open_table.get(fd) {
-                Some(f) => f,
+            let (file_path, file_off, file_ns) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(), f.offset, f.ns_id),
                 None => { reply_err(client, msg); return; }
             };
             // We need the file size to compute SEEK_END.
-            let file_size = vfs.stat(&file.path).map(|(_, s)| s).unwrap_or(0);
+            let file_size = ns_vfs(namespaces, file_ns).stat(&file_path).map(|(_, s)| s).unwrap_or(0);
             let new_offset = match whence {
                 0 /* SEEK_SET */ => offset,
-                1 /* SEEK_CUR */ => file.offset as i64 + offset,
+                1 /* SEEK_CUR */ => file_off as i64 + offset,
                 2 /* SEEK_END */ => file_size as i64 + offset,
                 _ => { reply_err(client, msg); return; }
             };
@@ -1297,11 +1302,11 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
         }
         OP_FALLOCATE => {
             let (fd, _offset, _length) = unpack_fallocate_req(&msg.data);
-            let path = match open_table.get(fd) {
-                Some(f) => f.path.clone(),
+            let (path, file_ns) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(), f.ns_id),
                 None => { reply_err(client, msg); return; }
             };
-            if vfs.exists(&path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+            if ns_vfs(namespaces, file_ns).exists(&path) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         _ => { reply_err(client, msg); }
     }
@@ -1313,14 +1318,13 @@ fn dispatch(vfs: &mut Vfs, open_table: &mut OpenTable, mut msg: libos::ipc::Mess
 pub extern "C" fn main(_argc: usize, _argv: usize) -> i32 {
     vfs_register();
 
-    let mut vfs = Vfs::new();
-    scan_initrd(&mut vfs);      // O(entries) time, O(metadata) memory
-    vfs.mkdir_all("/tmp");
-    vfs.mkdir_all("/home/guest");
-
-    // Register /proc and /dev as visible root entries so ls / lists them.
-    // Their content is synthesised on demand; the Dir entries only hold the name.
-    if let Some(FsNode::Dir(root_children)) = vfs.nodes.get_mut("/") {
+    // Namespace 1 = root mount namespace (kernel assigns ID 1 to the first MountNs).
+    let mut namespaces: BTreeMap<u32, Vfs> = BTreeMap::new();
+    let root_vfs = namespaces.entry(1).or_insert_with(Vfs::new);
+    scan_initrd(root_vfs);
+    root_vfs.mkdir_all("/tmp");
+    root_vfs.mkdir_all("/home/guest");
+    if let Some(FsNode::Dir(root_children)) = root_vfs.nodes.get_mut("/") {
         if !root_children.iter().any(|n| n == "proc") { root_children.push(String::from("proc")); }
         if !root_children.iter().any(|n| n == "dev")  { root_children.push(String::from("dev")); }
     }
@@ -1330,6 +1334,6 @@ pub extern "C" fn main(_argc: usize, _argv: usize) -> i32 {
 
     loop {
         libos::msg_receive(-1, &mut msg);
-        dispatch(&mut vfs, &mut open_table, msg);
+        dispatch(&mut namespaces, &mut open_table, msg);
     }
 }

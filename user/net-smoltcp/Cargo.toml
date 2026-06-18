@@ -7,3 +7,4 @@ edition = "2021"
 libos = { path = "../libos", features = ["large-heap"] }
 smoltcp = { version = "0.13.1", default-features = false, features = ["proto-ipv4","socket","socket-tcp","medium-ethernet","alloc","auto-icmp-echo-reply"] }
 heapless = "0.9.3"
+driver-abi = { path = "../driver-abi" }

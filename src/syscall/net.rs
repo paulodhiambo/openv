@@ -87,7 +87,7 @@ pub fn sys_daemon_create_conn(arg0: usize, tf: &mut TrapFrame) {
         });
 
         if let Some(waiting_pid) = crate::net::socket::pop_waiting_pid(listen_sid) {
-            crate::posix::process::RUN_QUEUE.lock().push_back(waiting_pid);
+            crate::posix::process::enqueue(waiting_pid);
         }
 
         tf.regs[10] = net_fd as usize;
@@ -104,7 +104,7 @@ pub fn sys_accept(arg0: usize, tf: &mut TrapFrame) {
         } else {
             crate::net::socket::add_pending_accept(sid, crate::posix::process::current_pid());
             tf.sepc -= 4;
-            crate::posix::process::RUN_QUEUE.lock().push_back(crate::posix::process::current_pid());
+            crate::posix::process::enqueue(crate::posix::process::current_pid());
             crate::posix::process::schedule();
             unsafe { __halt_cpu() }
         }
@@ -241,7 +241,7 @@ pub fn sys_sock_recv(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
                     drop(fds);
                     drop(proc);
                     tf.sepc -= 4;
-                    crate::posix::process::RUN_QUEUE.lock().push_back(crate::posix::process::current_pid());
+                    crate::posix::process::enqueue(crate::posix::process::current_pid());
                     crate::posix::process::schedule();
                     unsafe { __halt_cpu() }
                 }

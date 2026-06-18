@@ -9,7 +9,8 @@ extern crate alloc;
 use alloc::vec::Vec;
 use device::SmolDevice;
 use smoltcp_adapter::SmolPhyDevice;
-use libos::{gettimeofday, sys_yield, try_recv, TimeVal};
+use libos::{gettimeofday, sys_yield, try_recv, TimeVal, ipc_send, ipc_recv, getppid, CAP_NET_RAW};
+use driver_abi::{DriverDesc, OP_DRIVER_REGISTER, REPLY_DRIVER_OK};
 
 mod allocator;
 use allocator::init_allocator;
@@ -47,10 +48,30 @@ enum ProxyMode {
     Connection { handle: SocketHandle },
 }
 
+fn register_with_rs() {
+    let rs_pid = getppid();
+    let desc = DriverDesc {
+        name: alloc::string::String::from("net-smoltcp"),
+        version: (0, 1, 0),
+        required_caps: CAP_NET_RAW,
+        resources: alloc::vec![],
+    };
+    let mut payload = OP_DRIVER_REGISTER.to_le_bytes().to_vec();
+    payload.extend_from_slice(&desc.serialize());
+    ipc_send(rs_pid, &payload);
+    let mut reply = [0u8; 4];
+    let mut _from: i32 = 0;
+    let n = ipc_recv(&mut reply, &mut _from);
+    if n < 4 || i32::from_le_bytes(reply) != REPLY_DRIVER_OK {
+        libos::write(1, b"net: rs-server rejected registration\n".as_ptr(), 37);
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn main() -> i32 {
     unsafe { init_allocator(); }
     libos::write(1, b"net: daemon starting\n".as_ptr(), 21);
+    register_with_rs();
 
     let mut phy = SmolPhyDevice::new(SmolDevice::new(), 1500);
 

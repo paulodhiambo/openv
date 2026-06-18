@@ -38,6 +38,21 @@ pub fn sys_write(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                 }
             }
             crate::ipc::handle::KernelObject::PipeWrite(half) => {
+                // Broken pipe: all read ends have been closed.
+                if half.read_open.upgrade().is_none() {
+                    let pid = crate::posix::process::current_pid();
+                    let table = crate::posix::process::PROCESS_TABLE.lock();
+                    if let Some(proc) = table.get(&pid) {
+                        let blocked = proc.blocked_signals.load(Ordering::Relaxed);
+                        let sigpipe_bit = 1u32 << crate::syscall::proc::SIGPIPE;
+                        if sigpipe_bit & !blocked != 0 {
+                            proc.pending_signals.fetch_or(sigpipe_bit, Ordering::Relaxed);
+                        }
+                    }
+                    drop(table);
+                    tf.regs[10] = crate::errno::EPIPE;
+                    return;
+                }
                 let mut data = half.data.lock();
                 for &b in buf {
                     data.push_back(b);
@@ -46,7 +61,7 @@ pub fn sys_write(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                 tf.regs[10] = arg2;
                 let waiter = half.waiter.swap(0, Ordering::Relaxed);
                 if waiter > 0 {
-                    crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+                    crate::posix::process::enqueue(waiter);
                 }
                 crate::ipc::handle::wake_epoll_waiters(&half.epoll_waiters);
             }

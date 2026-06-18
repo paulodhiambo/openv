@@ -104,7 +104,7 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     }
 
     crate::println!("spawn: pid {} executing '{}'", pid, path);
-    crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+    crate::posix::process::enqueue_with_prio(pid, proc.priority.load(core::sync::atomic::Ordering::Relaxed));
     Ok(pid)
 }
 
@@ -140,7 +140,7 @@ fn try_wake_parent(parent: &Process, child_pid: Pid, child_status: i32) {
     if matches!(*state, crate::posix::process::ProcState::Stopped) {
         *state = crate::posix::process::ProcState::Running;
         drop(state);
-        crate::posix::process::RUN_QUEUE.lock().push_back(parent.pid);
+        crate::posix::process::enqueue_with_prio(parent.pid, parent.priority.load(core::sync::atomic::Ordering::Relaxed));
     }
 }
 
@@ -190,8 +190,8 @@ pub fn exit(pid: Pid, status: i32) {
             for waiter_pid in waiters {
                 if let Some(wp) = PROCESS_TABLE.lock().get(&waiter_pid).cloned() {
                     *wp.state.lock() = ProcState::Running;
+                    crate::posix::process::enqueue_with_prio(waiter_pid, wp.priority.load(Ordering::Relaxed));
                 }
-                crate::posix::process::RUN_QUEUE.lock().push_back(waiter_pid);
             }
         }
     }
@@ -214,27 +214,35 @@ pub fn exit(pid: Pid, status: i32) {
             let mut st = proc.state.lock();
             if matches!(*st, ProcState::Stopped) {
                 *st = ProcState::Running;
+                let prio = proc.priority.load(Ordering::Relaxed);
                 drop(st);
-                crate::posix::process::RUN_QUEUE.lock().push_back(sender_pid);
+                crate::posix::process::enqueue_with_prio(sender_pid, prio);
             }
         }
     }
-    // Scan for sendrec reply-waiters (not in any per-process queue).
-    let reply_waiters: alloc::vec::Vec<Pid> = {
+    // Scan for sendrec reply-waiters AND directed receive-waiters (not in any
+    // per-process queue).  Both are permanently stuck because the only process
+    // that could unblock them has just exited.
+    let stuck_waiters: alloc::vec::Vec<Pid> = {
         let table = PROCESS_TABLE.lock();
         table
             .iter()
             .filter(|(_, p)| {
+                let ipc = p.ipc_state.lock().clone();
                 matches!(
-                    *p.ipc_state.lock(),
+                    ipc,
                     crate::posix::process::IpcState::ReceivingReply { source, .. }
                         if source == pid
+                ) || matches!(
+                    ipc,
+                    crate::posix::process::IpcState::Receiving { source, .. }
+                        if source == pid  // directed receive from the dying process
                 )
             })
             .map(|(&p, _)| p)
             .collect()
     };
-    for waiter_pid in reply_waiters {
+    for waiter_pid in stuck_waiters {
         let table = PROCESS_TABLE.lock();
         if let Some(proc) = table.get(&waiter_pid) {
             {
@@ -246,11 +254,16 @@ pub fn exit(pid: Pid, status: i32) {
             let mut st = proc.state.lock();
             if matches!(*st, ProcState::Stopped) {
                 *st = ProcState::Running;
+                let prio = proc.priority.load(Ordering::Relaxed);
                 drop(st);
-                crate::posix::process::RUN_QUEUE.lock().push_back(waiter_pid);
+                crate::posix::process::enqueue_with_prio(waiter_pid, prio);
             }
         }
     }
+
+    // Clean up any IRQ handler registered by this process so interrupts
+    // targeting a dead PID no longer cause spurious wakeup attempts.
+    crate::trap::interrupt::IRQ_HANDLERS.lock().retain(|_, &mut owner| owner != pid);
 
     // Phase 2: Orphan reparenting — give all children to init (PID 1).
     if !children.is_empty() {
@@ -335,7 +348,7 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
         child_tf.sepc += 4; // advance past the ecall instruction
     }
 
-    crate::posix::process::RUN_QUEUE.lock().push_back(child.pid);
+    crate::posix::process::enqueue_with_prio(child.pid, child.priority.load(core::sync::atomic::Ordering::Relaxed));
     Ok(child.pid)
 }
 
