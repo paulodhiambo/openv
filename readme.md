@@ -76,13 +76,15 @@ $ mkdir /tmp && ls /
 | `make build-kernel` | Kernel only |
 | `make build-user` | Userspace binaries only |
 | `make initrd` | Package initrd from existing bins |
-| `make run` | Boot in QEMU (assumes already built) |
+| `make disk` | Create 8 MB `disk.img` for virtio-blk (auto-created by `run`) |
+| `make run` | Boot in QEMU; creates `disk.img` if absent |
 | `make debug` | Boot with GDB server on `:1234` |
 | `make image` | Build `openv.img` disk image |
 | `make fmt` | Format all Rust source |
 | `make clippy` | Lint kernel |
 | `make check` | `cargo check` kernel |
-| `make clean` | Remove all build artifacts |
+| `make clean` | Remove build artifacts (preserves `disk.img` OFS data) |
+| `make clean-all` | Remove everything including `disk.img` |
 
 ### Variables
 
@@ -92,9 +94,9 @@ make BINS="init sh" QEMU_MEM=512M QEMU_CPUS=2 run
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `BINS` | `init sh ls cat hello producer consumer doexec forktest net-smoltcp spin` | Userspace binaries copied into the initrd |
-| `QEMU_MEM` | `128M` | QEMU guest memory |
-| `QEMU_CPUS` | `1` | Number of RISC-V harts |
+| `BINS` | `init sh ls cat hello producer consumer doexec forktest net-smoltcp spin vfs-server pm-server rs-server virtio-blk-driver …` | Userspace binaries copied into the initrd |
+| `QEMU_MEM` | `512M` | QEMU guest memory |
+| `QEMU_CPUS` | `4` | Number of RISC-V harts |
 
 ### Scripts
 
@@ -221,7 +223,7 @@ openv/
 
 **UART line discipline.** The kernel drains the full UART FIFO on every timer tick (`poll_uart_into_linedisc`). Reads from the console syscall pull exclusively from `LINE_DISC_BUFFER`, eliminating any race between the timer ISR and `sys_read`. Raw mode (used by the shell for arrow-key history) delivers bytes immediately; cooked mode buffers until `\n`.
 
-**Initrd-based root filesystem.** A UStar tar archive (`test_root.tar`) is passed via the DTB `chosen` node. The kernel parses it into a MemFS tree at boot. `/proc` (ProcFS) and `/dev` (DevFS) are layered on top via the mount table. An optional OFS filesystem mounts at `/mnt` if a virtio-blk device is detected.
+**Initrd-based root filesystem.** A UStar tar archive (`test_root.tar`) is passed via the DTB `chosen` node. The kernel parses it into a MemFS tree at boot. `/proc` (ProcFS) and `/dev` (DevFS) are layered on top via the mount table. OFS mounts at `/mnt` when a virtio-blk device is present; the first boot auto-formats a blank disk. `make run` creates `disk.img` automatically if it does not exist.
 
 **Userspace TCP/IP.** The kernel provides only raw Ethernet send/receive via two syscalls. The full TCP/IP stack (smoltcp) runs in the `net-smoltcp` userspace daemon, with connections proxied to user processes via kernel IPC channels.
 
@@ -321,9 +323,11 @@ pub trait Vnode: Send + Sync {
 
 **Lifecycle states:** `Running → Stopped (waitpid block) → Zombie(status) → reaped`
 
-**Scheduler:** simple FIFO `VecDeque<Pid>`. `schedule()` pops the front, checks state is `Running`, switches SATP, calls `return_to_user`. Idles with `wfi` (interrupts enabled so the timer fires during idle).
+**Scheduler:** priority-based `BTreeMap<u8, VecDeque<Pid>>`. `schedule()` pops from the lowest-numbered (highest-priority) non-empty bucket, switches SATP, calls `return_to_user`. Idles with `wfi` when all buckets are empty.
 
-**Preemption:** The SBI timer fires every 10 ms. The ISR drains the UART FIFO (so characters are never dropped regardless of what the current process is doing), then re-queues the current PID into `RUN_QUEUE`. The next call to `schedule()` (on the next syscall or the next timer tick if the CPU is in the scheduler) switches to the next runnable process.
+Priority levels: `PRIO_REALTIME=0`, `PRIO_HIGH=8`, `PRIO_NORMAL=16`, `PRIO_LOW=24`, `PRIO_IDLE=31`. Boot servers (pm-server, vfs-server, rs-server, …) run at `PRIO_HIGH`; all user processes — including driver children of `PRIO_HIGH` servers — always start at `PRIO_NORMAL`, preventing priority inheritance from starving foreground processes.
+
+**Preemption:** The SBI timer fires every 10 ms. The ISR drains the UART FIFO (so characters are never dropped regardless of what the current process is doing), then re-queues the current PID into `RUN_QUEUE` at the process's stored priority. The next call to `schedule()` switches to the highest-priority runnable process.
 
 **COW Fork:**
 
@@ -488,7 +492,7 @@ lint (user)  ──┘
 
 ## Known Limitations
 
-1. **Preemption is soft** — the timer ISR re-queues the current process and sets a flag; the actual context switch happens at the next syscall boundary. A tight `loop {}` (no syscalls) will not be preempted mid-instruction; use `sys_yield` or the `spin` binary to test.
+1. **Preemption is soft** — the timer ISR re-queues the current process; the actual context switch happens at the next return from user space (next syscall or next timer boundary). A tight `loop {}` (no syscalls) will not be preempted mid-instruction; use `sys_yield` or the `spin` binary to test.
 2. **Single TTY** — `LINE_DISC_BUFFER` is global, not per-session. Multiple concurrent login sessions on separate virtual TTYs are not supported.
 3. **No signal delivery** — Ctrl-C delivers either EOF to a blocked `read` or kills the foreground PID directly. There is no `sigaction`/`kill`/`sigprocmask` ABI.
 4. **Password hashing** — FNV-1a 64-bit is used for demo purposes. Do not expose the network interface without replacing it with Argon2 or bcrypt.

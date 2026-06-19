@@ -81,7 +81,8 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
     let pt = unsafe { &mut *(pt_pa as *mut crate::mm::vmm::PageTable) };
 
     // Load ELF
-    let entry_point = load_elf(file_data, pt).map_err(cleanup)?;
+    let elf_info = load_elf(file_data, pt).map_err(cleanup)?;
+    let entry_point = elf_info.entry;
 
     // Allocate and map user stack.
     // The page immediately below the allocated stack region is intentionally left unmapped
@@ -114,6 +115,10 @@ pub fn posix_spawn(path: &str, ppid: Pid) -> Result<Pid, &'static str> {
 /// is waiting for the exiting child (or any child), and if so, queues
 /// the exit status and wakes the parent.
 fn try_wake_parent(parent: &Process, child_pid: Pid, child_status: i32) {
+    // Always set SIGCHLD pending so the parent receives it regardless
+    // of whether it's currently blocked in waitpid.
+    parent.pending_signals.fetch_or(1 << 17, Ordering::Relaxed);
+
     // Only enqueue if this child matches what the parent is waiting for, or if
     // the parent is not yet blocked (it will find the result via pop_front on its
     // next waitpid call rather than needing a table scan).
@@ -304,6 +309,53 @@ pub fn exit(pid: Pid, status: i32) {
             try_wake_parent(parent, pid, status);
         }
     }
+
+    // Phase 4: Orphaned process group detection.
+    // If this process was the last parent in its session for any process group,
+    // orphaned stopped children must receive SIGHUP followed by SIGCONT.
+    if !children.is_empty() {
+        let table = PROCESS_TABLE.lock();
+        let mut pgids: alloc::vec::Vec<Pid> = alloc::vec::Vec::new();
+        for &child_pid in &children {
+            if let Some(child) = table.get(&child_pid) {
+                let cpgid = child.pgid.load(Ordering::Relaxed);
+                if !pgids.contains(&cpgid) { pgids.push(cpgid); }
+            }
+        }
+        if let Some(proc) = table.get(&pid) {
+            let ppgid = proc.pgid.load(Ordering::Relaxed);
+            if !pgids.contains(&ppgid) { pgids.push(ppgid); }
+        }
+
+        for pgid in pgids {
+            let mut is_orphaned = true;
+            for (_, p) in table.iter() {
+                if p.pgid.load(Ordering::Relaxed) != pgid { continue; }
+                let ppid = p.ppid.load(Ordering::Relaxed);
+                if ppid == pid { continue; }
+                if ppid == 0 { continue; }
+                if let Some(parent) = table.get(&ppid) {
+                    if parent.sid.load(Ordering::Relaxed) == p.sid.load(Ordering::Relaxed) {
+                        is_orphaned = false;
+                        break;
+                    }
+                }
+            }
+
+            if is_orphaned {
+                for (_, p) in table.iter() {
+                    if p.pgid.load(Ordering::Relaxed) != pgid { continue; }
+                    p.pending_signals.fetch_or(1 << 1 | 1 << 18, Ordering::Relaxed);
+                    let mut state = p.state.lock();
+                    if matches!(*state, crate::posix::process::ProcState::Stopped) {
+                        *state = crate::posix::process::ProcState::Running;
+                        drop(state);
+                        crate::posix::process::enqueue_with_prio(p.pid, p.priority.load(Ordering::Relaxed));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// `sys_fork` — create a child process with copy-on-write address space.
@@ -370,7 +422,7 @@ pub fn sys_fork() -> Result<Pid, &'static str> {
 ///
 /// `Ok(entry_point)` with the virtual address of the new entry point on
 /// success. The trap handler uses this to set `sepc`, `sp`, and `sstatus`.
-pub unsafe fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'static str> {
+pub unsafe fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<crate::posix::elf::ElfLoadInfo, &'static str> {
     let ppid = crate::posix::process::current_pid();
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr, path_len) };
     let path = core::str::from_utf8(path_bytes).map_err(|_| "Invalid UTF-8 path")?;
@@ -397,7 +449,7 @@ pub unsafe fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'
     // If we destroyed the old space first, PMM could reuse its root page for a
     // new mapping while the CPU still page-walks via the old satp — corruption.
     let new_pt = unsafe { &mut *(new_root_pa as *mut crate::mm::vmm::PageTable) };
-    let entry_point = crate::posix::elf::load_elf(file_data, new_pt)?;
+    let elf_info = crate::posix::elf::load_elf(file_data, new_pt)?;
 
     let stack_base = USER_STACK_TOP - (USER_STACK_PAGES * PAGE_SIZE);
     for i in 0..USER_STACK_PAGES {
@@ -407,23 +459,17 @@ pub unsafe fn sys_exec(path_ptr: *const u8, path_len: usize) -> Result<usize, &'
         frame.into_raw();
     }
 
-    // Install the new page table into the process struct via AtomicUsize::store
-    // (safe — no raw pointer cast through Arc needed), then switch the CPU to it
-    // before freeing the old space so no stale satp walk occurs.
     proc.satp_val.store(new_satp, core::sync::atomic::Ordering::Relaxed);
     unsafe {
         riscv::register::satp::write(new_satp);
         core::arch::asm!("sfence.vma");
     }
 
-    // Now safe: CPU uses new PT. Only free old space if this was the last
-    // thread using it (CLONE_VM threads sharing the old PA may still be running).
     if crate::posix::process::satp_unshare(old_root_pa) {
         crate::mm::vmm::destroy_user_space(old_root_pa)?;
     }
 
-    // Return entry_point — trap handler sets sepc, sp, sstatus (satp already switched above).
-    Ok(entry_point)
+    Ok(elf_info)
 }
 
 /// Removes a newly-created but not-yet-running process from the system

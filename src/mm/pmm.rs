@@ -63,6 +63,10 @@ use crate::sync::Mutex;
 /// Size of a physical page in bytes. Always 4 KB on RISC-V.
 pub const PAGE_SIZE: usize = 4096;
 
+/// Poison byte written to the majority of a freed page's bytes.
+/// The first 8 bytes are reserved for the intrusive free-list link.
+const POISON_BYTE: u8 = 0xCD;
+
 // External symbol marking the end of the kernel's BSS section.
 unsafe extern "C" {
     static _stack_end: u8;
@@ -225,6 +229,9 @@ pub fn init(dtb_ptr: usize) {
         let overlaps_fdt    = curr < fdt_end   && next > fdt_start;
         let overlaps_initrd = initrd_start > 0 && curr < initrd_end && next > initrd_start;
         if !overlaps_fdt && !overlaps_initrd {
+            // Poison bytes 8..PAGE_SIZE so alloc_frame's debug check passes.
+            // Mirrors what free_page does; bytes 0..8 hold the free-list link.
+            unsafe { core::ptr::write_bytes((curr as *mut u8).add(8), POISON_BYTE, PAGE_SIZE - 8); }
             if head == 0 {
                 head = curr;
             } else {
@@ -280,6 +287,20 @@ pub fn alloc_frame() -> Option<PhysFrame> {
         // Preconditions: `page` is a physical address safely popped from the head of the free list. By PMM invariants, its first 8 bytes contain the address of the next free page (or 0).
         // Postconditions: Reads that address to correctly update the list head.
         *head = unsafe { (page as *const usize).read_volatile() };
+
+        // In debug builds, verify the page looks like a properly-freed page
+        // by checking that the poison byte is still present.
+        if cfg!(debug_assertions) {
+            let poison_check = unsafe { *(page as *const u8).add(8) };
+            if poison_check != POISON_BYTE {
+                crate::println!(
+                    "PMM: free-list corruption at {:#x}: expected poison {:#x}, found {:#x}",
+                    page, POISON_BYTE, poison_check,
+                );
+                panic!("free-list corruption");
+            }
+        }
+
         page
     };
 
@@ -351,13 +372,25 @@ pub fn free_page(page: usize) {
     }
 
     let mut counts = PAGE_REF_COUNTS.lock();
+
+    // Double-free detection: page must have had a positive refcount.
+    if cfg!(debug_assertions) && counts[idx] == 0 {
+        crate::println!("PMM: double-free detected at {:#x}", page);
+        panic!("double-free of physical page {:#x}", page);
+    }
+
     counts[idx] = 0;
     let mut head = FREE_LIST.lock();
 
     // SAFETY: `page` is a valid, 4096-byte-aligned physical frame with no
     // active references.  We write the old head into the frame's first word
     // and install the frame as the new head of the free list.
-    unsafe { (page as *mut usize).write_volatile(*head); }
+    unsafe {
+        (page as *mut usize).write_volatile(*head);
+        // Poison the freed frame (skip first 8 bytes used by the free-list link)
+        // to catch use-after-free accesses.
+        core::ptr::write_bytes((page + 8) as *mut u8, POISON_BYTE, PAGE_SIZE - 8);
+    }
     *head = page;
 }
 
@@ -440,7 +473,10 @@ pub fn decr_ref_and_maybe_free(page: usize) {
     counts[idx] = 0;
 
     let mut head = FREE_LIST.lock();
-    unsafe { (page as *mut usize).write_volatile(*head); }
+    unsafe {
+        (page as *mut usize).write_volatile(*head);
+        core::ptr::write_bytes((page + 8) as *mut u8, POISON_BYTE, PAGE_SIZE - 8);
+    }
     *head = page;
 }
 

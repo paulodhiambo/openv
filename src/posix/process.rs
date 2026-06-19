@@ -461,7 +461,8 @@ pub fn schedule() -> ! {
                 }
 
                 let tf_ptr = {
-                    let tf = proc.trap_frame.lock();
+                    let mut tf = proc.trap_frame.lock();
+                    tf.kernel_hartid = crate::smp::current_hartid();
                     &(*tf) as *const crate::trap::TrapFrame as usize
                 };
 
@@ -568,7 +569,11 @@ impl Process {
                     parent.euid.load(Ordering::Relaxed),
                     parent.egid.load(Ordering::Relaxed),
                     parent.caps.load(Ordering::Relaxed),
-                    parent.priority.load(Ordering::Relaxed),
+                    // Always start new processes at PRIO_NORMAL so that
+                    // PRIO_HIGH servers (rs-server, etc.) cannot starve
+                    // PRIO_NORMAL user processes by spawning PRIO_HIGH children.
+                    // kmain raises boot-server priorities explicitly after spawn.
+                    PRIO_NORMAL,
                     parent.cwd.lock().clone(),
                     *parent.signal_handlers.lock(),
                     *parent.signal_restorers.lock(),

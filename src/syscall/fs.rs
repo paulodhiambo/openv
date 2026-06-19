@@ -22,6 +22,21 @@ pub fn sys_write(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     match fds.get_with_rights(arg0 as u32, crate::ipc::handle::Rights::WRITE) {
         Ok(obj) => match obj {
             crate::ipc::handle::KernelObject::Tty(_) => {
+                // SIGTTOU: background process writing to its controlling TTY.
+                let pgid = proc.pgid.load(Ordering::Relaxed);
+                let fg = crate::posix::process::FOREGROUND_PID.load(Ordering::Relaxed);
+                if fg > 0 && pgid != fg {
+                    let table = crate::posix::process::PROCESS_TABLE.lock();
+                    for (_, p) in table.iter() {
+                        if p.pgid.load(Ordering::Relaxed) == pgid {
+                            p.pending_signals.fetch_or(1 << crate::syscall::proc::SIGTTOU, Ordering::Relaxed);
+                        }
+                    }
+                    drop(table);
+                    tf.regs[10] = crate::errno::EIO;
+                    return;
+                }
+
                 if let Ok(s) = core::str::from_utf8(buf) {
                     crate::print!("{}", s);
                 }
@@ -88,6 +103,22 @@ pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     match fds.get_with_rights(arg0 as u32, crate::ipc::handle::Rights::READ) {
         Ok(obj) => match obj {
             crate::ipc::handle::KernelObject::Tty(tty_arc) => {
+                // SIGTTIN: background process reading from its controlling TTY.
+                let pgid = proc.pgid.load(Ordering::Relaxed);
+                let fg = crate::posix::process::FOREGROUND_PID.load(Ordering::Relaxed);
+                if fg > 0 && pgid != fg {
+                    // Deliver SIGTTIN to the background process group.
+                    let table = crate::posix::process::PROCESS_TABLE.lock();
+                    for (_, p) in table.iter() {
+                        if p.pgid.load(Ordering::Relaxed) == pgid {
+                            p.pending_signals.fetch_or(1 << crate::syscall::proc::SIGTTIN, Ordering::Relaxed);
+                        }
+                    }
+                    drop(table);
+                    tf.regs[10] = crate::errno::EIO;
+                    return;
+                }
+
                 let tty = tty_arc.clone();
                 drop(fds);
                 drop(proc);
@@ -216,6 +247,112 @@ pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     }
 }
 
+
+/// syscall 19: reposition read/write file offset (lseek)
+pub fn sys_lseek(arg0: usize, _arg1: usize, _arg2: usize, tf: &mut TrapFrame) {
+    let fd = arg0 as i32;
+
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    let fds = proc.fds.lock();
+    match fds.get(fd as u32) {
+        Some(_) => {
+            // Pipes, FIFOs, and TTYs do not support seeking.
+            tf.regs[10] = crate::errno::ESPIPE;
+        }
+        None => {
+            tf.regs[10] = crate::errno::EBADF;
+        }
+    }
+}
+
+/// syscall 68: poll file descriptors for readiness
+pub fn sys_poll(arg0: usize, arg1: usize, _arg2: usize, tf: &mut TrapFrame) {
+    use crate::mm::vmm::is_user_pointer_valid;
+
+    let fds_ptr = arg0 as *const u8;
+    let nfds = arg1;
+    const POLLFD_SIZE: usize = 8; // i32(4) + i16(2) + i16(2)
+
+    if nfds == 0 {
+        tf.regs[10] = 0;
+        return;
+    }
+
+    if !is_user_pointer_valid(tf, fds_ptr, nfds * POLLFD_SIZE) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    let fds = proc.fds.lock();
+
+    let mut ready_count = 0usize;
+    for i in 0..nfds {
+        let off = i * POLLFD_SIZE;
+        let fd     = unsafe { (fds_ptr.add(off) as *const i32).read_volatile() };
+        let events = unsafe { (fds_ptr.add(off + 4) as *const i16).read_volatile() };
+
+        let revents = match fds.get(fd as u32) {
+            Some(obj) => match obj {
+                crate::ipc::handle::KernelObject::Tty(_) => {
+                    let mut rev = 0i16;
+                    if events & crate::syscall::ipc::POLLIN != 0 { rev |= crate::syscall::ipc::POLLIN; }
+                    if events & crate::syscall::ipc::POLLOUT != 0 { rev |= crate::syscall::ipc::POLLOUT; }
+                    rev
+                }
+                crate::ipc::handle::KernelObject::PipeRead(half) => {
+                    let mut rev = 0i16;
+                    let data = half.data.lock();
+                    if !data.is_empty() && events & crate::syscall::ipc::POLLIN != 0 {
+                        rev |= crate::syscall::ipc::POLLIN;
+                    }
+                    if half.write_open.strong_count() == 0 {
+                        rev |= crate::syscall::ipc::POLLHUP;
+                    }
+                    rev
+                }
+                crate::ipc::handle::KernelObject::PipeWrite(half) => {
+                    let mut rev = 0i16;
+                    if events & crate::syscall::ipc::POLLOUT != 0 { rev |= crate::syscall::ipc::POLLOUT; }
+                    if half.read_open.upgrade().is_none() {
+                        rev |= crate::syscall::ipc::POLLERR;
+                    }
+                    rev
+                }
+                crate::ipc::handle::KernelObject::Channel(ep) => {
+                    let mut rev = 0i16;
+                    if events & crate::syscall::ipc::POLLIN != 0 && ep.try_recv().is_some() {
+                        rev |= crate::syscall::ipc::POLLIN;
+                    }
+                    if events & crate::syscall::ipc::POLLOUT != 0 {
+                        rev |= crate::syscall::ipc::POLLOUT;
+                    }
+                    rev
+                }
+                crate::ipc::handle::KernelObject::VfsFile(_) => {
+                    let mut rev = 0i16;
+                    if events & crate::syscall::ipc::POLLIN  != 0 { rev |= crate::syscall::ipc::POLLIN; }
+                    if events & crate::syscall::ipc::POLLOUT != 0 { rev |= crate::syscall::ipc::POLLOUT; }
+                    rev
+                }
+                _ => {
+                    let mut rev = 0i16;
+                    if events & crate::syscall::ipc::POLLIN  != 0 { rev |= crate::syscall::ipc::POLLIN; }
+                    if events & crate::syscall::ipc::POLLOUT != 0 { rev |= crate::syscall::ipc::POLLOUT; }
+                    rev
+                }
+            },
+            None => crate::syscall::ipc::POLLNVAL,
+        };
+
+        if revents != 0 {
+            unsafe { (fds_ptr.add(off + 6) as *mut i16).write_volatile(revents); }
+            ready_count += 1;
+        }
+    }
+
+    tf.regs[10] = ready_count;
+}
 
 pub fn sys_close(arg0: usize, tf: &mut TrapFrame) {
     let proc = crate::get_current_proc_or_esrch!(tf);

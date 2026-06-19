@@ -604,9 +604,28 @@ pub const F_SETLKW: usize = 7;
 
 pub const FD_CLOEXEC: usize = 1;
 
+// ── poll(2) constants ──────────────────────────────────────────────────────────
+pub const POLLIN:  i16 = 0x001;
+pub const POLLOUT: i16 = 0x004;
+pub const POLLERR: i16 = 0x008;
+pub const POLLHUP: i16 = 0x010;
+pub const POLLNVAL: i16 = 0x020;
+// Non-standard convenience alias for `POLLERR | POLLHUP | POLLNVAL`.
+pub const POLLNBF: i16 = POLLERR | POLLHUP | POLLNVAL;
+
+#[repr(C)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
 // Non-POSIX kernel-private commands (high range to avoid clashing with future POSIX additions)
 pub const F_SET_VFS_FD: usize = 1000;
 pub const F_GET_VFS_FD: usize = 1001;
+
+// Global map: (pid, kernel_fd) → file status flags (F_GETFL / F_SETFL)
+static FD_FLAGS: Mutex<BTreeMap<(i32, u32), usize>> = Mutex::new(BTreeMap::new());
 
 pub fn sys_fcntl(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     use crate::ipc::handle::KernelObject;
@@ -643,8 +662,16 @@ pub fn sys_fcntl(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
             proc.fds.lock().set_cloexec(fd, (arg2 & FD_CLOEXEC) != 0);
             tf.regs[10] = 0;
         }
-        F_GETFL => { tf.regs[10] = 0; } // file status flags not yet tracked
-        F_SETFL => { tf.regs[10] = 0; } // accepted but ignored
+        F_GETFL => {
+            let flags = FD_FLAGS.lock().get(&(pid, fd)).copied().unwrap_or(0);
+            tf.regs[10] = flags;
+        }
+        F_SETFL => {
+            // Only O_NONBLOCK, O_APPEND, O_ASYNC are meaningful; store the
+            // whole mask so F_GETFL reflects what the caller wrote.
+            FD_FLAGS.lock().insert((pid, fd), arg2);
+            tf.regs[10] = 0;
+        }
 
         // ── POSIX byte-range locking ─────────────────────────────────────────
         F_GETLK | F_SETLK | F_SETLKW => {
@@ -743,7 +770,8 @@ pub fn sys_fcntl(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
             if let Some(KernelObject::VfsFile(server_fd)) = fds.get(fd) {
                 tf.regs[10] = *server_fd as usize;
             } else {
-                tf.regs[10] = crate::errno::EBADF;
+                // usize::MAX signals "no VFS fd" — libos checks != usize::MAX
+                tf.regs[10] = usize::MAX;
             }
         }
         _ => {

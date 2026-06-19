@@ -178,7 +178,7 @@ pub fn poll_uart_into_linedisc() {
 /// Called from `schedule()`'s idle loop so UART chars are serviced
 /// when the timer ISR cannot fire (SIE=0 in supervisor mode).
 pub fn service_uart() {
-    if crate::smp::current_hartid() == 0 {
+    if crate::smp::current_hartid() == crate::smp::BOOT_HARTID.load(core::sync::atomic::Ordering::Relaxed) {
         poll_uart_into_linedisc();
     }
 }
@@ -201,8 +201,8 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
             crate::posix::process::wake_sleepers();
 
             // Drain all available UART bytes into LINE_DISC_BUFFER in one shot.
-            // Only HART 0 polls UART to avoid multiple HARTs racing on the RX register.
-            if crate::smp::current_hartid() == 0 {
+            // Only the boot HART polls UART to avoid multiple HARTs racing on the RX register.
+            if crate::smp::current_hartid() == crate::smp::BOOT_HARTID.load(core::sync::atomic::Ordering::Relaxed) {
                 poll_uart_into_linedisc();
             }
 

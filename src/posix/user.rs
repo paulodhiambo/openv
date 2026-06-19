@@ -1,29 +1,7 @@
 //! # User / Group Database and Authentication
 //!
 //! This module provides a simple user and group database for OpenV.
-//! Passwords are stored as FNV-1a 64-bit hashes (fast, deterministic,
-//! computable at `const` time — sufficient for a single-machine demo
-//! OS). Replace with a proper KDF (bcrypt/argon2) when adding network
-//! services.
-//!
-//! ## Overview
-//!
-//! The module provides:
-//!
-//! - **User IDs** ([`Uid`]) and **Group IDs** ([`Gid`])
-//!  - **Well-known IDs**: [`ROOT_UID`], [`ROOT_GID`], [`GUEST_UID`], [`GUEST_GID`], [`SUDO_GID`]
-//!  - **FNV-1a hash function**: [`fnv1a`]
-//!  - **User database**: [`UserEntry`] and the [`USERS`] static array
-//!  - **Group database**: [`GroupEntry`] and the [`GROUPS`] static array
-//!  - **Lookup functions**: [`find_by_name`], [`find_by_uid`], etc.
-//!  - **Authentication**: [`authenticate`], [`authenticate_uid`]
-//!  - **Privilege checks**: [`in_group`], [`can_sudo`], [`is_root`]
-//!
-//! ## Security Note
-//!
-//! FNV-1a is a fast, non-cryptographic hash function. It is suitable
-//! for demo purposes but should be replaced with a proper password
-//! hashing function (bcrypt, argon2) for any real-world use.
+//! Passwords are stored as SHA-256 digests.
 
 /// User ID type.
 pub type Uid = u32;
@@ -43,31 +21,12 @@ pub const GUEST_GID: Gid = 1000;
 /// Debian/Ubuntu convention: GID 27 = sudo group.
 pub const SUDO_GID: Gid = 27;
 
-// ── FNV-1a 64-bit (const-fn, usable in static initialisers) ───────────────
-
-/// Computes the FNV-1a 64-bit hash of a byte slice.
-///
-/// This is a `const` function, so it can be used in static initializers.
-///
-/// # Arguments
-///
-/// * `data` - The data to hash.
-///
-/// # Returns
-///
-/// The 64-bit FNV-1a hash.
-pub const fn fnv1a(data: &[u8]) -> u64 {
-    let mut h: u64 = 14695981039346656037;
-    let mut i = 0;
-    while i < data.len() {
-        h ^= data[i] as u64;
-        h = h.wrapping_mul(1099511628211);
-        i += 1;
-    }
-    h
+/// Computes the SHA-256 digest of a byte slice.
+pub fn hash_password(data: &[u8]) -> [u8; 32] {
+    crate::crypto::sha256(data)
 }
 
-/// Verifies a password against a stored FNV-1a hash.
+/// Verifies a password against a stored SHA-256 hash.
 ///
 /// # Arguments
 ///
@@ -77,8 +36,8 @@ pub const fn fnv1a(data: &[u8]) -> u64 {
 /// # Returns
 ///
 /// `true` if the password matches, `false` otherwise.
-pub fn verify_password(stored_hash: u64, plaintext: &[u8]) -> bool {
-    fnv1a(plaintext) == stored_hash
+pub fn verify_password(stored_hash: &[u8; 32], plaintext: &[u8]) -> bool {
+    &hash_password(plaintext) == stored_hash
 }
 
 // ── Static user database (/etc/passwd + /etc/shadow equivalent) ───────────
@@ -90,7 +49,7 @@ pub fn verify_password(stored_hash: u64, plaintext: &[u8]) -> bool {
 /// * `uid` - User ID.
 /// * `gid` - Primary group ID.
 /// * `name` - Username.
-/// * `password_hash` - FNV-1a hash of the password.
+/// * `password_hash` - SHA-256 digest of the password.
 /// * `home` - Home directory path.
 /// * `shell` - Login shell path.
 pub struct UserEntry {
@@ -100,8 +59,8 @@ pub struct UserEntry {
     pub gid: Gid,
     /// Username.
     pub name: &'static str,
-    /// FNV-1a hash of the password.
-    pub password_hash: u64,
+    /// SHA-256 digest of the password.
+    pub password_hash: [u8; 32],
     /// Home directory path.
     pub home: &'static str,
     /// Login shell path.
@@ -124,6 +83,22 @@ pub struct GroupEntry {
     pub members: &'static [Uid],
 }
 
+/// SHA-256 digest of "root"
+const ROOT_HASH: [u8; 32] = [
+    0x48, 0x13, 0x49, 0x4d, 0x13, 0x7e, 0x16, 0x31,
+    0xbb, 0xa3, 0x01, 0xd5, 0xac, 0xab, 0x6e, 0x7b,
+    0xb7, 0xaa, 0x74, 0xce, 0x11, 0x85, 0xd4, 0x56,
+    0x56, 0x5e, 0xf5, 0x1d, 0x73, 0x76, 0x77, 0xb2,
+];
+
+/// SHA-256 digest of "guest"
+const GUEST_HASH: [u8; 32] = [
+    0x84, 0x98, 0x3c, 0x60, 0xf7, 0xda, 0xad, 0xc1,
+    0xcb, 0x86, 0x98, 0x62, 0x1f, 0x80, 0x2c, 0x0d,
+    0x9f, 0x9a, 0x3c, 0x3c, 0x29, 0x5c, 0x81, 0x07,
+    0x48, 0xfb, 0x04, 0x81, 0x15, 0xc1, 0x86, 0xec,
+];
+
 /// Static user database.
 ///
 /// Contains the root and guest users. The root user has password
@@ -133,7 +108,7 @@ static USERS: &[UserEntry] = &[
         uid: ROOT_UID,
         gid: ROOT_GID,
         name: "root",
-        password_hash: fnv1a(b"root"),
+        password_hash: ROOT_HASH,
         home: "/root",
         shell: "/sh",
     },
@@ -141,7 +116,7 @@ static USERS: &[UserEntry] = &[
         uid: GUEST_UID,
         gid: GUEST_GID,
         name: "guest",
-        password_hash: fnv1a(b"guest"),
+        password_hash: GUEST_HASH,
         home: "/home/guest",
         shell: "/sh",
     },
@@ -259,7 +234,7 @@ pub fn groups_of(uid: Uid) -> alloc::vec::Vec<Gid> {
 /// `Some(&UserEntry)` if authentication succeeds, `None` otherwise.
 pub fn authenticate(username: &str, password: &[u8]) -> Option<&'static UserEntry> {
     let user = find_by_name(username)?;
-    if verify_password(user.password_hash, password) {
+    if verify_password(&user.password_hash, password) {
         Some(user)
     } else {
         None
@@ -278,7 +253,7 @@ pub fn authenticate(username: &str, password: &[u8]) -> Option<&'static UserEntr
 ///
 /// `true` if the password matches, `false` otherwise.
 pub fn authenticate_uid(uid: Uid, password: &[u8]) -> bool {
-    find_by_uid(uid).is_some_and(|u| verify_password(u.password_hash, password))
+    find_by_uid(uid).is_some_and(|u| verify_password(&u.password_hash, password))
 }
 
 // ── Privilege checks ───────────────────────────────────────────────────────

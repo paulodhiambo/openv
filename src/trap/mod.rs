@@ -104,6 +104,10 @@ pub struct TrapFrame {
     pub sepc: usize,
     /// The saved status register.
     pub sstatus: usize,
+    /// The HART id of the HART that last dispatched this process.
+    /// Stored here so the trap-entry path can restore tp = hartid even
+    /// when arriving from U-mode (where tp holds a user-space value).
+    pub kernel_hartid: usize,
 }
 
 /// Signal frame pushed to the user stack on signal delivery.
@@ -141,6 +145,7 @@ impl TrapFrame {
             regs: [0; 32],
             sepc: 0,
             sstatus: 0,
+            kernel_hartid: 0,
         }
     }
 }
@@ -215,6 +220,7 @@ trap_vector:
     bnez t0, 3f
     
     ld sp, 0(a0)
+    ld tp, 34*8+8(a0)    # U-mode: restore kernel tp = hartid
 3:
     call rust_trap_handler
     

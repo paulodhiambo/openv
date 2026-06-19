@@ -25,11 +25,84 @@ enum BlockFs {
 }
 
 impl BlockFs {
-    fn lookup_path(&mut self, path: &str) -> Option<(u32, u8)> {
+    fn dir_lookup_inode_dispatch(&mut self, dir_ino: u32, name: &str) -> Option<(u32, u8)> {
         match self {
-            BlockFs::Ofs(s) => s.lookup_path(path),
-            BlockFs::Ext2(s) => s.lookup_path(path),
+            BlockFs::Ofs(s) => s.dir_lookup_inode(dir_ino, name),
+            BlockFs::Ext2(s) => s.dir_lookup_inode(dir_ino, name),
         }
+    }
+
+    fn root_inode_number(&self) -> u32 {
+        match self {
+            BlockFs::Ofs(_) => blockfs::ROOT_INODE,
+            BlockFs::Ext2(_) => 2,
+        }
+    }
+
+    fn lookup_path(&mut self, path: &str) -> Option<(u32, u8)> {
+        self.lookup_path_depth(path, 8, true)
+    }
+
+    fn lookup_path_nofollow(&mut self, path: &str) -> Option<(u32, u8)> {
+        self.lookup_path_depth(path, 8, false)
+    }
+
+    fn lookup_path_depth(&mut self, path: &str, depth: u32, follow_last: bool) -> Option<(u32, u8)> {
+        let root_ino = self.root_inode_number();
+        let trimmed = path.trim_matches('/');
+        if trimmed.is_empty() {
+            return Some((root_ino, ITYPE_DIR_ENTRY));
+        }
+        let components: Vec<&str> = trimmed.split('/').filter(|c| !c.is_empty()).collect();
+        let n = components.len();
+        let mut cur_ino = root_ino;
+        let mut cur_type = ITYPE_DIR_ENTRY;
+
+        for (i, comp) in components.iter().enumerate() {
+            if cur_type != ITYPE_DIR_ENTRY {
+                return None;
+            }
+            let (next_ino, next_type) = self.dir_lookup_inode_dispatch(cur_ino, comp)?;
+            let is_last = i == n - 1;
+
+            if next_type == ITYPE_SYMLINK_ENTRY && (follow_last || !is_last) {
+                if depth == 0 {
+                    return None;
+                }
+                let info = self.inode_info(next_ino)?;
+                let mut target_buf = alloc::vec![0u8; info.size as usize];
+                if self.file_read(next_ino, 0, &mut target_buf).is_err() {
+                    return None;
+                }
+                let target = core::str::from_utf8(&target_buf).ok()?;
+                let mut new_path = alloc::string::String::new();
+                if target.starts_with('/') {
+                    new_path.push_str(target);
+                } else {
+                    for j in 0..i {
+                        new_path.push('/');
+                        new_path.push_str(components[j]);
+                    }
+                    if new_path.is_empty() {
+                        new_path.push('/');
+                    } else {
+                        new_path.push('/');
+                    }
+                    new_path.push_str(target);
+                }
+                for j in (i + 1)..n {
+                    if !new_path.ends_with('/') {
+                        new_path.push('/');
+                    }
+                    new_path.push_str(components[j]);
+                }
+                return self.lookup_path_depth(&new_path, depth - 1, follow_last);
+            }
+
+            cur_ino = next_ino;
+            cur_type = next_type;
+        }
+        Some((cur_ino, cur_type))
     }
     fn inode_info(&mut self, ino: u32) -> Option<blockio::InodeInfo> {
         match self {
@@ -106,21 +179,18 @@ impl BlockFs {
     fn rename(&mut self, old_dir: &str, old_name: &str, new_dir: &str, new_name: &str) -> bool {
         let (dir_ino, _) = match self.lookup_path(old_dir) { Some(r) => r, None => return false };
         let (new_dir_ino, _) = match self.lookup_path(new_dir) { Some(r) => r, None => return false };
-        let (child_ino, etype) = match self.lookup_path(
-            &alloc::format!("{}/{}", old_dir, old_name)
-        ) { Some(r) => r, None => return false };
+        // Use dir_lookup_inode_dispatch so we get the entry itself, not a followed symlink
+        let (child_ino, etype) = match self.dir_lookup_inode_dispatch(dir_ino, old_name) {
+            Some(r) => r, None => return false
+        };
 
-        // Same-inode check: if old and new point to the same entry, no-op
-        let target_path = alloc::format!("{}/{}", new_dir, new_name);
-        if let Some((target_ino, _)) = self.lookup_path(&target_path) {
+        // Check if target already exists
+        if let Some((target_ino, _)) = self.dir_lookup_inode_dispatch(new_dir_ino, new_name) {
             if target_ino == child_ino { return true; }
-            // Remove existing target
             if !self.dir_unlink(new_dir_ino, new_name) { return false; }
         }
 
-        // Link child to new name
         if !self.dir_link_entry(new_dir_ino, new_name, child_ino, etype) { return false; }
-        // Unlink old name
         if !self.dir_unlink(dir_ino, old_name) { return false; }
         true
     }
@@ -164,15 +234,61 @@ enum FsNode {
     Symlink(String),
 }
 
+fn normalize_path(path: &str) -> String {
+    let is_absolute = path.starts_with('/');
+    let mut components: Vec<&str> = Vec::new();
+    for comp in path.split('/') {
+        match comp {
+            "" | "." => continue,
+            ".." => {
+                if !components.is_empty() {
+                    components.pop();
+                }
+            }
+            _ => components.push(comp),
+        }
+    }
+    let mut result = String::new();
+    if is_absolute || components.is_empty() {
+        result.push('/');
+    }
+    result.push_str(&components.join("/"));
+    result
+}
+
+#[derive(Clone)]
+struct NodeMeta {
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    atime: u64,
+    mtime: u64,
+}
+
+impl NodeMeta {
+    fn default_dir() -> Self {
+        Self { mode: 0o40755, uid: 0, gid: 0, atime: 0, mtime: 0 }
+    }
+    fn default_file() -> Self {
+        Self { mode: 0o100644, uid: 0, gid: 0, atime: 0, mtime: 0 }
+    }
+    fn default_symlink() -> Self {
+        Self { mode: 0o120777, uid: 0, gid: 0, atime: 0, mtime: 0 }
+    }
+}
+
 struct Vfs {
     nodes: BTreeMap<String, FsNode>,
+    meta: BTreeMap<String, NodeMeta>,
 }
 
 impl Vfs {
     fn new() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert(String::from("/"), FsNode::Dir(Vec::new()));
-        Self { nodes }
+        let mut meta = BTreeMap::new();
+        meta.insert(String::from("/"), NodeMeta::default_dir());
+        Self { nodes, meta }
     }
 
     fn exists(&self, path: &str) -> bool {
@@ -183,6 +299,7 @@ impl Vfs {
             let p = if stripped.is_empty() { "/" } else { stripped };
             return ofs.lookup_path(p).is_some();
         }
+        let path = &normalize_path(path);
         self.nodes.contains_key(path)
     }
 
@@ -229,23 +346,27 @@ impl Vfs {
             }
             return false;
         }
+        let path = &normalize_path(path);
         if self.exists(path) { return false; }
         if let Some((parent, name)) = Self::parent_and_name(path)
             && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
         {
             children.push(name);
             self.nodes.insert(String::from(path), FsNode::Dir(Vec::new()));
+            self.meta.entry(String::from(path)).or_insert_with(NodeMeta::default_dir);
             return true;
         }
         false
     }
 
     fn insert_tar_file(&mut self, path: &str, tar_offset: usize, size: usize) {
+        let path = &normalize_path(path);
         if let Some((parent, name)) = Self::parent_and_name(path) {
             let already_exists = self.nodes.contains_key(path);
             if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
                 if !already_exists { children.push(name); }
                 self.nodes.insert(String::from(path), FsNode::TarFile { tar_offset, size });
+                self.meta.entry(String::from(path)).or_insert_with(NodeMeta::default_file);
             }
         }
     }
@@ -258,13 +379,12 @@ impl Vfs {
                     && let Some((dir_ino, etype)) = ofs.lookup_path(&parent)
                     && etype == ITYPE_DIR_ENTRY
                 {
-                    // If it exists, truncate it instead of failing
                     if let Some((child_ino, ctype)) = ofs.lookup_path(p) {
                         if ctype == ITYPE_FILE_ENTRY {
                             ofs.file_truncate(child_ino);
                             return true;
                         }
-                        return false; // Is a directory
+                        return false;
                     }
 
                     let child_ino = match ofs.create_inode(ITYPE_FILE_ENTRY) {
@@ -280,11 +400,13 @@ impl Vfs {
             }
             return false;
         }
+        let path = &normalize_path(path);
         if let Some((parent, name)) = Self::parent_and_name(path) {
             let already_exists = self.nodes.contains_key(path);
             if let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent) {
                 if !already_exists { children.push(name); }
                 self.nodes.insert(String::from(path), FsNode::MemFile(Vec::new()));
+                self.meta.entry(String::from(path)).or_insert_with(NodeMeta::default_file);
                 return true;
             }
         }
@@ -304,28 +426,28 @@ impl Vfs {
             }
             return false;
         }
+        let path = &normalize_path(path);
         if !self.nodes.contains_key(path) { return false; }
         if let Some((parent, name)) = Self::parent_and_name(path)
             && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
         {
             children.retain(|c| c != &name);
             self.nodes.remove(path);
+            self.meta.remove(path);
             return true;
         }
         false
     }
 
     fn read(&self, path: &str, offset: u64, buf: &mut [u8]) -> Option<usize> {
-        // Virtual /dev files
-        if path == "/dev/null" { return Some(0); } // always EOF
+        if path == "/dev/null" { return Some(0); }
         if path == "/dev/zero" {
             let n = buf.len();
             buf.fill(0);
             return Some(n);
         }
-        if path == "/dev/tty" { return Some(0); } // stub
+        if path == "/dev/tty" { return Some(0); }
 
-        // Virtual /proc files
         if let Some(rest) = path.strip_prefix("/proc/") {
             if let Some((pid_str, "status")) = rest.split_once('/')
                 && let Ok(pid) = pid_str.parse::<i32>()
@@ -349,13 +471,13 @@ impl Vfs {
             }
             return None;
         }
+        let path = &normalize_path(path);
         match self.nodes.get(path)? {
             FsNode::TarFile { tar_offset, size } => {
                 let file_off = offset as usize;
                 if file_off >= *size { return Some(0); }
                 let avail = size - file_off;
                 let take = buf.len().min(avail);
-                // Fetch data on-demand from the initrd TAR (no copy kept in VFS).
                 let n = initrd_read(&mut buf[..take], tar_offset + file_off);
                 Some(n)
             }
@@ -385,6 +507,7 @@ impl Vfs {
             }
             return None;
         }
+        let path = &normalize_path(path);
         match self.nodes.get_mut(path)? {
             FsNode::MemFile(buf) => {
                 let start = offset as usize;
@@ -416,7 +539,6 @@ impl Vfs {
     }
 
     fn readdir(&self, path: &str) -> Option<Vec<String>> {
-        // Virtual directories
         if path == "/dev" {
             return Some(alloc::vec![
                 String::from("null"),
@@ -449,6 +571,7 @@ impl Vfs {
             }
             return None;
         }
+        let path = &normalize_path(path);
         match self.nodes.get(path)? {
             FsNode::Dir(children) => Some(children.clone()),
             _ => None,
@@ -483,6 +606,7 @@ impl Vfs {
             }
             return None;
         }
+        let path = &normalize_path(path);
         match self.nodes.get(path)? {
             FsNode::TarFile { size, .. } => Some((false, *size as u64)),
             FsNode::MemFile(data)        => Some((false, data.len() as u64)),
@@ -491,7 +615,66 @@ impl Vfs {
         }
     }
 
+    fn chmod(&mut self, path: &str, mode: u32) -> bool {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                return ofs.lookup_path(p).is_some();
+            }
+            return false;
+        }
+        let path = &normalize_path(path);
+        if !self.nodes.contains_key(path) { return false; }
+        self.meta.entry(String::from(path)).or_insert_with(||
+            if matches!(self.nodes.get(path), Some(FsNode::Dir(_))) { NodeMeta::default_dir() }
+            else if matches!(self.nodes.get(path), Some(FsNode::Symlink(_))) { NodeMeta::default_symlink() }
+            else { NodeMeta::default_file() }
+        ).mode = mode;
+        true
+    }
+
+    fn chown(&mut self, path: &str, uid: u32, gid: u32) -> bool {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                return ofs.lookup_path(p).is_some();
+            }
+            return false;
+        }
+        let path = &normalize_path(path);
+        if !self.nodes.contains_key(path) { return false; }
+        let meta = self.meta.entry(String::from(path)).or_insert_with(||
+            if matches!(self.nodes.get(path), Some(FsNode::Dir(_))) { NodeMeta::default_dir() }
+            else if matches!(self.nodes.get(path), Some(FsNode::Symlink(_))) { NodeMeta::default_symlink() }
+            else { NodeMeta::default_file() }
+        );
+        meta.uid = uid;
+        meta.gid = gid;
+        true
+    }
+
+    fn utimens(&mut self, path: &str, atime: u64, mtime: u64) -> bool {
+        if let Some(stripped) = path.strip_prefix("/mnt") {
+            if let Some(ofs) = get_blockfs() {
+                let p = if stripped.is_empty() { "/" } else { stripped };
+                return ofs.lookup_path(p).is_some();
+            }
+            return false;
+        }
+        let path = &normalize_path(path);
+        if !self.nodes.contains_key(path) { return false; }
+        let meta = self.meta.entry(String::from(path)).or_insert_with(||
+            if matches!(self.nodes.get(path), Some(FsNode::Dir(_))) { NodeMeta::default_dir() }
+            else if matches!(self.nodes.get(path), Some(FsNode::Symlink(_))) { NodeMeta::default_symlink() }
+            else { NodeMeta::default_file() }
+        );
+        meta.atime = atime;
+        meta.mtime = mtime;
+        true
+    }
+
     fn readlink(&self, path: &str) -> Option<&str> {
+        let path = &normalize_path(path);
         if let Some(FsNode::Symlink(target)) = self.nodes.get(path) {
             Some(target.as_str())
         } else {
@@ -500,12 +683,14 @@ impl Vfs {
     }
 
     fn symlink(&mut self, link_path: &str, target: &str) -> bool {
+        let link_path = &normalize_path(link_path);
         if self.exists(link_path) { return false; }
         if let Some((parent, name)) = Self::parent_and_name(link_path)
             && let Some(FsNode::Dir(children)) = self.nodes.get_mut(&parent)
         {
             children.push(name);
             self.nodes.insert(String::from(link_path), FsNode::Symlink(String::from(target)));
+            self.meta.entry(String::from(link_path)).or_insert_with(NodeMeta::default_symlink);
             true
         } else {
             false
@@ -513,6 +698,8 @@ impl Vfs {
     }
 
     fn link(&mut self, old_path: &str, new_path: &str) -> bool {
+        let old_path = &normalize_path(old_path);
+        let new_path = &normalize_path(new_path);
         let node = match self.nodes.get(old_path) {
             Some(n) => n,
             None => return false,
@@ -540,6 +727,7 @@ impl Vfs {
     }
 
     fn truncate(&mut self, path: &str, length: u64) -> bool {
+        let path = &normalize_path(path);
         match self.nodes.get_mut(path) {
             Some(FsNode::MemFile(data)) => {
                 data.resize(length as usize, 0);
@@ -1209,6 +1397,10 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
                         c.push(nn);
                     }
                     vfs.nodes.insert(new.to_string(), node);
+                    // Copy metadata if it exists
+                    if let Some(meta) = vfs.meta.remove(old) {
+                        vfs.meta.insert(new.to_string(), meta);
+                    }
                     true
                 } else {
                     false
@@ -1329,24 +1521,24 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
             if ok { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_CHMOD => {
-            let (_mode, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
+            let (mode, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            if ns_vfs(namespaces, ns_id).exists(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+            if ns_vfs(namespaces, ns_id).chmod(path, mode) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_CHOWN => {
-            let (_, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
+            let (owner, path_ptr, path_len, ns_id) = unpack_path_req(&msg.data);
             if path_len == 0 || path_len > 1024 { reply_err(client, msg); return; }
             let mut path_buf = alloc::vec![0u8; path_len];
             if libos::datacopy(client, path_ptr as *const u8, libos::getpid(), path_buf.as_mut_ptr(), path_len) < 0 {
                 reply_err(client, msg); return;
             }
             let path = match core::str::from_utf8(&path_buf) { Ok(s) => s, Err(_) => { reply_err(client, msg); return; } };
-            if ns_vfs(namespaces, ns_id).exists(path) { reply_ok(client, msg) } else { reply_err(client, msg) }
+            if ns_vfs(namespaces, ns_id).chown(path, owner, !0) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
         OP_FTRUNCATE => {
             let (fd, length) = unpack_ftruncate_req(&msg.data);
@@ -1406,8 +1598,15 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
             reply_ok(client, msg);
         }
         OP_FUTIMENS => {
-            let (_fd, _ats, _atns, _mts, _mtns) = unpack_futimens_req(&msg.data);
-            reply_ok(client, msg);
+            let (fd, ats, atns, mts, mtns) = unpack_futimens_req(&msg.data);
+            let (path, file_ns) = match open_table.get(fd) {
+                Some(f) => (f.path.clone(), f.ns_id),
+                None => { reply_err(client, msg); return; }
+            };
+            // Convert nsec timestamps to whole-seconds (round down)
+            let atime = if ats >= 0 { ats as u64 } else { 0 };
+            let mtime = if mts >= 0 { mts as u64 } else { 0 };
+            if ns_vfs(namespaces, file_ns).utimens(&path, atime, mtime) { reply_ok(client, msg) } else { reply_err(client, msg) }
         }
          OP_FALLOCATE => {
             let (fd, _offset, _length) = unpack_fallocate_req(&msg.data);

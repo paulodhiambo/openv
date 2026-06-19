@@ -212,31 +212,67 @@ pub fn sys_fork(tf: &mut TrapFrame) {
 /// `(argc, argv_ptr, new_sp)` where `argv_ptr` is the address of the
 /// pointer array and `new_sp` is the new stack pointer (with 16-byte
 /// alignment and 16 bytes of extra slack).
-fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
+/// Auxiliary vector types for ELF executables.
+const AT_NULL: usize = 0;
+const AT_PHDR: usize = 3;
+const AT_PHENT: usize = 4;
+const AT_PHNUM: usize = 5;
+const AT_PAGESZ: usize = 6;
+const AT_BASE: usize = 7;
+const AT_ENTRY: usize = 9;
+const AT_UID: usize = 11;
+const AT_EUID: usize = 12;
+const AT_GID: usize = 13;
+const AT_EGID: usize = 14;
+const AT_SECURE: usize = 23;
+const AT_RANDOM: usize = 25;
+
+fn setup_exec_stack(
+    argv_data: &[u8],
+    envp_data: &[u8],
+    elf_info: &crate::posix::elf::ElfLoadInfo,
+) -> (usize, usize, usize, usize) {
     use crate::posix::spawn::USER_STACK_TOP;
 
-    let mut args: Vec<&[u8]> = Vec::new();
-    let mut start = 0usize;
-    for (i, &b) in argv_data.iter().enumerate() {
-        if b == 0 {
-            if i > start {
-                args.push(&argv_data[start..i]);
+    let args = {
+        let mut entries: Vec<&[u8]> = Vec::new();
+        let mut start = 0usize;
+        for (i, &b) in argv_data.iter().enumerate() {
+            if b == 0 {
+                if i > start {
+                    entries.push(&argv_data[start..i]);
+                }
+                start = i + 1;
             }
-            start = i + 1;
         }
-    }
-    if start < argv_data.len() {
-        args.push(&argv_data[start..]);
-    }
+        if start < argv_data.len() {
+            entries.push(&argv_data[start..]);
+        }
+        entries
+    };
+    let envp = {
+        let mut entries: Vec<&[u8]> = Vec::new();
+        let mut start = 0usize;
+        for (i, &b) in envp_data.iter().enumerate() {
+            if b == 0 {
+                if i > start {
+                    entries.push(&envp_data[start..i]);
+                }
+                start = i + 1;
+            }
+        }
+        if start < envp_data.len() {
+            entries.push(&envp_data[start..]);
+        }
+        entries
+    };
 
     let argc = args.len();
-    if argc == 0 {
-        return (0, 0, USER_STACK_TOP);
-    }
 
     let mut sp = USER_STACK_TOP;
-    let mut string_addrs: Vec<usize> = Vec::new();
 
+    // Push argv strings
+    let mut string_addrs: Vec<usize> = Vec::new();
     for arg in &args {
         let len = arg.len() + 1;
         sp -= len;
@@ -248,6 +284,19 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
         string_addrs.push(sp);
     }
 
+    // Push envp strings
+    let mut envp_addrs: Vec<usize> = Vec::new();
+    for entry in &envp {
+        let len = entry.len() + 1;
+        sp -= len;
+        unsafe {
+            let dst = core::slice::from_raw_parts_mut(sp as *mut u8, len);
+            dst[..entry.len()].copy_from_slice(entry);
+            dst[entry.len()] = 0;
+        }
+        envp_addrs.push(sp);
+    }
+
     sp &= !7;
     sp -= 8;
     unsafe { *(sp as *mut usize) = 0; }
@@ -255,11 +304,54 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
         sp -= 8;
         unsafe { *(sp as *mut usize) = addr; }
     }
-
     let argv_ptr = sp;
+
+    sp -= 8;
+    unsafe { *(sp as *mut usize) = 0; }
+    for &addr in envp_addrs.iter().rev() {
+        sp -= 8;
+        unsafe { *(sp as *mut usize) = addr; }
+    }
+    let envp_ptr = sp;
+
+    // Push 16 random bytes for AT_RANDOM
+    sp -= 16;
+    let random_va = sp;
+    unsafe {
+        // Simple non-cryptographic random from the cycle counter
+        let cycle: usize = riscv::register::cycle::read();
+        let dst = core::slice::from_raw_parts_mut(sp as *mut u8, 16);
+        for j in 0..4 {
+            let val = cycle.wrapping_mul(6364136223846793005usize.wrapping_add(j));
+            dst[j * 4..(j + 1) * 4].copy_from_slice(&(val as u32).to_ne_bytes());
+        }
+    }
+
+    // Push auxv pairs: type, value, type, value, ..., AT_NULL, 0
+    let mut push_aux = |type_: usize, val: usize| {
+        sp -= 8;
+        unsafe { *(sp as *mut usize) = val; }
+        sp -= 8;
+        unsafe { *(sp as *mut usize) = type_; }
+    };
+    push_aux(AT_PHDR, elf_info.phdr_va);
+    push_aux(AT_PHENT, elf_info.phentsize);
+    push_aux(AT_PHNUM, elf_info.phnum);
+    push_aux(AT_PAGESZ, 4096);
+    push_aux(AT_BASE, 0); // no ld.so
+    push_aux(AT_ENTRY, elf_info.entry);
+    push_aux(AT_UID, 0);
+    push_aux(AT_EUID, 0);
+    push_aux(AT_GID, 0);
+    push_aux(AT_EGID, 0);
+    push_aux(AT_SECURE, 0);
+    push_aux(AT_RANDOM, random_va);
+    push_aux(AT_NULL, 0);
+
+    // 16-byte alignment
     sp = (sp - 16) & !15;
 
-    (argc, argv_ptr, sp)
+    (argc, argv_ptr, envp_ptr, sp)
 }
 
 /// Replaces the current process image with a new executable.
@@ -275,14 +367,24 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
 /// * `arg2` (`a2`) - Pointer to a NUL-separated argv buffer.
 /// * `arg3` (`a3`) - Argv buffer length (in `tf.regs[13]`).
 /// * `tf` - Caller's trap frame.
-pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: usize, tf: &mut TrapFrame) {
+pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, argv_buf_len: usize, tf: &mut TrapFrame) {
     if !crate::mm::vmm::is_user_pointer_valid(tf, path_ptr as *const u8, path_len) {
         tf.regs[10] = crate::errno::EFAULT;
         return;
     }
-    let argv_buf_len = tf.regs[13]; // a3
-    if argv_buf_len > 0 {
+    // argv_buf_ptr/length come from a2/a3 (arg2/arg3 in dispatch).
+    if argv_buf_len > 0 && argv_buf_ptr != 0 {
         if !crate::mm::vmm::is_user_pointer_valid(tf, argv_buf_ptr as *const u8, argv_buf_len) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
+    }
+
+    // envp_buf_ptr/length come from a4/a5 (regs[14]/regs[15]).
+    let envp_buf_ptr = tf.regs[14]; // a4
+    let envp_buf_len = tf.regs[15]; // a5
+    if envp_buf_len > 0 && envp_buf_ptr != 0 {
+        if !crate::mm::vmm::is_user_pointer_valid(tf, envp_buf_ptr as *const u8, envp_buf_len) {
             tf.regs[10] = crate::errno::EFAULT;
             return;
         }
@@ -294,8 +396,15 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
         Vec::new()
     };
 
+    let envp_data: Vec<u8> = if envp_buf_len > 0 && envp_buf_ptr != 0 {
+        unsafe { core::slice::from_raw_parts(envp_buf_ptr as *const u8, envp_buf_len).to_vec() }
+    } else {
+        Vec::new()
+    };
+
     match unsafe { crate::posix::spawn::sys_exec(path_ptr as *const u8, path_len) } {
-        Ok(entry_point) => {
+        Ok(ref elf_info) => {
+            let entry_point = elf_info.entry;
             let pid = crate::posix::process::current_pid();
 
             {
@@ -317,7 +426,7 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
                 }
             }
 
-            let (argc, argv_ptr, new_sp) = setup_exec_stack(&argv_data);
+            let (argc, argv_ptr, envp_ptr, new_sp) = setup_exec_stack(&argv_data, &envp_data, elf_info);
 
             let new_satp = crate::posix::process::PROCESS_TABLE
                 .lock()
@@ -333,6 +442,7 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
             tf.regs[2] = new_sp;
             tf.regs[10] = argc;
             tf.regs[11] = argv_ptr;
+            tf.regs[12] = envp_ptr;
             tf.sstatus = (1 << 5) | (1 << 18);
             // execution will return to U-mode from the trap handler with the new context
         }
@@ -943,6 +1053,98 @@ pub fn sys_sigreturn(tf: &mut TrapFrame) {
     // Restore the signal mask that was active before the handler was invoked.
     if let Some(proc) = crate::posix::process::get_current_proc() {
         proc.blocked_signals.store(frame.saved_blocked, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Sets or queries the process signal mask (sigprocmask).
+///
+/// # Arguments
+///
+/// * `arg0` - How: `SIG_BLOCK=0`, `SIG_UNBLOCK=1`, `SIG_SETMASK=2`.
+/// * `arg1` - New mask pointer (user-space `*const u32`), or `0` to ignore.
+/// * `arg2` - Old mask pointer (user-space `*mut u32`), or `0` to ignore.
+///
+/// Returns 0 on success.
+pub fn sys_sigprocmask(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
+    let how = arg0;
+    let set_ptr = arg1;
+    let old_set_ptr = arg2;
+
+    let proc = crate::get_current_proc_or_esrch!(tf);
+
+    // Return old mask if requested
+    if old_set_ptr != 0 {
+        if !crate::mm::vmm::is_user_pointer_valid(tf, old_set_ptr as *const u32, 1) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
+        let old_set = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+        unsafe { core::ptr::write(old_set_ptr as *mut u32, old_set); }
+    }
+
+    // Update mask if new set provided
+    if set_ptr != 0 {
+        if !crate::mm::vmm::is_user_pointer_valid(tf, set_ptr as *const u32, 1) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
+        let new_set = unsafe { core::ptr::read(set_ptr as *const u32) };
+        let old_blocked = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+        let updated = match how {
+            0 => old_blocked | new_set,           // SIG_BLOCK
+            1 => old_blocked & !new_set,           // SIG_UNBLOCK
+            2 => new_set,                          // SIG_SETMASK
+            _ => { tf.regs[10] = crate::errno::EINVAL; return; }
+        };
+        // SIGKILL and SIGSTOP are always blocked
+        let mask = updated | (1u32 << crate::syscall::proc::SIGKILL) | (1u32 << crate::syscall::proc::SIGSTOP);
+        proc.blocked_signals.store(mask, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    tf.regs[10] = 0;
+}
+
+/// Returns the set of pending signals that are not blocked (sigpending).
+///
+/// # Arguments
+///
+/// * `arg0` - Output pointer to `u32` mask (user-space `*mut u32`).
+pub fn sys_sigpending(arg0: usize, tf: &mut TrapFrame) {
+    let set_ptr = arg0;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, set_ptr as *const u32, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    if let Some(proc) = crate::posix::process::get_current_proc() {
+        let pending = proc.pending_signals.load(core::sync::atomic::Ordering::Relaxed);
+        let blocked = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+        let result = pending & !blocked;
+        unsafe { core::ptr::write(set_ptr as *mut u32, result); }
+        tf.regs[10] = 0;
+    } else {
+        tf.regs[10] = crate::errno::ESRCH;
+    }
+}
+
+/// Architecture-specific operations (arch_prctl equivalent).
+///
+/// Currently only supports `ARCH_SET_FS = 0x1002` / `SET_THREAD_AREA = 1`
+/// which sets the thread pointer (tp) register.
+///
+/// # Arguments
+///
+/// * `arg0` - Code: `1` = set thread area (tp = arg1).
+/// * `arg1` - Value (TLS pointer for tp).
+pub fn sys_arch_prctl(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
+    match arg0 {
+        1 => {
+            // SET_THREAD_AREA: tp = arg1
+            tf.regs[4] = arg1;
+            tf.regs[10] = 0;
+        }
+        _ => {
+            tf.regs[10] = crate::errno::EINVAL;
+        }
     }
 }
 

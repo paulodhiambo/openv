@@ -102,6 +102,8 @@ pub mod uart;
 pub mod initrd;
 /// Module containing synchronization primitives.
 pub mod sync;
+/// Module containing cryptographic hash functions (SHA-256).
+pub mod crypto;
 
 /// Atomic storage for the device tree blob (DTB) pointer passed by the bootloader.
 ///
@@ -273,9 +275,16 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // resources such as PIDs, mount points, and network interfaces.
     namespace::init();
 
+    // Record which HART is the boot HART so the timer ISR knows where to poll UART.
+    smp::BOOT_HARTID.store(hartid, core::sync::atomic::Ordering::Relaxed);
+
     // Initialize Trap Handler. This sets up the trap vector and configures
     // the CPU to handle traps (exceptions, interrupts, and system calls).
     trap::init();
+
+    // Enable UART external interrupt (IRQ 10) on the boot HART so keyboard
+    // input arrives via the PLIC regardless of which hartid won the election.
+    plic::set_enable(hartid, 10, true);
 
     // Initialize networking via driver framework (virtio-mmio probe or loopback fallback).
     // This probes the DTB for network devices and initializes the appropriate

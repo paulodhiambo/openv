@@ -67,11 +67,12 @@ pub struct MountTable {
 
 **Mount configuration at boot:**
 
-| Mount point | Filesystem | Backing data       |
-|-------------|------------|--------------------|
-| `/`         | TarFS      | initrd TAR archive |
-| `/proc`     | ProcFS     | Live kernel state  |
-| `/dev`      | DevFS      | Synthetic devices  |
+| Mount point | Filesystem | Backing data                     |
+|-------------|------------|----------------------------------|
+| `/`         | TarFS      | initrd TAR archive               |
+| `/proc`     | ProcFS     | Live kernel state                |
+| `/dev`      | DevFS      | Synthetic devices                |
+| `/mnt`      | OFS        | virtio-blk `disk.img` (if present; auto-formatted on blank disk) |
 
 ### 7.3 MemFS
 
@@ -155,7 +156,38 @@ DevFS provides POSIX-style special device files:
 | `/dev/zero`   | `ZeroDev`    | Fills buffer with 0x00 bytes          | Discards all data          |
 | `/dev/tty`    | `TtyDev`     | Reads from the line discipline buffer | Writes to UART             |
 
-### 7.7 File Access Control
+### 7.7 OFS — Persistent On-Disk Filesystem
+
+OFS ("openv filesystem") is a simple journaled block filesystem backed by a virtio-blk device. It lives in `user/vfs-server/src/blockfs.rs` and runs entirely in userspace inside `vfs-server`.
+
+**Disk layout (4 KiB blocks):**
+
+| Block | Contents |
+|-------|----------|
+| 0 | Superblock: magic `0x4F564653` ("OVFS"), version, total_blocks, CRC32 |
+| 1 | Block allocation bitmap |
+| 2 | Inode allocation bitmap |
+| 3–34 | Inode table (one inode per 4 KiB block) |
+| 35 | Journal header: magic, commit flag, slot count, CRC32 |
+| 36–67 | Journal data slots (32 slots × 4 KiB) |
+| 68+ | Data blocks |
+
+**Write-ahead journal:** All metadata writes go through a two-phase journal: write data to a journal slot, set the commit flag, then apply to the actual block. On mount, OFS replays any committed-but-not-applied journal entry before normal operation.
+
+**Auto-format:** On first mount, if the superblock magic or CRC does not match, OFS calls `mkfs()` to initialise the layout on the blank disk. No manual `mkfs` step is needed.
+
+**Block device interface:** vfs-server communicates with `virtio-blk-driver` (pid 8) via IPC messages:
+
+| Message type | Direction | Meaning |
+|---|---|---|
+| `OP_BLOCK_READ = 100` | vfs-server → driver | Read 4 KiB block N |
+| `OP_BLOCK_WRITE = 101` | vfs-server → driver | Write 4 KiB block N |
+| `type_ = 0` | driver → vfs-server | OK reply |
+| `type_ = -1` | driver → vfs-server | Error reply |
+
+**QEMU setup:** OFS requires `disk.img` to be passed as a virtio-blk device. `make run` creates an 8 MB `disk.img` automatically if none exists, and QEMU is always launched with `-device virtio-blk-device,drive=disk0`. The disk persists across kernel rebuilds; `make clean-all` removes it.
+
+### 7.8 File Access Control
 
 Access control uses the classic **Unix 9-bit permission model**:
 

@@ -3,8 +3,7 @@
 
 extern crate alloc;
 
-use libos::{spawn, spawn_with_caps, sys_yield, waitpid, write};
-use libos::{CAP_MMIO, CAP_INTERRUPT, CAP_NET_RAW};
+use libos::{spawn, sys_yield, waitpid, write};
 use alloc::string::ToString;
 
 fn wrt(s: &[u8]) {
@@ -40,23 +39,8 @@ pub extern "C" fn main() -> ! {
 
     ok_line(b"Mounting virtual filesystem");
 
-    // ── Start block device driver (needed for /mnt filesystem) ───────────────
-    let _blk_pid = spawn_with_caps(
-        b"/virtio-blk-driver".as_ptr(),
-        b"/virtio-blk-driver".len(),
-        CAP_MMIO | CAP_INTERRUPT,
-    );
-    ok_line(b"Starting block device driver");
-
-    // ── Start network daemon (needed for pkg update / install-pkg) ────────────
-    let _net_pid = spawn_with_caps(
-        b"/net-smoltcp".as_ptr(),
-        b"/net-smoltcp".len(),
-        CAP_NET_RAW,
-    );
-    ok_line(b"Starting network daemon");
-
-    // Let block and net daemons initialize before we need them.
+    // Block and network drivers are managed by rs-server; init only waits
+    // a few ticks so they finish registering before we need them.
     for _ in 0..200 { sys_yield(); }
 
     // ── Start component manager ───────────────────────────────────────────────

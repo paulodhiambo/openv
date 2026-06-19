@@ -95,6 +95,9 @@ secondary_park:
 ```
 kmain(hartid: usize, dtb_ptr: *const u8)
   │
+  ├── smp::BOOT_HARTID.store(hartid)
+  │     Record which HART is primary (used for UART polling on multi-HART systems)
+  │
   ├── uart::init()
   │     Initialises UART0 at MMIO base 0x10000000 (QEMU virt)
   │
@@ -102,14 +105,17 @@ kmain(hartid: usize, dtb_ptr: *const u8)
   │     ├─ Parse DTB /memory node for RAM base + size
   │     ├─ Build PMM free-list (exclude kernel, FDT, initrd)
   │     ├─ Set up Sv39 kernel identity map (1GB superpages)
-  │     └─ Initialise heap (16 MB from PMM)
+  │     └─ Initialise heap (32 MB from PMM)
   │
   ├── trap::init()
   │     ├─ csrw stvec, trap_vector  (Direct mode)
-  │     └─ Set sscratch for HART 0
+  │     └─ Set sscratch for boot HART
+  │
+  ├── plic::set_enable(hartid, 10, true)
+  │     Enable UART IRQ 10 at the PLIC for S-mode on the boot HART
   │
   ├── net::init()
-  │     Probe virtio-mmio bus for network device
+  │     Probe virtio-mmio bus for network device (virtio device-id=1)
   │
   ├── initrd::parse(dtb_ptr)
   │     Locate initrd region from DTB chosen node
@@ -119,19 +125,30 @@ kmain(hartid: usize, dtb_ptr: *const u8)
   │     ├─ Mount ProcFS at "/proc"
   │     └─ Mount DevFS at "/dev"
   │
-  ├── heap_test()           (debug builds only)
+  ├── heap_test() / ipc_test()   (debug builds only)
   │
-  ├── process::init_table()
-  │     Allocate PID 0 (idle process)
+  ├── spawn boot servers (microkernel architecture)
+  │     ├─ PID 1  /init            PRIO_NORMAL → stays PRIO_NORMAL (user PID 1)
+  │     ├─ PID 2  /pm-server       PRIO_NORMAL → raised to PRIO_HIGH
+  │     ├─ PID 3  /vfs-server      PRIO_NORMAL → raised to PRIO_HIGH
+  │     ├─ PID 4  /rs-server       PRIO_NORMAL → raised to PRIO_HIGH
+  │     ├─ PID 5  /procfs-server   PRIO_NORMAL → raised to PRIO_HIGH
+  │     └─ PID 6  /devfs-server    PRIO_NORMAL → raised to PRIO_HIGH
   │
-  ├── process::spawn("/sbin/init")
-  │     ELF load → PID 1 pushed to RUN_QUEUE
+  │   rs-server then spawns drivers in userspace:
+  │     ├─ PID 7  /net-smoltcp         PRIO_NORMAL (spawned by rs-server)
+  │     └─ PID 8  /virtio-blk-driver   PRIO_NORMAL (spawned by rs-server)
   │
   ├── timer::enable()
   │     Set first SBI timer call; enable supervisor timer interrupt
   │
   └── sched::schedule()     ← enters scheduler, never returns
 ```
+
+> **Priority note:** All processes are spawned at `PRIO_NORMAL` by the ELF loader.  
+> `kmain` then explicitly raises the five boot servers to `PRIO_HIGH` before entering the scheduler.  
+> Processes spawned later (drivers, shell, user programs) always stay at `PRIO_NORMAL`,  
+> preventing `PRIO_HIGH` servers from starving user workloads via priority inheritance.
 
 ### 2.4 Secondary HART Wakeup
 

@@ -106,6 +106,10 @@ pub const PTE_W: usize = 1 << 2;
 pub const PTE_X: usize = 1 << 3;
 /// PTE User-accessible flag. If set, the page is accessible from U-mode.
 pub const PTE_U: usize = 1 << 4;
+/// Copy-on-write marker (software-reserved bit, RSW[0]).
+/// Set on user writable pages during fork; the page fault handler checks
+/// this bit to distinguish COW pages from genuinely read-only pages (e.g. .rodata).
+pub const PTE_COW: usize = 1 << 8;
 
 /// A page table with 512 entries.
 ///
@@ -369,10 +373,10 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
                     if crate::mm::pmm::is_managed_page(pa) {
                         // User page: make read-only in both parent and child (COW)
                         if (flags & PTE_W) != 0 {
-                            // Clear write in parent
-                            let new_parent_entry = (pa >> 12) << 10 | (flags & !PTE_W);
-                            parent_pt.entries[idx] = new_parent_entry;
-                            flags &= !PTE_W;
+                            // Set COW marker, clear write in parent
+                            let new_flags = (flags & !PTE_W) | PTE_COW;
+                            parent_pt.entries[idx] = ((pa >> 12) << 10) | (new_flags & 0x3FF) | PTE_V;
+                            flags = new_flags;
                         }
                         // Increment refcount for shared page
                         pmm::incr_ref(pa);
@@ -382,7 +386,7 @@ pub fn clone_user_space(parent_root_pa: usize, child_root_pa: usize) -> Result<(
                     }
                 }
 
-                child_pt.entries[idx] = (pa >> 12) << 10 | (flags & 0x3FF) | PTE_V;
+                child_pt.entries[idx] = ((pa >> 12) << 10) | (flags & 0x3FF) | PTE_V;
             }
         }
         Ok(())
@@ -454,12 +458,12 @@ pub fn handle_store_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'
     let pa = (entry >> 10) << 12;
     let flags = entry & 0x3FF;
 
-    // If page is user and not writable, perform COW
-    if (flags & PTE_U) != 0 && (flags & PTE_W) == 0 {
+    // COW if page has PTE_COW marker (set by fork).
+    if (flags & PTE_COW) != 0 {
         if !crate::mm::pmm::is_managed_page(pa) {
             return Err("Cannot COW an unmanaged physical page (e.g., MMIO)");
         }
-        
+
         // Allocate a new page and copy contents
         let new_frame = pmm::alloc_frame().ok_or("OOM in COW")?;
         let new_pa = new_frame.pa();
@@ -470,9 +474,9 @@ pub fn handle_store_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'
             core::ptr::copy_nonoverlapping(pa as *const u8, new_pa as *mut u8, pmm::PAGE_SIZE);
         }
 
-        // Update PTE to point to new page with write enabled
-        let new_entry = ((new_pa >> 12) << 10) | (flags | PTE_W) | PTE_V;
-        pt.entries[vpn[0]] = new_entry;
+        // Update PTE: clear COW marker, set writable
+        let new_flags = (flags & !PTE_COW) | PTE_W;
+        pt.entries[vpn[0]] = ((new_pa >> 12) << 10) | (new_flags & 0x3FF) | PTE_V;
         new_frame.into_raw(); // ownership transferred to PTE
 
         pmm::decr_ref_and_maybe_free(pa);
@@ -484,7 +488,9 @@ pub fn handle_store_page_fault(root_pa: usize, fault_va: usize) -> Result<(), &'
 
         Ok(())
     } else {
-        Err("not a COW candidate")
+        // Read-only user page without PTE_COW → genuinely read-only (e.g. .rodata).
+        // Return error so the caller can raise SIGSEGV.
+        Err("write to read-only page (not COW)")
     }
 }
 
@@ -788,9 +794,41 @@ fn setup_kernel_memory_protection(root: &mut PageTable) -> Result<(), &'static s
     let stack_start  = core::ptr::addr_of!(_stack_start)     as usize;
     let stack_end    = core::ptr::addr_of!(_stack_end)       as usize;
 
-    // L2[0]: 0–1 GB identity map as a 1 GB superpage, R+W only.
+    // L2[0]: 0–1 GB identity map with NULL-guard page.
+    // The first 4 KB (VA 0x0000–0x0FFF) is deliberately left unmapped so that
+    // a NULL pointer dereference in the kernel triggers a page fault instead of
+    // silently accessing physical memory at PA 0.
     // Covers UART (0x1000_0000), PLIC, VirtIO, etc. MMIO must not be executable.
-    root.entries[0] = PTE_V | PTE_R | PTE_W; // ppn=0 → PA 0x0000_0000
+    {
+        // L1 page table covering the 0–1 GB window.
+        let l1_frame = alloc_frame().ok_or("OOM for L1 identity-map table")?;
+        let l1_pa = l1_frame.pa();
+        unsafe { core::ptr::write_bytes(l1_pa as *mut u8, 0, 4096); }
+        let l1 = unsafe { &mut *(l1_pa as *mut PageTable) };
+
+        // First 2 MB region (VA 0x0–0x1F_FFFF): 4 KB granularity.
+        let l0_frame = alloc_frame().ok_or("OOM for L0 identity-map table")?;
+        let l0_pa = l0_frame.pa();
+        unsafe { core::ptr::write_bytes(l0_pa as *mut u8, 0, 4096); }
+        let l0 = unsafe { &mut *(l0_pa as *mut PageTable) };
+
+        // l0[0] = 0 → unmapped (NULL guard page, catches kernel NULL derefs)
+        for i in 1..512 {
+            let pa = i * 4096;
+            l0.entries[i] = (pa >> 12) << 10 | PTE_V | PTE_R | PTE_W;
+        }
+        l1.entries[0] = (l0_pa >> 12) << 10 | PTE_V;
+
+        // Remaining 511 × 2 MB as 2 MB megapages.
+        for i in 1..512 {
+            let pa = i * 0x20_0000;
+            l1.entries[i] = (pa >> 12) << 10 | PTE_V | PTE_R | PTE_W;
+        }
+
+        root.entries[0] = (l1_pa >> 12) << 10 | PTE_V;
+        l1_frame.into_raw();
+        l0_frame.into_raw();
+    }
 
     // L2[1] and L2[3]: no physical memory on QEMU virt — leave invalid (0).
 
@@ -837,6 +875,20 @@ fn setup_kernel_memory_protection(root: &mut PageTable) -> Result<(), &'static s
     // Phase C: remainder of RAM (heap, PMM free-list pages, process page tables).
     // Round stack_end up to the next 2 MB boundary for megapage alignment.
     let heap_base = (stack_end + MEGAPAGE - 1) & !(MEGAPAGE - 1);
+
+    // Bridge: 4 KB pages from stack_end to heap_base.
+    // This partial 2 MB block contains PMM free-list pages.  Without this
+    // mapping the first alloc_frame() after paging is enabled would fault
+    // trying to read the free-list next-pointer through an unmapped address.
+    // The L0 table for this VPN[1] region was already allocated by phase B
+    // (kernel sections share the same 2 MB VPN[1] slot), so no new PMM pages
+    // are consumed here.
+    let mut pa = stack_end;
+    while pa < heap_base {
+        root.map_page(pa, pa, PTE_R | PTE_W)?;
+        pa += PAGE_SIZE;
+    }
+
     let mut pa = heap_base;
     while pa < GB3 {
         root.map_megapage(pa, pa, PTE_R | PTE_W)?;

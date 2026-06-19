@@ -150,6 +150,14 @@ pub const EMFILE: usize = usize::MAX - 23; // -24
 /// **POSIX name**: `ENOSYS` (38)
 pub const ENOSYS: usize = usize::MAX - 37; // -38
 
+/// Illegal seek (ESPIPE).
+///
+/// Returned when `lseek` is called on a file descriptor that does not support
+/// seeking (e.g., a pipe, FIFO, or TTY).
+///
+/// **POSIX name**: `ESPIPE` (29)
+pub const ESPIPE: usize = usize::MAX - 28; // -29
+
 /// File exists.
 ///
 /// Returned when an attempt is made to create a file or object that already

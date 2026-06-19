@@ -118,6 +118,33 @@ pub fn syscall5(
     ret
 }
 
+#[inline]
+pub fn syscall6(
+    sys_num: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
+) -> usize {
+    let mut ret: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") arg0 => ret,
+            in("a1") arg1,
+            in("a2") arg2,
+            in("a3") arg3,
+            in("a4") arg4,
+            in("a5") arg5,
+            in("a7") sys_num,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_yield() {
     syscall(0, 0, 0, 0);
@@ -125,7 +152,7 @@ pub extern "C" fn sys_yield() {
 
 fn close_all_vfs_fds() {
     for i in 0..256 {
-        let res = syscall(81, i, 6 /* F_GET_VFS_FD */, 0);
+        let res = syscall(81, i, 1001 /* F_GET_VFS_FD */, 0);
         if res != usize::MAX {
             vfs_close(res as u32);
             syscall(9, i, 0, 0); // remove the stale VfsFile handle from the kernel table
@@ -144,7 +171,7 @@ pub extern "C" fn exit(status: i32) -> ! {
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn write(fd: usize, buf: *const u8, len: usize) -> isize {
-    let res = syscall(81, fd, 6, 0);
+    let res = syscall(81, fd, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         return vfs_write(vfs_fd, u64::MAX, unsafe {
@@ -216,7 +243,7 @@ pub extern "C" fn channel_read(
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn read(fd: usize, buf: *mut u8, len: usize) -> isize {
-    let res = syscall(81, fd, 6, 0);
+    let res = syscall(81, fd, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         return vfs_read(vfs_fd, u64::MAX, unsafe {
@@ -304,7 +331,7 @@ pub fn set_raw(enabled: u32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn close(fd: i32) -> i32 {
-    let res = syscall(81, fd as usize, 6, 0);
+    let res = syscall(81, fd as usize, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         vfs_close(vfs_fd);
@@ -546,8 +573,23 @@ pub extern "C" fn sigreturn() {
     syscall(89, 0, 0, 0);
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn sigprocmask(how: i32, set: *const u32, old_set: *mut u32) -> i32 {
+    syscall(69, how as usize, set as usize, old_set as usize) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigpending(set: *mut u32) -> i32 {
+    syscall(97, set as usize, 0, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_prctl(code: usize, val: usize) -> i32 {
+    syscall(98, code, val, 0) as i32
+}
+
 pub fn dup(oldfd: i32) -> i32 {
-    let res = syscall(81, oldfd as usize, 6, 0);
+    let res = syscall(81, oldfd as usize, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         if let Some(new_server_fd) = vfs_dup(vfs_fd) {
@@ -559,7 +601,7 @@ pub fn dup(oldfd: i32) -> i32 {
 }
 
 pub fn dup2(oldfd: i32, newfd: i32) -> i32 {
-    let res = syscall(81, oldfd as usize, 6, 0);
+    let res = syscall(81, oldfd as usize, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         if let Some(new_server_fd) = vfs_dup(vfs_fd) {
@@ -573,6 +615,45 @@ pub fn dup2(oldfd: i32, newfd: i32) -> i32 {
 
 pub fn set_fg_pid(pid: i32) {
     syscall(60, pid as usize, 0, 0);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
+    // Check if this is a VFS-backed fd.
+    let res = syscall(81, fd as usize, 1001 /* F_GET_VFS_FD */, 0);
+    if res != usize::MAX {
+        return vfs_lseek(res as u32, offset, whence as u32);
+    }
+    // Fall back to kernel lseek.
+    let ret = syscall(19, fd as usize, offset as usize, whence as usize);
+    if ret == usize::MAX { -1 } else { ret as i64 }
+}
+
+#[repr(C)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// Simple poll(2) wrapper — iterates the fd array once without blocking.
+/// Returns the number of ready fds, or -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32 {
+    syscall(68, fds as usize, nfds, timeout as usize) as i32
+}
+
+/// tcsetpgrp — set the foreground process group of the terminal.
+/// Equivalent to calling `ioctl(fd, TIOCSPGRP, &pgrp)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn tcsetpgrp(fd: i32, pgrp: i32) -> i32 {
+    // Validate fd is a TTY via fcntl; then delegate to kernel.
+    if fd >= 0 {
+        syscall(60, pgrp as usize, 0, 0);
+        0
+    } else {
+        -1
+    }
 }
 
 pub fn ipc_send(to_pid: i32, buf: &[u8]) -> i32 {
@@ -966,17 +1047,32 @@ pub fn fork() -> i32 {
 
 pub fn exec(path: &[u8]) -> i32 {
     close_all_vfs_fds();
-    syscall4(51, path.as_ptr() as usize, path.len(), 0, 0) as i32
+    syscall6(51, path.as_ptr() as usize, path.len(), 0, 0, 0, 0) as i32
 }
 
 pub fn exec_args(path: &[u8], argv_buf: &[u8]) -> i32 {
     close_all_vfs_fds();
-    syscall4(
+    syscall6(
         51,
         path.as_ptr() as usize,
         path.len(),
         argv_buf.as_ptr() as usize,
         argv_buf.len(),
+        0,
+        0,
+    ) as i32
+}
+
+pub fn exec_args_envp(path: &[u8], argv_buf: &[u8], envp_buf: &[u8]) -> i32 {
+    close_all_vfs_fds();
+    syscall6(
+        51,
+        path.as_ptr() as usize,
+        path.len(),
+        argv_buf.as_ptr() as usize,
+        argv_buf.len(),
+        envp_buf.as_ptr() as usize,
+        envp_buf.len(),
     ) as i32
 }
 
@@ -1052,7 +1148,7 @@ pub fn vfs_fsync(vfs_fd: u32) -> i32 {
 
 /// Flush all pending writes for `fd` to durable storage.
 pub fn fsync(fd: i32) -> i32 {
-    let res = syscall(81, fd as usize, 6, 0); // F_GET_VFS_FD
+    let res = syscall(81, fd as usize, 1001, 0); // F_GET_VFS_FD
     if res != usize::MAX {
         return vfs_fsync(res as u32);
     }

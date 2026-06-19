@@ -22,7 +22,7 @@ QEMU_DISK   = -drive id=disk0,file=$(DISK_IMG),format=raw,if=none -device virtio
 
 .PHONY: help build build-kernel build-user build-release build-relibc initrd \
         run all debug image image-release disk                                \
-        clean clean-user check clippy fmt                                     \
+        clean clean-all clean-user check clippy fmt                           \
         $(BINS:%=test_root/%)
 
 help:
@@ -39,9 +39,9 @@ help:
 	@echo '  initrd             Package initrd from already-built userspace bins'
 	@echo ''
 	@echo 'Run'
-	@echo '  run                Boot in QEMU (assumes already built)'
+	@echo '  run                Boot in QEMU (creates disk.img if absent)'
 	@echo '  all                Build + run'
-	@echo '  debug              Build + run with GDB server (-s -S)'
+	@echo '  debug              Boot with GDB server on :1234 (-s -S)'
 	@echo ''
 	@echo 'Release'
 	@echo '  build-release      $(KERNEL_REL) + release userspace + initrd'
@@ -54,7 +54,8 @@ help:
 	@echo '  fmt                cargo fmt (kernel + userspace)'
 	@echo ''
 	@echo 'Clean'
-	@echo '  clean              Remove kernel and user artifacts + image'
+	@echo '  clean              Remove build artifacts (preserves disk.img OFS data)'
+	@echo '  clean-all          Remove everything including disk.img'
 	@echo '  clean-user         Remove userspace build artifacts only'
 	@echo ''
 	@echo 'Variables'
@@ -64,7 +65,7 @@ help:
 
 # ── Default ────────────────────────────────────────────────────────────────────
 
-all: build disk run
+all: build run
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 
@@ -115,27 +116,21 @@ $(DISK_IMG):
 	dd if=/dev/zero of=$(DISK_IMG) bs=1M count=$(DISK_SIZE_MB) 2>/dev/null
 	@echo '  disk   : $(DISK_IMG) ($(DISK_SIZE_MB) MB)'
 
-run: $(KERNEL) $(INITRD)
+run: $(KERNEL) $(INITRD) $(DISK_IMG)
+	@pkill -f 'qemu-system-riscv64' 2>/dev/null || true
 	@echo 'Booting openv...'
 	@echo '  kernel : $(KERNEL)'
 	@echo '  initrd : $(INITRD)'
+	@echo '  disk   : $(DISK_IMG) (persistent OFS)'
 	@echo '  memory : $(QEMU_MEM)'
 	@echo '  (Ctrl-A X to quit QEMU)'
 	@echo ''
-	@if [ -f $(DISK_IMG) ]; then \
-	  echo '  disk   : $(DISK_IMG) (persistent OFS)'; \
-	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK); \
-	else \
-	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL); \
-	fi
+	qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK)
 
-debug: $(KERNEL) $(INITRD)
+debug: $(KERNEL) $(INITRD) $(DISK_IMG)
+	@pkill -f 'qemu-system-riscv64' 2>/dev/null || true
 	@echo 'Booting openv with GDB server on :1234...'
-	@if [ -f $(DISK_IMG) ]; then \
-	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK) -s -S; \
-	else \
-	  qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) -s -S; \
-	fi
+	qemu-system-riscv64 $(QEMU_FLAGS) $(QEMU_NET) -initrd $(INITRD) -kernel $(KERNEL) $(QEMU_DISK) -s -S
 
 # ── Disk image ─────────────────────────────────────────────────────────────────
 
@@ -186,9 +181,12 @@ fmt:
 # ── Clean ──────────────────────────────────────────────────────────────────────
 
 clean:
-	rm -rf openv.img openv.bin $(DISK_IMG)
+	rm -rf openv.img openv.bin
 	cd user && $(CARGO) clean
 	$(CARGO) clean
+
+clean-all: clean
+	rm -f $(DISK_IMG)
 
 clean-user:
 	cd user && $(CARGO) clean

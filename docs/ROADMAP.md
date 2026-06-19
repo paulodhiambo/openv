@@ -48,9 +48,16 @@ This document tracks what has been implemented, what is in progress, and what is
 
 *Fix known correctness issues and prepare for multi-user workloads.*
 
-- [ ] Fix data races: `ppid` and `satp_val` via atomic types (see CONTRIBUTING §11)
+- [x] Split `trap.rs` God File into `syscall/` subsystem modules
+- [x] Priority-based scheduler (`BTreeMap<u8, VecDeque<Pid>>`) — replaces FIFO round-robin
+- [x] No priority inheritance on spawn — children always start at `PRIO_NORMAL`, preventing PRIO_HIGH servers from starving user processes via driver children
+- [x] ELF loader zeros BSS pages — pages previously kept PMM poison (0xcd), corrupting zero-initialised statics in any newly spawned process
+- [x] libos `F_GET_VFS_FD` constant fixed (`1001` not `6`/`F_SETLK`) — all `write`/`read`/`close` calls to kernel TTY fds were silently failing
+- [x] PLIC UART IRQ 10 enabled in `kmain` — UART external interrupts were never enabled, keyboard input only worked via timer-ISR polling
+- [x] `BOOT_HARTID` tracking — UART polling and timer ISR now use the actual boot HART ID instead of hardcoded HART 0
+- [x] virtio-blk device and OFS persistent filesystem fully operational — `make run` auto-creates `disk.img`; OFS auto-formats blank disk on first boot
+- [ ] Fix data races: `ppid` and `satp_val` via atomic types
 - [ ] Fix PMM `static mut` free-list — wrap in `Mutex`
-- [ ] Split `trap.rs` God File into `syscall/` subsystem modules
 - [ ] Per-session TTY line discipline buffer (not global)
 - [ ] Named errno constants for all error returns
 - [ ] Full preemptive context switch at timer interrupt (not just re-queue)
