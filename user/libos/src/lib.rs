@@ -203,6 +203,7 @@ pub extern "C" fn channel_write(
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn channel_read(
     fd: usize,
     buf: *mut u8,
@@ -1271,6 +1272,7 @@ pub extern "C" fn port_bind(
 pub const JOB_POLICY_MAX_MEMORY: u32 = 1;
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn job_create(
     parent_job_handle: u32,
     options: u32,
@@ -1299,6 +1301,7 @@ pub const RIGHTS_DUPLICATE: u32 = 1 << 2;
 pub const RIGHTS_TRANSFER: u32 = 1 << 3;
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn handle_duplicate(handle: u32, rights: u32, out_handle: *mut u32) -> i32 {
     let ret = syscall(76, handle as usize, rights as usize, 0);
     if ret >= (usize::MAX - 200) {

@@ -260,6 +260,10 @@ pub unsafe fn syscall0(n: usize) -> usize {
 /// Perform a syscall with 1 argument.
 ///
 /// Argument layout: `a0 = arg0`.
+///
+/// # Safety
+///
+/// `n` must be a valid syscall number and `arg0` must be a valid argument for it.
 #[inline]
 pub unsafe fn syscall1(n: usize, arg0: usize) -> usize {
     let ret: usize;
@@ -272,6 +276,10 @@ pub unsafe fn syscall1(n: usize, arg0: usize) -> usize {
 /// Perform a syscall with 2 arguments.
 ///
 /// Argument layout: `a0 = arg0`, `a1 = arg1`.
+///
+/// # Safety
+///
+/// `n` must be a valid syscall number and all arguments must be valid for it.
 #[inline]
 pub unsafe fn syscall2(n: usize, arg0: usize, arg1: usize) -> usize {
     let ret: usize;
@@ -284,6 +292,10 @@ pub unsafe fn syscall2(n: usize, arg0: usize, arg1: usize) -> usize {
 /// Perform a syscall with 3 arguments.
 ///
 /// Argument layout: `a0 = arg0`, `a1 = arg1`, `a2 = arg2`.
+///
+/// # Safety
+///
+/// `n` must be a valid syscall number and all arguments must be valid for it.
 #[inline]
 pub unsafe fn syscall3(n: usize, arg0: usize, arg1: usize, arg2: usize) -> usize {
     let ret: usize;
@@ -296,6 +308,10 @@ pub unsafe fn syscall3(n: usize, arg0: usize, arg1: usize, arg2: usize) -> usize
 /// Perform a syscall with 4 arguments.
 ///
 /// Argument layout: `a0 = arg0`, `a1 = arg1`, `a2 = arg2`, `a3 = arg3`.
+///
+/// # Safety
+///
+/// `n` must be a valid syscall number and all arguments must be valid for it.
 #[inline]
 pub unsafe fn syscall4(n: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> usize {
     let ret: usize;
@@ -309,6 +325,10 @@ pub unsafe fn syscall4(n: usize, arg0: usize, arg1: usize, arg2: usize, arg3: us
 ///
 /// Argument layout: `a0 = arg0`, `a1 = arg1`, `a2 = arg2`, `a3 = arg3`,
 /// `a4 = arg4`.
+///
+/// # Safety
+///
+/// `n` must be a valid syscall number and all arguments must be valid for it.
 #[inline]
 pub unsafe fn syscall5(n: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usize) -> usize {
     let ret: usize;
@@ -322,6 +342,10 @@ pub unsafe fn syscall5(n: usize, arg0: usize, arg1: usize, arg2: usize, arg3: us
 ///
 /// Argument layout: `a0 = arg0`, `a1 = arg1`, `a2 = arg2`, `a3 = arg3`,
 /// `a4 = arg4`, `a5 = arg5`.
+///
+/// # Safety
+///
+/// `n` must be a valid syscall number and all arguments must be valid for it.
 #[inline]
 pub unsafe fn syscall6(n: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usize, arg5: usize) -> usize {
     let ret: usize;
