@@ -30,10 +30,9 @@ unsafe extern "C" {
 /// If the run queue is non-empty, the current process is pushed to
 /// the back and [`crate::posix::process::schedule`] is called.
 pub fn sys_yield(_tf: &mut TrapFrame) {
-    let mut rq = crate::posix::process::RUN_QUEUE.lock();
-    if !rq.is_empty() {
-        rq.push_back(crate::posix::process::current_pid());
-        drop(rq);
+    let is_empty = crate::posix::process::RUN_QUEUE.lock().is_empty();
+    if !is_empty {
+        crate::posix::process::enqueue(crate::posix::process::current_pid());
         crate::posix::process::schedule();
         unsafe { __halt_cpu() }
     }
@@ -62,6 +61,10 @@ pub fn sys_exit(status: usize, _tf: &mut TrapFrame) {
 ///
 /// The new child's PID on success, `usize::MAX` on failure.
 pub fn sys_spawn(path_ptr: usize, path_len: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, path_ptr as *const u8, path_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let path_bytes = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, path_len) };
     if let Ok(path) = core::str::from_utf8(path_bytes) {
         match crate::posix::spawn::posix_spawn(path, crate::posix::process::current_pid()) {
@@ -88,6 +91,10 @@ pub fn sys_spawn_with_caps(path_ptr: usize, path_len: usize, caps: u64, tf: &mut
         }
     } else {
         tf.regs[10] = crate::errno::ESRCH;
+        return;
+    }
+    if !crate::mm::vmm::is_user_pointer_valid(tf, path_ptr as *const u8, path_len) {
+        tf.regs[10] = crate::errno::EFAULT;
         return;
     }
 
@@ -143,7 +150,8 @@ pub fn sys_privctl(pid: usize, caps: u64, tf: &mut TrapFrame) {
 /// Requires `CAP_INTERRUPT`.
 pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_INTERRUPT == 0 {
+        let caps = proc.caps.load(core::sync::atomic::Ordering::Relaxed);
+        if caps & (crate::posix::process::CAP_INTERRUPT | crate::posix::process::CAP_DRIVER) == 0 {
             tf.regs[10] = crate::errno::EPERM;
             return;
         }
@@ -151,7 +159,7 @@ pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         tf.regs[10] = crate::errno::ESRCH;
         return;
     }
-    
+
     let irq = arg0 as u32;
     let pid = arg1 as i32;
     crate::trap::interrupt::IRQ_HANDLERS.lock().insert(irq, pid);
@@ -160,10 +168,11 @@ pub fn sys_irq_register(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 
 /// Re-enables an IRQ at the PLIC for the current HART.
 ///
-/// Requires `CAP_INTERRUPT`.
+/// Requires `CAP_INTERRUPT` or `CAP_DRIVER`.
 pub fn sys_irq_enable(arg0: usize, tf: &mut TrapFrame) {
     if let Some(proc) = crate::posix::process::get_current_proc() {
-        if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_INTERRUPT == 0 {
+        let caps = proc.caps.load(core::sync::atomic::Ordering::Relaxed);
+        if caps & (crate::posix::process::CAP_INTERRUPT | crate::posix::process::CAP_DRIVER) == 0 {
             tf.regs[10] = crate::errno::EPERM;
             return;
         }
@@ -203,31 +212,67 @@ pub fn sys_fork(tf: &mut TrapFrame) {
 /// `(argc, argv_ptr, new_sp)` where `argv_ptr` is the address of the
 /// pointer array and `new_sp` is the new stack pointer (with 16-byte
 /// alignment and 16 bytes of extra slack).
-fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
+/// Auxiliary vector types for ELF executables.
+const AT_NULL: usize = 0;
+const AT_PHDR: usize = 3;
+const AT_PHENT: usize = 4;
+const AT_PHNUM: usize = 5;
+const AT_PAGESZ: usize = 6;
+const AT_BASE: usize = 7;
+const AT_ENTRY: usize = 9;
+const AT_UID: usize = 11;
+const AT_EUID: usize = 12;
+const AT_GID: usize = 13;
+const AT_EGID: usize = 14;
+const AT_SECURE: usize = 23;
+const AT_RANDOM: usize = 25;
+
+fn setup_exec_stack(
+    argv_data: &[u8],
+    envp_data: &[u8],
+    elf_info: &crate::posix::elf::ElfLoadInfo,
+) -> (usize, usize, usize, usize) {
     use crate::posix::spawn::USER_STACK_TOP;
 
-    let mut args: Vec<&[u8]> = Vec::new();
-    let mut start = 0usize;
-    for (i, &b) in argv_data.iter().enumerate() {
-        if b == 0 {
-            if i > start {
-                args.push(&argv_data[start..i]);
+    let args = {
+        let mut entries: Vec<&[u8]> = Vec::new();
+        let mut start = 0usize;
+        for (i, &b) in argv_data.iter().enumerate() {
+            if b == 0 {
+                if i > start {
+                    entries.push(&argv_data[start..i]);
+                }
+                start = i + 1;
             }
-            start = i + 1;
         }
-    }
-    if start < argv_data.len() {
-        args.push(&argv_data[start..]);
-    }
+        if start < argv_data.len() {
+            entries.push(&argv_data[start..]);
+        }
+        entries
+    };
+    let envp = {
+        let mut entries: Vec<&[u8]> = Vec::new();
+        let mut start = 0usize;
+        for (i, &b) in envp_data.iter().enumerate() {
+            if b == 0 {
+                if i > start {
+                    entries.push(&envp_data[start..i]);
+                }
+                start = i + 1;
+            }
+        }
+        if start < envp_data.len() {
+            entries.push(&envp_data[start..]);
+        }
+        entries
+    };
 
     let argc = args.len();
-    if argc == 0 {
-        return (0, 0, USER_STACK_TOP);
-    }
 
     let mut sp = USER_STACK_TOP;
-    let mut string_addrs: Vec<usize> = Vec::new();
 
+    // Push argv strings
+    let mut string_addrs: Vec<usize> = Vec::new();
     for arg in &args {
         let len = arg.len() + 1;
         sp -= len;
@@ -239,6 +284,19 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
         string_addrs.push(sp);
     }
 
+    // Push envp strings
+    let mut envp_addrs: Vec<usize> = Vec::new();
+    for entry in &envp {
+        let len = entry.len() + 1;
+        sp -= len;
+        unsafe {
+            let dst = core::slice::from_raw_parts_mut(sp as *mut u8, len);
+            dst[..entry.len()].copy_from_slice(entry);
+            dst[entry.len()] = 0;
+        }
+        envp_addrs.push(sp);
+    }
+
     sp &= !7;
     sp -= 8;
     unsafe { *(sp as *mut usize) = 0; }
@@ -246,11 +304,54 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
         sp -= 8;
         unsafe { *(sp as *mut usize) = addr; }
     }
-
     let argv_ptr = sp;
+
+    sp -= 8;
+    unsafe { *(sp as *mut usize) = 0; }
+    for &addr in envp_addrs.iter().rev() {
+        sp -= 8;
+        unsafe { *(sp as *mut usize) = addr; }
+    }
+    let envp_ptr = sp;
+
+    // Push 16 random bytes for AT_RANDOM
+    sp -= 16;
+    let random_va = sp;
+    unsafe {
+        // Simple non-cryptographic random from the cycle counter
+        let cycle: usize = riscv::register::cycle::read();
+        let dst = core::slice::from_raw_parts_mut(sp as *mut u8, 16);
+        for j in 0..4 {
+            let val = cycle.wrapping_mul(6364136223846793005usize.wrapping_add(j));
+            dst[j * 4..(j + 1) * 4].copy_from_slice(&(val as u32).to_ne_bytes());
+        }
+    }
+
+    // Push auxv pairs: type, value, type, value, ..., AT_NULL, 0
+    let mut push_aux = |type_: usize, val: usize| {
+        sp -= 8;
+        unsafe { *(sp as *mut usize) = val; }
+        sp -= 8;
+        unsafe { *(sp as *mut usize) = type_; }
+    };
+    push_aux(AT_PHDR, elf_info.phdr_va);
+    push_aux(AT_PHENT, elf_info.phentsize);
+    push_aux(AT_PHNUM, elf_info.phnum);
+    push_aux(AT_PAGESZ, 4096);
+    push_aux(AT_BASE, 0); // no ld.so
+    push_aux(AT_ENTRY, elf_info.entry);
+    push_aux(AT_UID, 0);
+    push_aux(AT_EUID, 0);
+    push_aux(AT_GID, 0);
+    push_aux(AT_EGID, 0);
+    push_aux(AT_SECURE, 0);
+    push_aux(AT_RANDOM, random_va);
+    push_aux(AT_NULL, 0);
+
+    // 16-byte alignment
     sp = (sp - 16) & !15;
 
-    (argc, argv_ptr, sp)
+    (argc, argv_ptr, envp_ptr, sp)
 }
 
 /// Replaces the current process image with a new executable.
@@ -266,8 +367,28 @@ fn setup_exec_stack(argv_data: &[u8]) -> (usize, usize, usize) {
 /// * `arg2` (`a2`) - Pointer to a NUL-separated argv buffer.
 /// * `arg3` (`a3`) - Argv buffer length (in `tf.regs[13]`).
 /// * `tf` - Caller's trap frame.
-pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: usize, tf: &mut TrapFrame) {
-    let argv_buf_len = tf.regs[13]; // a3
+pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, argv_buf_len: usize, tf: &mut TrapFrame) {
+    if !crate::mm::vmm::is_user_pointer_valid(tf, path_ptr as *const u8, path_len) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    // argv_buf_ptr/length come from a2/a3 (arg2/arg3 in dispatch).
+    if argv_buf_len > 0 && argv_buf_ptr != 0 {
+        if !crate::mm::vmm::is_user_pointer_valid(tf, argv_buf_ptr as *const u8, argv_buf_len) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
+    }
+
+    // envp_buf_ptr/length come from a4/a5 (regs[14]/regs[15]).
+    let envp_buf_ptr = tf.regs[14]; // a4
+    let envp_buf_len = tf.regs[15]; // a5
+    if envp_buf_len > 0 && envp_buf_ptr != 0 {
+        if !crate::mm::vmm::is_user_pointer_valid(tf, envp_buf_ptr as *const u8, envp_buf_len) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
+    }
 
     let argv_data: Vec<u8> = if argv_buf_len > 0 && argv_buf_ptr != 0 {
         unsafe { core::slice::from_raw_parts(argv_buf_ptr as *const u8, argv_buf_len).to_vec() }
@@ -275,8 +396,15 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
         Vec::new()
     };
 
+    let envp_data: Vec<u8> = if envp_buf_len > 0 && envp_buf_ptr != 0 {
+        unsafe { core::slice::from_raw_parts(envp_buf_ptr as *const u8, envp_buf_len).to_vec() }
+    } else {
+        Vec::new()
+    };
+
     match unsafe { crate::posix::spawn::sys_exec(path_ptr as *const u8, path_len) } {
-        Ok(entry_point) => {
+        Ok(ref elf_info) => {
+            let entry_point = elf_info.entry;
             let pid = crate::posix::process::current_pid();
 
             {
@@ -298,7 +426,7 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
                 }
             }
 
-            let (argc, argv_ptr, new_sp) = setup_exec_stack(&argv_data);
+            let (argc, argv_ptr, envp_ptr, new_sp) = setup_exec_stack(&argv_data, &envp_data, elf_info);
 
             let new_satp = crate::posix::process::PROCESS_TABLE
                 .lock()
@@ -314,6 +442,7 @@ pub fn sys_exec(path_ptr: usize, path_len: usize, argv_buf_ptr: usize, _dummy: u
             tf.regs[2] = new_sp;
             tf.regs[10] = argc;
             tf.regs[11] = argv_ptr;
+            tf.regs[12] = envp_ptr;
             tf.sstatus = (1 << 5) | (1 << 18);
             // execution will return to U-mode from the trap handler with the new context
         }
@@ -392,6 +521,10 @@ fn reap_zombie(
 /// The reaped PID on success, 0 if `WNOHANG` and no child is ready,
 /// or `-1` (`ECHILD`) if there are no matching children.
 pub fn sys_waitpid(target: usize, status_ptr: usize, options: usize, tf: &mut TrapFrame) {
+    if status_ptr != 0 && !crate::mm::vmm::is_user_pointer_valid(tf, status_ptr as *const i32, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let target = target as i32;
     let status_ptr = status_ptr as *mut i32;
     let ppid = crate::posix::process::current_pid();
@@ -545,8 +678,7 @@ pub fn sys_getpid(tf: &mut TrapFrame) {
 
 /// Returns the parent PID of the current process.
 pub fn sys_getppid(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     tf.regs[10] = proc.ppid.load(Ordering::Relaxed) as usize;
 }
 
@@ -591,6 +723,10 @@ pub struct TimeSpec {
 /// Returns the current time in CLINT ticks, converted to
 /// seconds/microseconds. The CLINT clock is 10 MHz.
 pub fn sys_gettimeofday(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
+    if arg0 != 0 && !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const TimeVal, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     // CLINT clock is 10 MHz: 10,000,000 ticks per second
     let ticks = riscv::register::time::read() as u64;
     let sec = ticks / 10_000_000;
@@ -610,8 +746,8 @@ pub fn sys_gettimeofday(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
 /// The current process is marked `Stopped` and the next process
 /// is scheduled.
 pub fn sys_nanosleep(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
-    if arg0 == 0 {
-        tf.regs[10] = usize::MAX;
+    if arg0 == 0 || !crate::mm::vmm::is_user_pointer_valid(tf, arg0 as *const TimeSpec, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
         return;
     }
     let req = unsafe { &*(arg0 as *const TimeSpec) };
@@ -646,8 +782,7 @@ pub fn sys_nanosleep(arg0: usize, _arg1: usize, tf: &mut TrapFrame) {
 pub fn sys_setpgid(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let mut pid = arg0 as i32;
     let mut pgid = arg1 as i32;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if pid == 0 {
         pid = proc.pid;
     }
@@ -666,8 +801,7 @@ pub fn sys_setpgid(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
 /// Returns the process group ID of the current process.
 pub fn sys_getpgid(arg0: usize, tf: &mut TrapFrame) {
     let mut pid = arg0 as i32;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     if pid == 0 {
         pid = proc.pid;
     }
@@ -681,8 +815,7 @@ pub fn sys_getpgid(arg0: usize, tf: &mut TrapFrame) {
 /// Creates a new session with the current process as the leader
 /// and allocates a fresh TTY for the new session.
 pub fn sys_setsid(tf: &mut TrapFrame) {
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let pid = proc.pid;
     proc.pgid.store(pid, core::sync::atomic::Ordering::Relaxed);
     proc.sid.store(pid, core::sync::atomic::Ordering::Relaxed);
@@ -726,6 +859,20 @@ pub const SIGKILL: usize = 9;
 pub const SIGINT: usize = 2;
 /// `SIGTERM` signal number (15) — termination request.
 pub const SIGTERM: usize = 15;
+/// `SIGPIPE` signal number (13) — write to closed pipe/socket.
+pub const SIGPIPE: usize = 13;
+/// `SIGCHLD` signal number (17) — child terminated/stopped/continued.
+pub const SIGCHLD: usize = 17;
+/// `SIGCONT` signal number (18) — continue if stopped.
+pub const SIGCONT: usize = 18;
+/// `SIGSTOP` signal number (19) — stop (cannot be caught/ignored).
+pub const SIGSTOP: usize = 19;
+/// `SIGTSTP` signal number (20) — terminal stop (Ctrl-Z).
+pub const SIGTSTP: usize = 20;
+/// `SIGTTIN` signal number (21) — background read on controlling TTY.
+pub const SIGTTIN: usize = 21;
+/// `SIGTTOU` signal number (22) — background write on controlling TTY.
+pub const SIGTTOU: usize = 22;
 
 /// Sends a signal to a process or process group.
 ///
@@ -737,40 +884,109 @@ pub const SIGTERM: usize = 15;
 /// * `arg1` (`a1`) - Signal number (0..31). `0` is a permission
 ///   check that does not actually deliver.
 /// * `tf` - Caller's trap frame.
+///
+/// Wake a Stopped process with EINTR so a pending signal is delivered on the
+/// next return-to-user-space.  Must be called while PROCESS_TABLE is held.
+///
+/// If the process is blocked in a rendezvous-IPC send, it is also removed from
+/// the target's senders queue so the target never tries to deliver to it.
+fn wake_with_eintr(
+    pid: i32,
+    proc: &alloc::sync::Arc<crate::posix::process::Process>,
+    table: &alloc::collections::BTreeMap<i32, alloc::sync::Arc<crate::posix::process::Process>>,
+) {
+    use crate::posix::process::{IpcState, ProcState, enqueue_with_prio};
+
+    if !matches!(*proc.state.lock(), ProcState::Stopped) {
+        return;
+    }
+
+    // If the process is mid-send, pull it out of the target's senders queue so
+    // the target won't try to deliver to an IPC state we're about to clear.
+    {
+        let ipc = proc.ipc_state.lock().clone();
+        if let IpcState::Sending { target, .. } = ipc {
+            if let Some(target_proc) = table.get(&target) {
+                target_proc.senders.lock().retain(|&s| s != pid);
+            }
+        }
+        *proc.ipc_state.lock() = IpcState::None;
+    }
+
+    {
+        let mut tf = proc.trap_frame.lock();
+        tf.sepc += 4; // undo the sepc -= 4 that armed the retry
+        tf.regs[10] = crate::errno::EINTR;
+    }
+
+    let mut st = proc.state.lock();
+    *st = ProcState::Running;
+    let prio = proc.priority.load(Ordering::Relaxed);
+    drop(st);
+    enqueue_with_prio(pid, prio);
+}
+
 pub fn sys_kill(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let target_pid = arg0 as i32;
     let sig = arg1 as u32;
-    
+
     if sig >= 32 {
         tf.regs[10] = usize::MAX; // EINVAL
         return;
     }
-    
-    let table = crate::posix::process::PROCESS_TABLE.lock();
-    let current_proc = table.get(&crate::posix::process::current_pid()).unwrap().clone();
-    
+
+    let current_pid = crate::posix::process::current_pid();
+    let mut to_kill: Vec<i32> = Vec::new();
     let mut sent = false;
-    
-    for (pid, proc) in table.iter() {
-        let matches = if target_pid > 0 {
-            *pid == target_pid
-        } else if target_pid == 0 {
-            proc.pgid.load(core::sync::atomic::Ordering::Relaxed) == current_proc.pgid.load(core::sync::atomic::Ordering::Relaxed)
-        } else if target_pid == -1 {
-            *pid > 1 && *pid != current_proc.pid // Broadcast to all except init and self (simplified)
-        } else {
-            proc.pgid.load(core::sync::atomic::Ordering::Relaxed) == -target_pid
-        };
-        
-        if matches {
-            if sig != 0 {
-                proc.pending_signals.fetch_or(1 << sig, core::sync::atomic::Ordering::Relaxed);
+
+    {
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        let current_pgid = table
+            .get(&current_pid)
+            .map(|p| p.pgid.load(Ordering::Relaxed))
+            .unwrap_or(0);
+
+        for (pid, proc) in table.iter() {
+            let matches = if target_pid > 0 {
+                *pid == target_pid
+            } else if target_pid == 0 {
+                proc.pgid.load(Ordering::Relaxed) == current_pgid
+            } else if target_pid == -1 {
+                *pid > 1 && *pid != current_pid
+            } else {
+                proc.pgid.load(Ordering::Relaxed) == -target_pid
+            };
+
+            if matches && sig != 0 {
+                if sig == SIGKILL as u32 {
+                    // SIGKILL is unblockable — collect for direct exit() after lock drop.
+                    to_kill.push(*pid);
+                } else {
+                    proc.pending_signals.fetch_or(1 << sig, Ordering::Relaxed);
+                    // Wake a sleeping process so signal is delivered on next return-to-user.
+                    let blocked = proc.blocked_signals.load(Ordering::Relaxed);
+                    if (1u32 << sig) & !blocked != 0 {
+                        wake_with_eintr(*pid, proc, &table);
+                    }
+                }
+                sent = true;
             }
-            sent = true;
         }
+    } // PROCESS_TABLE released
+
+    // Kill collected SIGKILL targets.  Call exit() with no lock held so it can
+    // acquire PROCESS_TABLE itself.  Handle the self-kill case last.
+    let kill_self = to_kill.contains(&current_pid);
+    for &pid in to_kill.iter().filter(|&&p| p != current_pid) {
+        crate::posix::spawn::exit(pid, -9);
     }
-    
-    if sent {
+    if kill_self {
+        crate::posix::spawn::exit(current_pid, -9);
+        crate::posix::process::schedule();
+        unsafe { __halt_cpu() }
+    }
+
+    if sent || !to_kill.is_empty() {
         tf.regs[10] = 0;
     } else {
         tf.regs[10] = usize::MAX; // ESRCH
@@ -786,9 +1002,15 @@ pub fn sys_sigaction(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
         tf.regs[10] = usize::MAX; // EINVAL
         return;
     }
-    
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    if arg2 != 0 && !crate::mm::vmm::is_user_pointer_valid(tf, arg2 as *const SigAction, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    if arg1 != 0 && !crate::mm::vmm::is_user_pointer_valid(tf, arg1 as *const SigAction, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    let proc = crate::get_current_proc_or_esrch!(tf);
     
     if arg2 != 0 {
         let old_act = unsafe { &mut *(arg2 as *mut SigAction) };
@@ -816,6 +1038,10 @@ pub fn sys_sigaction(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) 
 /// was delivered.
 pub fn sys_sigreturn(tf: &mut TrapFrame) {
     // sp points to the SignalFrame we pushed during signal delivery.
+    if !crate::mm::vmm::is_user_pointer_valid(tf, tf.regs[2] as *const crate::trap::SignalFrame, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
     let frame = unsafe { core::ptr::read(tf.regs[2] as *const crate::trap::SignalFrame) };
 
     // Restore the saved trap frame registers and sepc.  Do not restore
@@ -831,33 +1057,131 @@ pub fn sys_sigreturn(tf: &mut TrapFrame) {
     }
 }
 
+/// Sets or queries the process signal mask (sigprocmask).
+///
+/// # Arguments
+///
+/// * `arg0` - How: `SIG_BLOCK=0`, `SIG_UNBLOCK=1`, `SIG_SETMASK=2`.
+/// * `arg1` - New mask pointer (user-space `*const u32`), or `0` to ignore.
+/// * `arg2` - Old mask pointer (user-space `*mut u32`), or `0` to ignore.
+///
+/// Returns 0 on success.
+pub fn sys_sigprocmask(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
+    let how = arg0;
+    let set_ptr = arg1;
+    let old_set_ptr = arg2;
+
+    let proc = crate::get_current_proc_or_esrch!(tf);
+
+    // Return old mask if requested
+    if old_set_ptr != 0 {
+        if !crate::mm::vmm::is_user_pointer_valid(tf, old_set_ptr as *const u32, 1) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
+        let old_set = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+        unsafe { core::ptr::write(old_set_ptr as *mut u32, old_set); }
+    }
+
+    // Update mask if new set provided
+    if set_ptr != 0 {
+        if !crate::mm::vmm::is_user_pointer_valid(tf, set_ptr as *const u32, 1) {
+            tf.regs[10] = crate::errno::EFAULT;
+            return;
+        }
+        let new_set = unsafe { core::ptr::read(set_ptr as *const u32) };
+        let old_blocked = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+        let updated = match how {
+            0 => old_blocked | new_set,           // SIG_BLOCK
+            1 => old_blocked & !new_set,           // SIG_UNBLOCK
+            2 => new_set,                          // SIG_SETMASK
+            _ => { tf.regs[10] = crate::errno::EINVAL; return; }
+        };
+        // SIGKILL and SIGSTOP are always blocked
+        let mask = updated | (1u32 << crate::syscall::proc::SIGKILL) | (1u32 << crate::syscall::proc::SIGSTOP);
+        proc.blocked_signals.store(mask, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    tf.regs[10] = 0;
+}
+
+/// Returns the set of pending signals that are not blocked (sigpending).
+///
+/// # Arguments
+///
+/// * `arg0` - Output pointer to `u32` mask (user-space `*mut u32`).
+pub fn sys_sigpending(arg0: usize, tf: &mut TrapFrame) {
+    let set_ptr = arg0;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, set_ptr as *const u32, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
+    if let Some(proc) = crate::posix::process::get_current_proc() {
+        let pending = proc.pending_signals.load(core::sync::atomic::Ordering::Relaxed);
+        let blocked = proc.blocked_signals.load(core::sync::atomic::Ordering::Relaxed);
+        let result = pending & !blocked;
+        unsafe { core::ptr::write(set_ptr as *mut u32, result); }
+        tf.regs[10] = 0;
+    } else {
+        tf.regs[10] = crate::errno::ESRCH;
+    }
+}
+
+/// Architecture-specific operations (arch_prctl equivalent).
+///
+/// Currently only supports `ARCH_SET_FS = 0x1002` / `SET_THREAD_AREA = 1`
+/// which sets the thread pointer (tp) register.
+///
+/// # Arguments
+///
+/// * `arg0` - Code: `1` = set thread area (tp = arg1).
+/// * `arg1` - Value (TLS pointer for tp).
+pub fn sys_arch_prctl(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
+    match arg0 {
+        1 => {
+            // SET_THREAD_AREA: tp = arg1
+            tf.regs[4] = arg1;
+            tf.regs[10] = 0;
+        }
+        _ => {
+            tf.regs[10] = crate::errno::EINVAL;
+        }
+    }
+}
+
 // ── Thread support ─────────────────────────────────────────────────────────────
 
 /// `clone` flag: share address space with parent.
-const CLONE_VM:     u32 = 0x0000_0100;
+const CLONE_VM:               u32 = 0x0000_0100;
 /// `clone` flag: join parent's thread group.
-const CLONE_THREAD: u32 = 0x0001_0000;
+const CLONE_THREAD:           u32 = 0x0001_0000;
 /// `clone` flag: set `tp` to the TLS argument.
-const CLONE_SETTLS: u32 = 0x0008_0000;
+const CLONE_SETTLS:           u32 = 0x0008_0000;
+/// `clone` flag: write 0 to child_tid_ptr and futex-wake on thread exit.
+const CLONE_CHILD_CLEARTID:   u32 = 0x0020_0000;
+/// `clone` flag: write child TID to child_tid_ptr after fork.
+const CLONE_CHILD_SETTID:     u32 = 0x0100_0000;
 
 /// Creates a new thread or process.
 ///
 /// # Arguments
 ///
 /// * `arg0` (`a0`) - Flags (combinations of `CLONE_VM`, `CLONE_THREAD`,
-///   `CLONE_SETTLS`, and namespace flags).
+///   `CLONE_SETTLS`, `CLONE_CHILD_SETTID`, `CLONE_CHILD_CLEARTID`).
 /// * `arg1` (`a1`) - New stack pointer for child (`0` = inherit parent sp).
 /// * `arg2` (`a2`) - TLS value loaded into `tp` (only when `CLONE_SETTLS`).
+/// * `arg3` (`a3`) - User-space `*mut u32` for SETTID/CLEARTID.
 /// * `tf` - Caller's trap frame.
 ///
 /// # Returns
 ///
 /// The new thread/process PID in the parent, 0 in the child.
-pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
+pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, arg3: usize, tf: &mut TrapFrame) {
     use core::sync::atomic::Ordering;
     let flags = arg0 as u32;
     let stack = arg1;
     let tls   = arg2;
+    let child_tid_ptr = arg3;
 
     let ppid = crate::posix::process::current_pid();
 
@@ -908,15 +1232,12 @@ pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     }
 
     // Namespace isolation: create new namespaces for any requested CLONE_NEW* flags.
-    const CLONE_NEWNS:  u32 = 0x0002_0000;
-    const CLONE_NEWPID: u32 = 0x2000_0000;
-    const CLONE_NEWNET: u32 = 0x4000_0000;
-    if flags & (CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET) != 0 {
-        // The child's ns was set to the parent's at Process::new time; override with forks.
-        // We can't easily change it inside Arc, so we accept the parent's ns here —
-        // a full implementation would pass clone_flags into Process::new.
-        // TODO: plumb clone_flags into Process::new so ns is forked at creation time.
-        let _ = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET; // acknowledged
+    // The child inherited the parent's ns at Process::new time.  If clone flags
+    // request new namespaces, fork (create fresh) the relevant ones now.
+    {
+        let parent_ns = parent_proc.ns.lock();
+        let child_ns = crate::namespace::NsSet::fork_from(&parent_ns, flags);
+        *child.ns.lock() = child_ns;
     }
 
     // Copy the current trap frame into the child.  `tf` IS the parent's trap
@@ -936,7 +1257,17 @@ pub fn sys_clone(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
         }
     }
 
-    crate::posix::process::RUN_QUEUE.lock().push_back(child_pid);
+    // CLONE_CHILD_SETTID: write child's TID into child_tid_ptr (shared address space).
+    if flags & CLONE_CHILD_SETTID != 0 && child_tid_ptr != 0 {
+        unsafe { core::ptr::write_volatile(child_tid_ptr as *mut u32, child_pid as u32); }
+    }
+
+    // CLONE_CHILD_CLEARTID: store the pointer so it is cleared on thread exit.
+    if flags & CLONE_CHILD_CLEARTID != 0 && child_tid_ptr != 0 {
+        child.clear_tid_ptr.store(child_tid_ptr, Ordering::Relaxed);
+    }
+
+    crate::posix::process::enqueue_with_prio(child_pid, child.priority.load(Ordering::Relaxed));
     tf.regs[10] = child_pid as usize;
 }
 
@@ -967,6 +1298,10 @@ pub fn sys_futex(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let uaddr = arg0;
     let op    = arg1;
     let val   = arg2;
+    if !crate::mm::vmm::is_user_pointer_valid(tf, uaddr as *const u32, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
+        return;
+    }
 
     match op {
         FUTEX_WAIT => {
@@ -1009,12 +1344,56 @@ pub fn sys_futex(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                     crate::posix::process::PROCESS_TABLE.lock().get(&waker_pid).cloned()
                 {
                     *proc.state.lock() = crate::posix::process::ProcState::Running;
+                    crate::posix::process::enqueue_with_prio(waker_pid, proc.priority.load(Ordering::Relaxed));
                 }
-                crate::posix::process::RUN_QUEUE.lock().push_back(waker_pid);
             }
             tf.regs[10] = woken;
         }
         _ => { tf.regs[10] = usize::MAX; }
+    }
+}
+
+/// Returns the calling process's mount namespace ID (for VFS routing).
+pub fn sys_getnsid(tf: &mut TrapFrame) {
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    tf.regs[10] = proc.ns.lock().mnt.id as usize;
+}
+
+// ── Priority / capability syscalls ─────────────────────────────────────────────
+
+/// Sets the calling process's scheduling priority (0 = realtime, 31 = idle).
+pub fn sys_setpriority(prio: i32, tf: &mut TrapFrame) {
+    let clamped = prio.clamp(
+        crate::posix::process::PRIO_REALTIME,
+        crate::posix::process::PRIO_IDLE,
+    );
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    proc.priority.store(clamped, Ordering::Relaxed);
+    tf.regs[10] = 0;
+}
+
+/// Returns the calling process's scheduling priority.
+pub fn sys_getpriority(tf: &mut TrapFrame) {
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    tf.regs[10] = proc.priority.load(Ordering::Relaxed) as usize;
+}
+
+/// Grants a subset of the caller's capability mask to `target_pid`.
+///
+/// Only bits present in the caller's own caps may be granted.
+pub fn sys_cap_grant(target_pid: i32, caps: u64, tf: &mut TrapFrame) {
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    let my_caps = proc.caps.load(Ordering::Relaxed);
+    if caps & !my_caps != 0 {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+    let table = crate::posix::process::PROCESS_TABLE.lock();
+    if let Some(target) = table.get(&target_pid) {
+        target.caps.fetch_or(caps, Ordering::Relaxed);
+        tf.regs[10] = 0;
+    } else {
+        tf.regs[10] = crate::errno::ESRCH;
     }
 }
 
@@ -1136,12 +1515,167 @@ pub fn sys_abi_version(tf: &mut TrapFrame) {
 /// Supported flags: `CLONE_NEWNS` (0x00020000), `CLONE_NEWPID`
 /// (0x20000000), `CLONE_NEWNET` (0x40000000).
 ///
-/// Currently this is a no-op that records the intent. Full
-/// isolation requires making `Process::ns` a `Mutex<NsSet>`.
+/// Creates fresh namespaces for the calling process.  The process's
+/// existing namespaces are replaced with newly-created ones.
+///
+/// Requires `CAP_SYS_ADMIN` to create new namespaces.
 pub fn sys_unshare(arg0: usize, tf: &mut TrapFrame) {
-    let _flags = arg0 as u32;
-    // Namespace objects are stored inside Process::ns which is not behind a Mutex,
-    // so we can't mutate it after Arc creation.  For now we acknowledge the call
-    // and record the intent.  Full isolation requires making Process::ns a Mutex<NsSet>.
+    const CLONE_NEWNS:  u32 = 0x0002_0000;
+    const CLONE_NEWPID: u32 = 0x2000_0000;
+    const CLONE_NEWNET: u32 = 0x4000_0000;
+
+    let flags = arg0 as u32;
+    if flags & (CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET) == 0 {
+        tf.regs[10] = 0; // nothing to do
+        return;
+    }
+
+    let proc = crate::get_current_proc_or_esrch!(tf);
+    if proc.caps.load(Ordering::Relaxed) & crate::posix::process::CAP_SYS_ADMIN == 0 {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+
+    let mut ns = proc.ns.lock();
+    *ns = crate::namespace::NsSet::fork_from(&ns, flags);
     tf.regs[10] = 0;
 }
+
+pub const JOB_POLICY_MAX_MEMORY: usize = 1;
+
+pub fn sys_job_create(parent_handle: usize, options: usize, tf: &mut TrapFrame) {
+    let _ = options;
+    let proc = crate::get_current_proc_or_esrch!(tf);
+
+    let parent_job = if parent_handle == 0 {
+        proc.job.clone()
+    } else {
+        match proc.fds.lock().get(parent_handle as u32) {
+            Some(crate::ipc::handle::KernelObject::Job(job)) => job.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EBADF;
+                return;
+            }
+        }
+    };
+
+    let new_job = alloc::sync::Arc::new(crate::posix::job::Job::new(Some(alloc::sync::Arc::downgrade(&parent_job))));
+    parent_job.children.lock().push(new_job.clone());
+
+    let new_handle = proc.fds.lock().insert(crate::ipc::handle::KernelObject::Job(new_job));
+    tf.regs[10] = new_handle as usize;
+}
+
+pub fn sys_job_set_policy(job_handle: usize, policy_type: usize, value: usize, tf: &mut TrapFrame) {
+    let proc = crate::get_current_proc_or_esrch!(tf);
+
+    let job = if job_handle == 0 {
+        proc.job.clone()
+    } else {
+        match proc.fds.lock().get(job_handle as u32) {
+            Some(crate::ipc::handle::KernelObject::Job(j)) => j.clone(),
+            _ => {
+                tf.regs[10] = crate::errno::EBADF;
+                return;
+            }
+        }
+    };
+
+    if policy_type == JOB_POLICY_MAX_MEMORY {
+        job.max_memory.store(value, Ordering::SeqCst);
+        tf.regs[10] = 0;
+    } else {
+        tf.regs[10] = crate::errno::EINVAL;
+    }
+}
+
+// ── Thread lifecycle helpers ────────────────────────────────────────────────
+
+/// Exits all threads in the calling thread's thread group (POSIX exit_group).
+///
+/// Sets every process with the same tgid as a zombie with `status`, then
+/// schedules the next process.
+pub fn sys_exit_group(status: usize, tf: &mut TrapFrame) {
+    let _ = tf;
+    let my_tgid = {
+        let pid = crate::posix::process::current_pid();
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        match table.get(&pid) {
+            Some(p) => p.tgid.load(Ordering::Relaxed),
+            None => { crate::posix::process::schedule(); unsafe { __halt_cpu() } }
+        }
+    };
+
+    let peers: Vec<crate::posix::process::Pid> = {
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        table
+            .iter()
+            .filter(|(_, p)| p.tgid.load(Ordering::Relaxed) == my_tgid)
+            .map(|(pid, _)| *pid)
+            .collect()
+    };
+
+    for peer in peers {
+        crate::posix::spawn::exit(peer, status as i32);
+    }
+
+    crate::posix::process::schedule();
+    unsafe { __halt_cpu() }
+}
+
+/// Stores `ptr` as the thread's `clear_tid_ptr` and returns the calling TID.
+///
+/// Used by libc at thread start to register the futex address for `pthread_join`.
+pub fn sys_set_tid_address(ptr: usize, tf: &mut TrapFrame) {
+    let pid = crate::posix::process::current_pid();
+    if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&pid).cloned() {
+        proc.clear_tid_ptr.store(ptr, Ordering::Relaxed);
+    }
+    tf.regs[10] = pid as usize;
+}
+
+/// Terminates a task (process or job) identified by a handle.
+///
+/// If `handle` is 0, kills the calling process. If it resolves to a
+/// [`KernelObject::Job`], kills every process currently in the job.
+pub fn sys_task_kill(handle: usize, tf: &mut TrapFrame) {
+    if handle == 0 {
+        let pid = crate::posix::process::current_pid();
+        crate::posix::spawn::exit(pid, -1);
+        crate::posix::process::schedule();
+        unsafe { __halt_cpu() }
+    }
+    let proc = crate::get_current_proc_or_esrch!(tf);
+
+    let job = match proc.fds.lock().get(handle as u32) {
+        Some(crate::ipc::handle::KernelObject::Job(j)) => j.clone(),
+        _ => { tf.regs[10] = crate::errno::EBADF; return; }
+    };
+
+    let pids: Vec<crate::posix::process::Pid> = job.processes.lock().clone();
+    for pid in pids {
+        crate::posix::spawn::exit(pid, -1);
+    }
+    tf.regs[10] = 0;
+}
+
+/// Sends signal `sig` to thread `tid` within thread group `tgid`.
+///
+/// Only delivers if `tid` exists and its `tgid` matches.
+pub fn sys_tgkill(tgid: usize, tid: usize, sig: usize, tf: &mut TrapFrame) {
+    let target_pid = tid as crate::posix::process::Pid;
+    let target_tgid = tgid as i32;
+
+    let proc_arc = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid).cloned();
+    match proc_arc {
+        Some(p) if p.tgid.load(Ordering::Relaxed) == target_tgid => {
+            if sig != 0 && sig < 32 {
+                p.pending_signals.fetch_or(1 << (sig - 1), Ordering::SeqCst);
+            }
+            tf.regs[10] = 0;
+        }
+        Some(_) => tf.regs[10] = crate::errno::ESRCH,
+        None    => tf.regs[10] = crate::errno::ESRCH,
+    }
+}
+

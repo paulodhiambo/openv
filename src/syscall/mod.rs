@@ -25,6 +25,7 @@
 //! | `user`   | 23–24, 30–35 | User/credential ops |
 //! | `tty`    | 37–38 | TTY mode control |
 //! | `trace`  | 140–142 | eBPF-compatible tracepoints |
+//! | `epoll`  | 233, 244, 291 | I/O event notification |
 //!
 //! ## Error Convention
 //!
@@ -55,6 +56,7 @@ macro_rules! get_current_proc_or_esrch {
     };
 }
 
+pub mod epoll;
 pub mod fs;
 pub mod ipc;
 pub mod net;
@@ -62,6 +64,7 @@ pub mod proc;
 pub mod tty;
 pub mod user;
 pub mod pm;
+pub mod vm;
 
 /// Dispatches a system call to the appropriate handler.
 ///
@@ -117,12 +120,19 @@ pub fn dispatch(
         86 => proc::sys_setsid(tf),
         87 => proc::sys_kill(arg0, arg1, tf),
         88 => proc::sys_sigaction(arg0, arg1, arg2, tf),
-        89 => proc::sys_sigreturn(tf),
-        120 => proc::sys_clone(arg0, arg1, arg2, tf),
+         89 => proc::sys_sigreturn(tf),
+         69 => proc::sys_sigprocmask(arg0, arg1, arg2, tf),
+         97 => proc::sys_sigpending(arg0, tf),
+         98 => proc::sys_arch_prctl(arg0, arg1, tf),
+         74 => proc::sys_job_create(arg0, arg1, tf),
+        75 => proc::sys_job_set_policy(arg0, arg1, arg2, tf),
+        120 => proc::sys_clone(arg0, arg1, arg2, arg3, tf),
         121 => proc::sys_futex(arg0, arg1, arg2, tf),
         122 => proc::sys_gettid(tf),
 
-        // fs.rs — fsync
+        // fs.rs — fstat + fsync
+        78 => fs::sys_fstat(arg0, arg1, tf),
+        79 => fs::sys_fstatat(arg0, arg1, arg2, arg3, tf),
         130 => fs::sys_fsync(arg0, tf),
         131 => fs::sys_fdatasync(arg0, tf),
 
@@ -133,6 +143,39 @@ pub fn dispatch(
         138 => proc::sys_abi_version(tf),
         139 => proc::sys_unshare(arg0, tf),
 
+        // vm.rs — VMO / handle-close
+        150 => vm::sys_vmo_create(arg0, tf),
+        151 => vm::sys_vmo_map(arg0, arg1, arg2, arg3, tf),
+        152 => vm::sys_vmo_unmap(arg0, arg1, tf),
+        153 => vm::sys_vmo_read(arg0, arg1, arg2, arg3, tf),
+        154 => vm::sys_vmo_write(arg0, arg1, arg2, arg3, tf),
+        155 => vm::sys_handle_close(arg0, tf),
+
+        // proc.rs — thread lifecycle
+        158 => proc::sys_exit_group(arg0, tf),
+        159 => proc::sys_set_tid_address(arg0, tf),
+        160 => proc::sys_tgkill(arg0, arg1, arg2, tf),
+
+        // ipc.rs — object signal wait (Zircon-compatible)
+        161 => ipc::sys_object_wait_one(arg0, arg1, arg2, arg3, tf),
+
+        // proc.rs — task kill
+        162 => proc::sys_task_kill(arg0, tf),
+
+        // fs.rs — component manager registration
+        163 => fs::sys_cm_register(tf),
+        164 => fs::sys_get_cm_pid(tf),
+
+        // pm.rs — driver framework isolation
+        165 => pm::sys_create_resource(arg0, arg1, arg2, tf),
+        166 => pm::sys_grant_driver_cap(arg0, tf),
+
+        // proc.rs — priority + capability delegation
+        167 => proc::sys_setpriority(arg0 as i32, tf),
+        168 => proc::sys_getpriority(tf),
+        169 => proc::sys_cap_grant(arg0 as i32, arg1 as u64, tf),
+        170 => proc::sys_getnsid(tf),
+
         // trace.rs — eBPF-compatible observability
         140 => crate::trace::sys_trace_load(arg0, arg1, tf),
         141 => crate::trace::sys_trace_attach(arg0, arg1, tf),
@@ -141,16 +184,25 @@ pub fn dispatch(
         // fs.rs
         2 => fs::sys_write(arg0, arg1, arg2, tf),
         5 => fs::sys_read(arg0, arg1, arg2, tf),
+        8 => fs::sys_open(arg0, arg1, arg2, tf),
         9 => fs::sys_close(arg0, tf),
-        55 => fs::sys_chdir(arg0, arg1, tf),
+         19 => fs::sys_lseek(arg0, arg1, arg2, tf),
+         68 => fs::sys_poll(arg0, arg1, arg2, tf),
+         55 => fs::sys_chdir(arg0, arg1, tf),
         56 => fs::sys_getcwd(arg0, arg1, tf),
         63 => fs::sys_vfs_register(tf),
         64 => fs::sys_get_vfs_pid(tf),
         65 => fs::sys_initrd_data(arg0, arg1, arg2, tf),
+        66 => fs::sys_pm_register(tf),
+        67 => fs::sys_get_pm_pid(tf),
         110 => fs::sys_proc_list(arg0, arg1, tf),
         111 => fs::sys_proc_status(arg0, arg1, arg2, tf),
         112 => fs::sys_blk_register(tf),
         113 => fs::sys_get_blk_pid(tf),
+        114 => fs::sys_proc_server_register(tf),
+        115 => fs::sys_get_proc_server_pid(tf),
+        116 => fs::sys_dev_server_register(tf),
+        117 => fs::sys_get_dev_server_pid(tf),
 
         // ipc.rs
         3 => ipc::sys_pipe(arg0, tf),
@@ -159,10 +211,19 @@ pub fn dispatch(
         61 => ipc::sys_mailbox_send(arg0, arg1, arg2, tf),
         62 => ipc::sys_mailbox_receive(arg0, arg1, arg2, tf),
         81 => ipc::sys_fcntl(arg0, arg1, arg2, tf),
+        70 => ipc::sys_port_create(arg0, tf),
+        71 => ipc::sys_port_wait(arg0, arg1, tf),
+        72 => ipc::sys_port_queue(arg0, arg1, tf),
+        73 => ipc::sys_port_bind(arg0, arg1, arg2 as u64, arg3 as u32, tf),
+         76 => ipc::sys_handle_duplicate(arg0, arg1, tf),
+         77 => ipc::sys_handle_get_rights(arg0, tf),
         90 => ipc::sys_ipc_send(arg0, arg1, tf),
         91 => ipc::sys_ipc_receive(arg0, arg1, tf),
         92 => ipc::sys_ipc_sendrec(arg0, arg1, tf),
         93 => ipc::sys_datacopy(arg0, arg1, arg2, arg3, tf.regs[14], tf),
+        94 => ipc::sys_channel_create(arg0, tf),
+        95 => ipc::sys_channel_write(arg0, arg1, arg2, arg3, tf.regs[14], tf),
+        96 => ipc::sys_channel_read(arg0, arg1, arg2, arg3, tf.regs[14], tf),
 
         // net.rs
         10 => net::sys_net_send(arg0, arg1, tf),
@@ -191,6 +252,11 @@ pub fn dispatch(
         // tty.rs
         37 => tty::sys_set_echo(arg0, tf),
         38 => tty::sys_set_raw(arg0, tf),
+
+        // epoll.rs
+        233 => epoll::sys_epoll_ctl(arg0, arg1, arg2, arg3, tf),
+        244 => epoll::sys_epoll_pwait(arg0, arg1, arg2, arg3, tf),
+        291 => epoll::sys_epoll_create1(arg0, tf),
 
         _ => {
             crate::println!("Unknown syscall: {}", syscall_num);

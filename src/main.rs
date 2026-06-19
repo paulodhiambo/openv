@@ -102,6 +102,8 @@ pub mod uart;
 pub mod initrd;
 /// Module containing synchronization primitives.
 pub mod sync;
+/// Module containing cryptographic hash functions (SHA-256).
+pub mod crypto;
 
 /// Atomic storage for the device tree blob (DTB) pointer passed by the bootloader.
 ///
@@ -273,15 +275,27 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
     // resources such as PIDs, mount points, and network interfaces.
     namespace::init();
 
+    // Record which HART is the boot HART so the timer ISR knows where to poll UART.
+    smp::BOOT_HARTID.store(hartid, core::sync::atomic::Ordering::Relaxed);
+
     // Initialize Trap Handler. This sets up the trap vector and configures
     // the CPU to handle traps (exceptions, interrupts, and system calls).
     trap::init();
+
+    // Enable UART external interrupt (IRQ 10) on the boot HART so keyboard
+    // input arrives via the PLIC regardless of which hartid won the election.
+    plic::set_enable(hartid, 10, true);
 
     // Initialize networking via driver framework (virtio-mmio probe or loopback fallback).
     // This probes the DTB for network devices and initializes the appropriate
     // driver. If no network device is found, a loopback driver is used as a
     // fallback.
     crate::net::init(dtb_ptr);
+
+    // Initialize VirtIO GPU 2D framebuffer driver.
+    // Scans QEMU virt MMIO slots for a GPU device and sets up a 640×480
+    // scatter-gather framebuffer. Safe to call even if no GPU is present.
+    crate::drivers::gpu::probe();
 
     // Initrd parsing. The initrd is described in the DTB's `/chosen` node
     // via the `linux,initrd-start` and `linux,initrd-end` properties.
@@ -377,35 +391,42 @@ pub extern "C" fn kmain(hartid: usize, dtb_ptr: usize) -> ! {
         let pm_pid = posix::spawn::posix_spawn("/pm-server", init_pid).unwrap();
         let vfs_pid = posix::spawn::posix_spawn("/vfs-server", init_pid).unwrap();
         let rs_pid = posix::spawn::posix_spawn("/rs-server", init_pid).unwrap();
-        
+        let procfs_pid = posix::spawn::posix_spawn("/procfs-server", init_pid).unwrap();
+        let devfs_pid = posix::spawn::posix_spawn("/devfs-server", init_pid).unwrap();
+
         // Set capabilities for each boot server. Capabilities determine what
         // operations a process is allowed to perform. Each server gets a
         // different set of capabilities based on its role.
         let table = crate::posix::process::PROCESS_TABLE.lock();
         if let Some(init_proc) = table.get(&init_pid) {
-            // The init process has no special capabilities.
             init_proc.caps.store(posix::process::CAP_NONE, core::sync::atomic::Ordering::Relaxed);
+            init_proc.priority.store(posix::process::PRIO_NORMAL, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(pm_proc) = table.get(&pm_pid) {
-            // The process manager (pm-server) can create and manage processes
-            // and copy data between processes.
             pm_proc.caps.store(posix::process::CAP_PROCESS | posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+            pm_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(vfs_proc) = table.get(&vfs_pid) {
-            // The virtual file system server (vfs-server) can copy data and
-            // perform system administration tasks.
             vfs_proc.caps.store(
                 posix::process::CAP_DATACOPY | posix::process::CAP_SYS_ADMIN,
                 core::sync::atomic::Ordering::Relaxed,
             );
+            vfs_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
         }
         if let Some(rs_proc) = table.get(&rs_pid) {
-            // The resource server (rs-server) can manage processes, perform
-            // system administration, and copy data.
             rs_proc.caps.store(
-                posix::process::CAP_PROCESS | posix::process::CAP_SYS_ADMIN | posix::process::CAP_DATACOPY, 
+                posix::process::CAP_PROCESS | posix::process::CAP_SYS_ADMIN | posix::process::CAP_DATACOPY,
                 core::sync::atomic::Ordering::Relaxed
             );
+            rs_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(procfs_proc) = table.get(&procfs_pid) {
+            procfs_proc.caps.store(posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+            procfs_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(devfs_proc) = table.get(&devfs_pid) {
+            devfs_proc.caps.store(posix::process::CAP_DATACOPY, core::sync::atomic::Ordering::Relaxed);
+            devfs_proc.priority.store(posix::process::PRIO_HIGH, core::sync::atomic::Ordering::Relaxed);
         }
         drop(table);
         

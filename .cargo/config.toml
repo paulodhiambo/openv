@@ -10,5 +10,6 @@ rustflags = [
     "-C", "code-model=medium",
     "-C", "relocation-model=static",
     "-C", "panic=abort",
+    "-A", "unexpected_cfgs",
 ]
 runner = "qemu-system-riscv64 -machine virt -bios default -nographic -initrd test_root.tar -kernel"

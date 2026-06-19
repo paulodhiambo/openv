@@ -40,6 +40,8 @@
 //! drivers are stored in [`ACTIVE_DRIVERS`] and can receive interrupts
 //! via [`dispatch_interrupt`].
 
+pub mod gpu;
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use crate::sync::Mutex;

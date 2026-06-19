@@ -216,6 +216,7 @@ impl VirtQueue {
     ///
     /// `Ok(head_descriptor_index)` on success, or `Err(())` if there
     /// are not enough free descriptors.
+    #[allow(clippy::result_unit_err)]
     pub fn enqueue_chain(&self, buffers: &[(u64, u32, bool)]) -> Result<u16, ()> {
         let mut free = self.free_list.lock();
         if free.len() < buffers.len() {
@@ -275,6 +276,7 @@ impl VirtQueue {
     ///
     /// `Ok(head_descriptor_index)` on success, or `Err(())` if there
     /// are not enough free descriptors.
+    #[allow(clippy::result_unit_err)]
     pub fn enqueue(&self, buf_pa: u64, len: u32, write: bool) -> Result<u16, ()> {
         self.enqueue_chain(&[(buf_pa, len, write)])
     }
@@ -307,6 +309,22 @@ impl VirtQueue {
             self.last_used_idx = self.last_used_idx.wrapping_add(1);
         }
         out
+    }
+
+    /// Pops exactly one completed entry from the used ring, or returns None if
+    /// the ring is empty. Callers that process one packet at a time should use
+    /// this instead of `pop_used` to avoid silently discarding completions.
+    pub fn pop_one_used(&mut self) -> Option<(u16, u32)> {
+        fence(Ordering::Acquire);
+        let used_i = unsafe { read_volatile(self.used_idx) };
+        if self.last_used_idx as u16 == used_i {
+            return None;
+        }
+        let idx = (self.last_used_idx as usize) % self.size;
+        let ue = unsafe { &*self.used_ring.add(idx) };
+        let entry = (ue.id as u16, ue.len);
+        self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        Some(entry)
     }
 
     /// Walks a descriptor chain starting at `start` and returns the list of

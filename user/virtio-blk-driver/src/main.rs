@@ -4,8 +4,10 @@
 extern crate alloc;
 use alloc::format;
 use core::alloc::Layout;
-use libos::{blk_register, phys_map, virt_to_phys, irq_register, irq_enable, getpid, msg_receive, write};
+use libos::{blk_register, phys_map, virt_to_phys, irq_register, irq_enable, getpid, getppid,
+            msg_receive, write, ipc_send, ipc_recv, CAP_MMIO, CAP_INTERRUPT};
 use libos::ipc::Message;
+use driver_abi::{DriverDesc, ResourceReq, ResourceKind, OP_DRIVER_REGISTER, REPLY_DRIVER_OK};
 
 fn print(s: &str) {
     write(1, s.as_ptr(), s.len());
@@ -233,6 +235,19 @@ fn probe_driver() -> Option<VirtioBlk> {
     Some(drv)
 }
 
+/// Send a DriverDesc to rs-server (parent) and wait for acknowledgement.
+fn register_with_rs(desc: DriverDesc) -> bool {
+    let rs_pid = getppid();
+    let mut payload = OP_DRIVER_REGISTER.to_le_bytes().to_vec();
+    payload.extend_from_slice(&desc.serialize());
+    ipc_send(rs_pid, &payload);
+    let mut reply = [0u8; 4];
+    let mut _from: i32 = 0;
+    let n = ipc_recv(&mut reply, &mut _from);
+    if n < 4 { return false; }
+    i32::from_le_bytes(reply) == REPLY_DRIVER_OK
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn main() -> i32 {
     my_println!("virtio-blk-driver: starting");
@@ -241,9 +256,40 @@ pub extern "C" fn main() -> i32 {
         Some(d) => d,
         None => {
             my_println!("virtio-blk-driver: no device found, exiting");
+            let empty = DriverDesc {
+                name: alloc::string::String::from("virtio-blk"),
+                version: (0, 1, 0),
+                required_caps: 0, // signals no device
+                resources: alloc::vec![],
+            };
+            register_with_rs(empty);
             return 0;
         }
     };
+
+    // Self-register with rs-server now that we know the hardware layout
+    let desc = DriverDesc {
+        name: alloc::string::String::from("virtio-blk"),
+        version: (0, 1, 0),
+        required_caps: CAP_MMIO | CAP_INTERRUPT,
+        resources: alloc::vec![
+            ResourceReq {
+                kind: ResourceKind::Mmio {
+                    base: 0x10000000 + drv.irq as usize * 0x1000,
+                    size: 0x1000,
+                },
+                name: alloc::string::String::from("virtio-mmio"),
+            },
+            ResourceReq {
+                kind: ResourceKind::Irq(drv.irq),
+                name: alloc::string::String::from("virtio-blk-irq"),
+            },
+        ],
+    };
+    if !register_with_rs(desc) {
+        my_println!("virtio-blk-driver: rs-server rejected registration, aborting");
+        return 1;
+    }
 
     // Register for interrupts
     irq_register(drv.irq, getpid());

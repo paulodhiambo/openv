@@ -1,3 +1,10 @@
+# Elect the first HART to arrive as primary regardless of hartid.
+# Must be in .data (not .bss) so it survives the BSS clear that follows.
+.section .data
+.align 2
+_boot_hart_elected:
+    .word 0
+
 .section .text._start
 .global _start
 
@@ -5,7 +12,7 @@ _start:
     # OpenSBI passes:
     # a0 = hartid
     # a1 = dtb_phys_addr
-    
+
     # Disable interrupts
     csrw sie, zero
 
@@ -13,8 +20,13 @@ _start:
     mv s0, a0
     mv s1, a1
 
-    # Park all harts except hart 0
-    bnez s0, park
+    # Elect the first HART to arrive as primary (atomic swap).
+    # The boot HART (any hartid) gets old value 0 and proceeds;
+    # secondary HARTs started later get old value 1 and go to park.
+    la   t0, _boot_hart_elected
+    li   t1, 1
+    amoswap.w.aq t2, t1, (t0)
+    bnez t2, park
 
     # Set stack pointer to the end of the stack region defined in linker.ld
     la sp, _stack_end

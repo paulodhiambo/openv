@@ -37,8 +37,10 @@
 //! [`ACTIVE_TTY`]: static.ACTIVE_TTY.html
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32};
+use crate::ipc::handle::EpollInstance;
 use crate::sync::Mutex;
 
 /// Per-session TTY line discipline state.
@@ -79,6 +81,8 @@ pub struct TtyState {
     pub waiter: AtomicI32,
     /// Set by the UART ISR when Ctrl-C is pressed; `sys_read` returns 0 (EOF).
     pub ctrlc:  AtomicBool,
+    /// Epoll instances waiting for readability on this TTY.
+    pub epoll_waiters: Mutex<Vec<Weak<EpollInstance>>>,
 }
 
 impl TtyState {
@@ -101,6 +105,7 @@ impl TtyState {
             raw:    AtomicBool::new(false),
             waiter: AtomicI32::new(0),
             ctrlc:  AtomicBool::new(false),
+            epoll_waiters: Mutex::new(Vec::new()),
         })
     }
 }

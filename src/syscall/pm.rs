@@ -79,8 +79,17 @@ pub fn sys_clone_process(arg0: usize, tf: &mut TrapFrame) {
         *child.ipc_state.lock() = target_proc.ipc_state.lock().clone();
     }
 
-    // Do NOT push to RUN_QUEUE yet; pm-server's msg_send will push it when it replies.
-    
+    // Leave child Stopped with mailbox_waiter=1 so pm-server's msg_send wakes it.
+    // pm-server must send a reply to child_pid after setting its trap frame,
+    // which will transition child to Running and push it to RUN_QUEUE.
+    {
+        let table = crate::posix::process::PROCESS_TABLE.lock();
+        if let Some(child_proc) = table.get(&child_pid) {
+            *child_proc.state.lock() = crate::posix::process::ProcState::Stopped;
+            child_proc.mailbox_waiter.store(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     tf.regs[10] = child_pid as usize;
 }
 
@@ -111,6 +120,10 @@ pub fn sys_set_trapframe(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         && proc.caps.load(core::sync::atomic::Ordering::Relaxed) & (crate::posix::process::CAP_PROCESS | crate::posix::process::CAP_SYS_ADMIN) == 0
     {
         tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+    if !crate::mm::vmm::is_user_pointer_valid(tf, tf_ptr, 1) {
+        tf.regs[10] = crate::errno::EFAULT;
         return;
     }
 
@@ -157,7 +170,9 @@ pub fn sys_set_process_state(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
         if state == 1 {
             if *st == crate::posix::process::ProcState::Stopped {
                 *st = crate::posix::process::ProcState::Running;
-                crate::posix::process::RUN_QUEUE.lock().push_back(target_pid);
+                let prio = proc.priority.load(core::sync::atomic::Ordering::Relaxed);
+                drop(st);
+                crate::posix::process::enqueue_with_prio(target_pid, prio);
             }
         } else {
             *st = crate::posix::process::ProcState::Stopped;
@@ -207,6 +222,8 @@ pub fn sys_destroy_user_space(arg0: usize, tf: &mut TrapFrame) {
         
         // Destroy old
         let _ = crate::mm::vmm::destroy_user_space(root_pa);
+        let allocated_bytes = proc.allocated_pages.swap(0, Ordering::SeqCst) * 4096;
+        proc.job.dealloc_memory(allocated_bytes);
         tf.regs[10] = 0;
     } else {
         tf.regs[10] = usize::MAX;
@@ -241,6 +258,10 @@ pub fn sys_alloc_user_page(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
     }
 
     if let Some(proc) = crate::posix::process::PROCESS_TABLE.lock().get(&target_pid) {
+        if !proc.job.check_memory_limit(4096) {
+            tf.regs[10] = usize::MAX;
+            return;
+        }
         let satp = proc.satp_val.load(Ordering::Relaxed);
         let root_pa = (satp & 0xFFFFFFFFFFF) << 12;
 
@@ -257,6 +278,8 @@ pub fn sys_alloc_user_page(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapF
             return;
         }
         frame.into_raw();
+        proc.job.alloc_memory(4096);
+        proc.allocated_pages.fetch_add(1, Ordering::SeqCst);
         tf.regs[10] = 0;
     } else {
         tf.regs[10] = usize::MAX;
@@ -312,6 +335,9 @@ pub fn sys_reap_process(arg0: usize, tf: &mut TrapFrame) {
     };
 
     if let Some(proc) = removed_proc {
+        let allocated_bytes = proc.allocated_pages.load(Ordering::SeqCst) * 4096;
+        proc.job.dealloc_memory(allocated_bytes);
+
         let kstack = proc.kernel_stack_bottom;
         let satp = proc.satp_val.load(Ordering::Relaxed);
         let root_pa = (satp & 0xFFFFFFFFFFF) << 12;
@@ -361,11 +387,10 @@ pub fn sys_phys_map(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     let va = arg0;
     let pa = arg1;
     let len = arg2;
-
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     
-    if proc.caps.load(core::sync::atomic::Ordering::Relaxed) & crate::posix::process::CAP_MMIO == 0 {
+    let caps = proc.caps.load(core::sync::atomic::Ordering::Relaxed);
+    if caps & (crate::posix::process::CAP_MMIO | crate::posix::process::CAP_DRIVER) == 0 {
         tf.regs[10] = crate::errno::EPERM;
         return;
     }
@@ -407,12 +432,68 @@ pub fn sys_phys_map(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
 /// mapped.
 pub fn sys_virt_to_phys(arg0: usize, tf: &mut TrapFrame) {
     let va = arg0;
-    crate::get_current_proc_or_esrch!(tf);
-    let proc = crate::posix::process::get_current_proc().unwrap();
+    let proc = crate::get_current_proc_or_esrch!(tf);
     let root_pa = (proc.satp_val.load(core::sync::atomic::Ordering::Relaxed) & 0xFFFFFFFFFFF) << 12;
 
     match crate::mm::vmm::PageTable::walk_page_table(root_pa, va) {
         Ok((pa, _flags)) => tf.regs[10] = pa,
         Err(_) => tf.regs[10] = usize::MAX,
+    }
+}
+
+/// Creates a hardware resource capability handle.
+///
+/// Requires `CAP_SYS_ADMIN`. Returns a handle to a [`ResourceSpec`] that
+/// grants access to the specified MMIO range and/or IRQ line.
+///
+/// # Arguments
+/// * `arg0` (`a0`) — Physical base address of the MMIO region (0 if IRQ-only).
+/// * `arg1` (`a1`) — Size in bytes of the MMIO region (0 if IRQ-only).
+/// * `arg2` (`a2`) — IRQ number, or `u32::MAX` (0xffffffff) if no IRQ.
+pub fn sys_create_resource(arg0: usize, arg1: usize, arg2: usize, tf: &mut crate::trap::TrapFrame) {
+    let proc = crate::get_current_proc_or_esrch!(tf);
+
+    if proc.caps.load(core::sync::atomic::Ordering::Relaxed)
+        & crate::posix::process::CAP_SYS_ADMIN
+        == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+
+    let irq = if arg2 == usize::MAX { None } else { Some(arg2 as u32) };
+    let spec = crate::ipc::handle::ResourceSpec { pa: arg0, pa_size: arg1, irq };
+    let handle = proc.fds.lock().insert(crate::ipc::handle::KernelObject::Resource(spec));
+    tf.regs[10] = handle as usize;
+}
+
+/// Grants `CAP_DRIVER` capability to a target process.
+///
+/// Requires `CAP_SYS_ADMIN`. Allows the target process to call
+/// `sys_phys_map` and `sys_irq_register`/`sys_irq_enable`.
+///
+/// # Arguments
+/// * `arg0` (`a0`) — PID of the target process.
+pub fn sys_grant_driver_cap(arg0: usize, tf: &mut crate::trap::TrapFrame) {
+    let caller = crate::get_current_proc_or_esrch!(tf);
+
+    if caller.caps.load(core::sync::atomic::Ordering::Relaxed)
+        & crate::posix::process::CAP_SYS_ADMIN
+        == 0
+    {
+        tf.regs[10] = crate::errno::EPERM;
+        return;
+    }
+
+    let target_pid = arg0 as i32;
+    match crate::posix::process::PROCESS_TABLE.lock().get(&target_pid).cloned() {
+        Some(target) => {
+            target.caps.fetch_or(
+                crate::posix::process::CAP_DRIVER,
+                core::sync::atomic::Ordering::SeqCst,
+            );
+            tf.regs[10] = 0;
+        }
+        None => tf.regs[10] = crate::errno::ESRCH,
     }
 }

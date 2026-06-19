@@ -19,6 +19,9 @@
 //! 4. `SATP_REFCOUNT` (leaf — never held while acquiring #1)
 //! 5. `FUTEX_TABLE` (leaf)
 //! 6. `SLEEP_QUEUE` (leaf)
+//! 7. `PAGE_REF_COUNTS` then `FREE_LIST` (PMM — must acquire PAGE_REF_COUNTS
+//!    before FREE_LIST when holding both simultaneously; alloc_frame acquires
+//!    them sequentially so it does not hold both at once)
 //!
 //! ### Rules
 //!

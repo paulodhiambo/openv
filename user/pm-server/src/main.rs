@@ -44,7 +44,10 @@ fn get_table() -> &'static mut BTreeMap<i32, Process> {
 #[no_mangle]
 pub fn main() {
     wrt("PM server started.\n");
-    
+
+    // Register as the system PM server (syscall 66).
+    libos::syscall(66, 0, 0, 0);
+
     // PM is PID 2. Register init (PID 1).
     let table = get_table();
     table.insert(1, Process {

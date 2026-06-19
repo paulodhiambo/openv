@@ -33,48 +33,64 @@ pub enum ProcessState {
 
 ### 6.2 Scheduler
 
-openv uses a simple **FIFO round-robin** scheduler with timer preemption:
+openv uses a **priority-based multi-level scheduler** with timer preemption. The run queue is a sorted map from priority level to a per-level FIFO:
 
+```rust
+pub static RUN_QUEUE: Mutex<BTreeMap<u8, VecDeque<u32>>> = Mutex::new(BTreeMap::new());
 ```
-┌─────────────────────────────────────────────────────┐
-│                    RUN_QUEUE                         │
-│  [ PID 1 ] → [ PID 3 ] → [ PID 5 ] → [ PID 2 ] →  │
-└─────────────────────────────────────────────────────┘
-         │
-    schedule() pops front PID
-    sets satp, tp, sscratch
-    calls return_to_user(trap_frame)
-```
+
+`BTreeMap` iteration is ordered by key, so the lowest key (= highest priority) is always popped first.
+
+**Priority levels:**
+
+| Constant | Value | Used by |
+|----------|-------|---------|
+| `PRIO_REALTIME` | 0 | (reserved) |
+| `PRIO_HIGH` | 8 | Boot servers: pm-server, vfs-server, rs-server, procfs-server, devfs-server |
+| `PRIO_NORMAL` | 16 | init, shell, all user processes, drivers spawned by servers |
+| `PRIO_LOW` | 24 | (available for background tasks) |
+| `PRIO_IDLE` | 31 | (reserved) |
+
+**Priority assignment rules:**
+- `kmain` spawns boot servers at `PRIO_NORMAL`, then explicitly raises them to `PRIO_HIGH` via `priority.store(PRIO_HIGH, …)` before entering the scheduler.
+- All other processes — including children spawned by `PRIO_HIGH` servers — always start at `PRIO_NORMAL` regardless of the parent's priority. This prevents rs-server's driver children (net-smoltcp, virtio-blk-driver) from starving user processes.
 
 **`schedule()` algorithm:**
 
 ```rust
 pub fn schedule() -> ! {
     loop {
-        let pid = RUN_QUEUE.lock().pop_front();
-        match pid {
-            Some(pid) => {
-                let proc = PROCESS_TABLE.lock().get(pid);
-                // Switch page table
-                csrw!(satp, proc.satp_val);
-                sfence_vma();
-                // Point sscratch at this process's TrapFrame
-                csrw!(sscratch, proc.trap_frame as usize);
-                CURRENT_PIDS[current_hart()].store(pid as i32, Ordering::Relaxed);
-                unsafe { return_to_user(proc.trap_frame) }
-            }
-            None => {
-                // No runnable process — wait for interrupt (WFI)
-                unsafe { core::arch::asm!("wfi"); }
-            }
+        disable_interrupts();
+        let next_pid = {
+            let mut rq = RUN_QUEUE.lock();
+            // BTreeMap::keys() iterates in ascending order — lowest key = highest priority.
+            let prio = rq.keys().next().copied();
+            if let Some(p) = prio {
+                let bucket = rq.get_mut(&p).unwrap();
+                let pid = bucket.pop_front();
+                if bucket.is_empty() { rq.remove(&p); }
+                pid
+            } else { None }
+        };
+
+        if let Some(pid) = next_pid {
+            // Switch page table, set sscratch, return to user
+            unsafe { return_to_user(trap_frame_ptr) }
+        } else {
+            // No runnable process — idle
+            set_current_pid(0);
+            enable_interrupts();
+            unsafe { core::arch::asm!("wfi"); }
         }
     }
 }
 ```
 
-**Timer preemption:** The SBI timer fires every N milliseconds (configurable). The timer interrupt handler re-queues the current PID at the back of `RUN_QUEUE` but does **not** call `schedule()` from within the interrupt handler (to avoid lock re-entrancy). Instead, the process is transparently re-queued and will be rescheduled after the next `return_to_user` completes the current quantum.
+**`enqueue(pid)`** re-queues a process at its stored priority (`proc.priority.load()`). `enqueue_with_prio(pid, prio)` overrides the stored priority and updates `proc.priority` for future enqueues.
 
-**WFI idle:** When `RUN_QUEUE` is empty, the primary HART executes `wfi`. Any interrupt (timer, UART RX, network) will wake it. This avoids busy-spinning.
+**Timer preemption:** The SBI timer fires every 10 ms. The ISR re-queues the current PID via `enqueue(pid)` (using the process's stored priority) but does **not** call `schedule()` from interrupt context. The reschedule happens at the next return from `return_to_user`.
+
+**WFI idle:** When all priority buckets are empty, the HART executes `wfi` with interrupts enabled. The next timer tick, UART interrupt, or IPC wakeup will re-enter the scheduler.
 
 ### 6.3 Process Lifecycle
 

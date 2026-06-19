@@ -84,24 +84,54 @@ pub fn poll_uart_into_linedisc() {
                         let mut st = proc.state.lock();
                         if matches!(*st, crate::posix::process::ProcState::Stopped) {
                             *st = crate::posix::process::ProcState::Running;
-                            crate::posix::process::RUN_QUEUE.lock().push_back(*pid);
+                            crate::posix::process::enqueue_with_prio(*pid, proc.priority.load(core::sync::atomic::Ordering::Relaxed));
                         }
                     }
                 }
                 drop(table);
             } else {
                 // No external fg process — the shell itself is reading stdin.
-                // Set ctrlc so sys_read returns 0 (the shell can cancel the
-                // current input line), and push 0x03 into the TTY buffer so
-                // raw-mode readers also see it.
                 tty.ctrlc.store(true, Ordering::Relaxed);
                 let mut buf = tty.buf.lock();
                 buf.push_back(0x03);
                 drop(buf);
                 let waiter = tty.waiter.swap(0, Ordering::Relaxed);
                 if waiter > 0 {
-                    crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+                    crate::posix::process::enqueue(waiter);
                 }
+                crate::ipc::handle::wake_epoll_waiters(&tty.epoll_waiters);
+            }
+            break;
+        }
+        if c == 0x1A {
+            let fg = crate::posix::process::FOREGROUND_PID.load(Ordering::Relaxed);
+            uart.put_char(b'^');
+            uart.put_char(b'Z');
+            uart.put_char(b'\n');
+            if fg > 0 {
+                let table = crate::posix::process::PROCESS_TABLE.lock();
+                for (pid, proc) in table.iter() {
+                    if proc.pgid.load(Ordering::Relaxed) == fg {
+                        proc.pending_signals.fetch_or(1 << crate::syscall::proc::SIGTSTP, Ordering::Relaxed);
+                        let mut st = proc.state.lock();
+                        if matches!(*st, crate::posix::process::ProcState::Stopped) {
+                            *st = crate::posix::process::ProcState::Running;
+                            crate::posix::process::enqueue_with_prio(*pid, proc.priority.load(core::sync::atomic::Ordering::Relaxed));
+                        }
+                    }
+                }
+                drop(table);
+            } else {
+                // Push 0x1A into the TTY buffer for raw-mode readers.
+                tty.ctrlc.store(true, Ordering::Relaxed);
+                let mut buf = tty.buf.lock();
+                buf.push_back(0x1A);
+                drop(buf);
+                let waiter = tty.waiter.swap(0, Ordering::Relaxed);
+                if waiter > 0 {
+                    crate::posix::process::enqueue(waiter);
+                }
+                crate::ipc::handle::wake_epoll_waiters(&tty.epoll_waiters);
             }
             break;
         }
@@ -139,15 +169,16 @@ pub fn poll_uart_into_linedisc() {
     if any_pushed {
         let waiter = tty.waiter.swap(0, Ordering::Relaxed);
         if waiter > 0 {
-            crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+            crate::posix::process::enqueue(waiter);
         }
+        crate::ipc::handle::wake_epoll_waiters(&tty.epoll_waiters);
     }
 }
 
 /// Called from `schedule()`'s idle loop so UART chars are serviced
 /// when the timer ISR cannot fire (SIE=0 in supervisor mode).
 pub fn service_uart() {
-    if crate::smp::current_hartid() == 0 {
+    if crate::smp::current_hartid() == crate::smp::BOOT_HARTID.load(core::sync::atomic::Ordering::Relaxed) {
         poll_uart_into_linedisc();
     }
 }
@@ -170,8 +201,8 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
             crate::posix::process::wake_sleepers();
 
             // Drain all available UART bytes into LINE_DISC_BUFFER in one shot.
-            // Only HART 0 polls UART to avoid multiple HARTs racing on the RX register.
-            if crate::smp::current_hartid() == 0 {
+            // Only the boot HART polls UART to avoid multiple HARTs racing on the RX register.
+            if crate::smp::current_hartid() == crate::smp::BOOT_HARTID.load(core::sync::atomic::Ordering::Relaxed) {
                 poll_uart_into_linedisc();
             }
 
@@ -201,7 +232,7 @@ pub fn handle_interrupt(cause: usize, tf: &mut TrapFrame) -> *mut TrapFrame {
                         tf as *mut _
                     } else {
                         if pid != 0 {
-                            crate::posix::process::RUN_QUEUE.lock().push_back(pid);
+                            crate::posix::process::enqueue(pid);
                         }
                         crate::posix::process::schedule();
                         unsafe { crate::trap::halt_cpu() }

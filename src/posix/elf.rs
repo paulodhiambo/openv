@@ -18,12 +18,23 @@
 //!
 //! ## Limitations
 //!
-//! - Only `PT_LOAD` segments are processed.
-//! - Dynamic linking is not supported (no PT_INTERP, PT_DYNAMIC).
+//! - Only `PT_LOAD` segments are processed (no PT_INTERP).
 //! - No support for section headers or relocations.
 
 use crate::mm::pmm::{PAGE_SIZE, alloc_frame};
 use crate::mm::vmm::{PTE_R, PTE_U, PTE_W, PTE_X, PageTable};
+
+/// Information about a loaded ELF binary, returned by [`load_elf`].
+pub struct ElfLoadInfo {
+    /// Virtual address of the entry point.
+    pub entry: usize,
+    /// Virtual address of the program header table (AT_PHDR).
+    pub phdr_va: usize,
+    /// Number of program header entries (AT_PHNUM).
+    pub phnum: usize,
+    /// Size of each program header entry in bytes (AT_PHENT).
+    pub phentsize: usize,
+}
 
 /// ELF file header (64-bit).
 #[repr(C)]
@@ -101,19 +112,14 @@ const PF_R: u32 = 4;
 ///
 /// # Returns
 ///
-/// `Ok(entry_point)` with the virtual address of the entry point on
-/// success, or an error if:
-/// - The data is too small to be an ELF file.
-/// - The ELF magic number is wrong.
-/// - The program header table is malformed.
-/// - A segment extends past the end of the file.
-/// - Memory allocation fails.
+/// `Ok(ElfLoadInfo)` with entry point, program header address, count, and
+/// entry size on success, or an error string on failure.
 ///
 /// # Safety
 ///
 /// The caller must ensure that `data` points to valid memory containing
 /// a valid ELF binary.
-pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'static str> {
+pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<ElfLoadInfo, &'static str> {
     if data.len() < core::mem::size_of::<ElfHeader>() {
         return Err("File too small");
     }
@@ -127,7 +133,6 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
     let phnum = header.phnum as usize;
     let phentsize = header.phentsize as usize;
 
-    // Validate program header table bounds.
     if phentsize < core::mem::size_of::<ProgramHeader>() {
         return Err("invalid program header entry size");
     }
@@ -138,18 +143,28 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
         return Err("program headers extend past end of file");
     }
 
+    // Calculate AT_PHDR: find the first PT_LOAD to determine the load bias.
+    let mut first_load_va: Option<usize> = None;
+    let mut first_load_offset: Option<usize> = None;
+
     for i in 0..phnum {
         let ph_ptr = data.as_ptr() as usize + phoff + i * phentsize;
         let ph = unsafe { &*(ph_ptr as *const ProgramHeader) };
 
         if ph.type_ == PT_LOAD {
+            let load_va = ph.vaddr as usize;
+            let load_off = ph.offset as usize;
+            if first_load_va.is_none() || load_va < first_load_va.unwrap() {
+                first_load_va = Some(load_va);
+                first_load_offset = Some(load_off);
+            }
+
             let start_va = ph.vaddr as usize;
             let memsz = ph.memsz as usize;
             let end_va = start_va.checked_add(memsz).ok_or("integer overflow")?;
             let offset_in_file = ph.offset as usize;
             let file_size = ph.filesz as usize;
 
-            // Validate that the file data for this segment fits within the binary.
             if file_size > 0 {
                 let file_end = offset_in_file
                     .checked_add(file_size)
@@ -159,30 +174,26 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
                 }
             }
 
-            // Reject zero-sized segments.
             if memsz == 0 {
                 continue;
             }
 
-            // Flags
             let mut flags = PTE_U;
-            if (ph.flags & PF_R) != 0 {
-                flags |= PTE_R;
-            }
-            if (ph.flags & PF_W) != 0 {
-                flags |= PTE_W;
-            }
-            if (ph.flags & PF_X) != 0 {
-                flags |= PTE_X;
-            }
+            if (ph.flags & PF_R) != 0 { flags |= PTE_R; }
+            if (ph.flags & PF_W) != 0 { flags |= PTE_W; }
+            if (ph.flags & PF_X) != 0 { flags |= PTE_X; }
 
             let mut va = start_va & !(PAGE_SIZE - 1);
 
             while va < end_va {
-                // Use alloc_frame (RAII) so the page is automatically freed if
-                // map_page returns an error — alloc_page().ok_or()? would leak it.
                 let frame = alloc_frame().ok_or("Failed to alloc page for ELF")?;
                 let pa = frame.pa();
+
+                // Zero the whole page so that BSS and any intra-page
+                // padding before/after the segment data are not left as
+                // PMM poison (0xcd).  The copy below overwrites only the
+                // file-backed portion.
+                unsafe { core::ptr::write_bytes(pa as *mut u8, 0, PAGE_SIZE); }
 
                 let va_offset = va.saturating_sub(start_va);
                 let page_offset = start_va.saturating_sub(va);
@@ -191,7 +202,6 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
                     let copy_len = core::cmp::min(PAGE_SIZE - page_offset, file_size - va_offset);
                     let file_start = offset_in_file + va_offset;
 
-                    // Bounds-checked by the validation above; still guard against panic.
                     if file_start + copy_len <= data.len() {
                         unsafe {
                             let pa_ptr = (pa + page_offset) as *mut u8;
@@ -204,8 +214,6 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
                     }
                 }
 
-                // map_page success: transfer ownership of the frame to the PTE.
-                // On error: `frame` is dropped here, freeing the physical page.
                 page_table.map_page(va, pa, flags)?;
                 frame.into_raw();
                 va += PAGE_SIZE;
@@ -213,5 +221,15 @@ pub fn load_elf(data: &[u8], page_table: &mut PageTable) -> Result<usize, &'stat
         }
     }
 
-    Ok(header.entry as usize)
+    let phdr_va = match (first_load_va, first_load_offset) {
+        (Some(lva), Some(loff)) => lva + phoff - loff,
+        _ => return Err("no PT_LOAD segment found"),
+    };
+
+    Ok(ElfLoadInfo {
+        entry: header.entry as usize,
+        phdr_va,
+        phnum,
+        phentsize,
+    })
 }

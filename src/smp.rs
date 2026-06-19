@@ -44,12 +44,16 @@
 //! operations. The `tp` register is used to store the hart ID and must
 //! be set up correctly during boot.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Defined in main.rs global_asm; prevents the compiler from optimizing away the halt loop.
 unsafe extern "C" {
     fn __halt_cpu() -> !;
 }
+
+/// HART ID of the primary boot HART (whichever won the atomic election in boot.s).
+/// Used to restrict UART polling to one HART regardless of which hartid won the race.
+pub static BOOT_HARTID: AtomicUsize = AtomicUsize::new(0);
 
 /// Maximum number of harts (hardware threads) supported by the kernel.
 ///

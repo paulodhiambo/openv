@@ -54,7 +54,6 @@ jobs:
         run: |
           cargo clippy -- \
             -D warnings \
-            -A clippy::missing_safety_doc \
             -A clippy::identity_op \
             -A clippy::collapsible_if \
             -A clippy::unnecessary_cast \
@@ -65,9 +64,7 @@ jobs:
             -A clippy::manual_is_multiple_of \
             -A clippy::manual_range_contains \
             -A clippy::needless_range_loop \
-            -A clippy::not_unsafe_ptr_arg_deref \
             -A clippy::redundant_pattern_matching \
-            -A clippy::result_unit_err \
             -A clippy::slow_vector_initialization \
             -A clippy::unnecessary_map_or \
             -A clippy::while_let_loop \

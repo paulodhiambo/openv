@@ -41,3 +41,6 @@ pub mod spawn;
 pub mod user;
 /// Wait/exit handling.
 pub mod wait;
+/// Job tree hierarchy and resource policy.
+pub mod job;
+

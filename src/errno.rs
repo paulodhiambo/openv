@@ -150,6 +150,30 @@ pub const EMFILE: usize = usize::MAX - 23; // -24
 /// **POSIX name**: `ENOSYS` (38)
 pub const ENOSYS: usize = usize::MAX - 37; // -38
 
+/// Illegal seek (ESPIPE).
+///
+/// Returned when `lseek` is called on a file descriptor that does not support
+/// seeking (e.g., a pipe, FIFO, or TTY).
+///
+/// **POSIX name**: `ESPIPE` (29)
+pub const ESPIPE: usize = usize::MAX - 28; // -29
+
+/// File exists.
+///
+/// Returned when an attempt is made to create a file or object that already
+/// exists. Used by epoll_ctl(EPOLL_CTL_ADD) when the fd is already registered.
+///
+/// **POSIX name**: `EEXIST` (17)
+pub const EEXIST: usize = usize::MAX - 16; // -17
+
+/// Broken pipe.
+///
+/// Returned when a write is attempted on a pipe or socket whose read end
+/// has been closed. The process is also sent SIGPIPE (unless blocked/ignored).
+///
+/// **POSIX name**: `EPIPE` (32)
+pub const EPIPE: usize = usize::MAX - 31; // -32
+
 /// Connection refused.
 ///
 /// Returned when a connection attempt is refused by the remote host.

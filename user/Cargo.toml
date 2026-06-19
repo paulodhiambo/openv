@@ -1,3 +1,32 @@
 [workspace]
-members = ["libos", "vfs-proto", "pm-proto", "vfs-server", "pm-server", "rs-server", "init", "sh", "ls", "cat", "producer", "consumer", "net-smoltcp", "hello", "doexec", "forktest", "spin", "echo-server", "net-client", "ipc_test", "virtio-blk-driver"]
+members = ["libos", "vfs-proto", "pm-proto", "vfs-server", "pm-server", "rs-server", "init", "sh", "ls", "cat", "producer", "consumer", "net-smoltcp", "hello", "doexec", "forktest", "spin", "echo-server", "net-client", "ipc_test", "virtio-blk-driver", "openv_syscall", "libopenv", "pkg", "epolltest", "procfs-server", "devfs-server", "component-manager", "driver-abi"]
 resolver = "2"
+
+[workspace.lints.rust]
+dangling_pointers_from_temporaries = "deny"
+dead_code = "allow"
+deprecated = "deny"
+improper_ctypes_definitions = "deny"
+internal_features = "allow"
+irrefutable_let_patterns = "deny"
+mismatched_lifetime_syntaxes = "deny"
+non_camel_case_types = "allow"
+non_snake_case = "allow"
+non_upper_case_globals = "allow"
+unexpected_cfgs = "deny"
+unpredictable_function_pointer_comparisons = "deny"
+unreachable_code = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+unused_imports = "deny"
+unused_must_use = "deny"
+unused_mut = "deny"
+unused_unsafe = "deny"
+unused_variables = "allow"
+
+[workspace.dependencies]
+bitflags = "2"
+ioslice = { version = "0.6", default-features = false }
+plain = "0.2"
+redox-path = "0.3"
+redox_protocols = { package = "libredox", version = "0.1.17", default-features = false, features = ["protocol"] }
+redox_syscall = "0.8.1"

@@ -66,6 +66,18 @@ pub static SATP_REFCOUNT: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::n
 /// Futex wait table: maps (user virtual address) → list of sleeping PIDs.
 pub static FUTEX_TABLE: Mutex<BTreeMap<usize, VecDeque<Pid>>> = Mutex::new(BTreeMap::new());
 
+/// The root Job container for the system.
+pub static ROOT_JOB: Mutex<Option<Arc<crate::posix::job::Job>>> = Mutex::new(None);
+
+/// Returns the root Job container, allocating it if not already initialized.
+pub fn get_root_job() -> Arc<crate::posix::job::Job> {
+    let mut root = ROOT_JOB.lock();
+    if root.is_none() {
+        *root = Some(Arc::new(crate::posix::job::Job::new(None)));
+    }
+    root.as_ref().unwrap().clone()
+}
+
 /// Marks `root_pa` as shared by one additional thread.
 ///
 /// # Arguments
@@ -92,18 +104,14 @@ pub fn satp_unshare(root_pa: usize) -> bool {
     if let Some(count) = map.get_mut(&root_pa) {
         *count -= 1;
         let remaining = *count;
-        // Remove the entry early (at ≤1) so the last registered owner
-        // doesn't need to look up a dying entry; it will fall through to
-        // the else branch and return true.  Return true as soon as we
-        // drop to ≤1 — either this is the last owner (remaining==0) or
-        // only the implicit original owner remains (remaining==1) and it
-        // will be freed by the next satp_unshare via the else branch.
-        if remaining <= 1 {
+        if remaining == 0 {
             map.remove(&root_pa);
+            true  // last tracked owner — caller must free the page table
+        } else {
+            false // other owners remain
         }
-        remaining <= 1
     } else {
-        // Not in the shared map — this process is the sole owner.
+        // Not in the shared map — this process is the sole (unregistered) owner.
         true
     }
 }
@@ -129,6 +137,25 @@ pub const CAP_PROCESS: u64   = 1 << 3;
 pub const CAP_INTERRUPT: u64 = 1 << 4;
 /// Perform system administration tasks.
 pub const CAP_SYS_ADMIN: u64 = 1 << 5;
+/// Driver access: MMIO mapping and IRQ registration.
+pub const CAP_DRIVER: u64    = 1 << 6;
+/// Configure network interfaces (IP, routes, etc.).
+pub const CAP_NET_ADMIN: u64 = 1 << 7;
+/// Mount/unmount filesystems.
+pub const CAP_MOUNT: u64     = 1 << 8;
+/// Send signals to any process regardless of ownership.
+pub const CAP_KILL_ANY: u64  = 1 << 9;
+
+/// Real-time priority (highest): 0.
+pub const PRIO_REALTIME: i32 = 0;
+/// High priority (IPC-intensive servers): 8.
+pub const PRIO_HIGH: i32     = 8;
+/// Normal user-space priority: 16.
+pub const PRIO_NORMAL: i32   = 16;
+/// Low background priority: 24.
+pub const PRIO_LOW: i32      = 24;
+/// Idle-only priority (lowest): 31.
+pub const PRIO_IDLE: i32     = 31;
 
 /// The state of a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +183,8 @@ pub enum IpcState {
     MessageAvailable { msg: crate::ipc::msg::Message },
     /// A send has completed.
     SendComplete,
+    /// Waiting for a POSIX byte-range file lock (F_SETLKW).
+    LockWaiting { lock_id: u64, l_type: i16, l_start: i64, l_end: i64 },
 }
 
 /// A process in the system.
@@ -190,6 +219,8 @@ pub struct Process {
     pub egid: AtomicU32,
     /// Capability mask.
     pub caps: AtomicU64,
+    /// Scheduling priority: 0 (highest / PRIO_REALTIME) … 31 (lowest / PRIO_IDLE).
+    pub priority: AtomicI32,
     /// The current state of the process.
     pub state: Mutex<ProcState>,
     /// The file descriptor table.
@@ -209,6 +240,12 @@ pub struct Process {
     pub kernel_stack_bottom: usize,
     /// Current working directory — inherited from parent, updated by chdir.
     pub cwd: Mutex<String>,
+    /// The Job container for this process.
+    pub job: Arc<crate::posix::job::Job>,
+    /// The number of physical pages allocated to this process's user space.
+    pub allocated_pages: AtomicUsize,
+    /// User-space address to clear (write 0) and futex-wake on thread exit (CLONE_CHILD_CLEARTID).
+    pub clear_tid_ptr: AtomicUsize,
 
     // Fields to support synchronous waitpid
     /// Target PID for synchronous waitpid.
@@ -248,7 +285,7 @@ pub struct Process {
 
     // Namespaces
     /// The set of namespaces this process belongs to.
-    pub ns: crate::namespace::NsSet,
+    pub ns: Mutex<crate::namespace::NsSet>,
 }
 
 /// Canary value written to `kstack_bottom` on process creation.
@@ -265,9 +302,30 @@ pub static FOREGROUND_PID: AtomicI32 = AtomicI32::new(-1);
 
 /// Global process table, mapping PIDs to [`Process`] arcs.
 pub static PROCESS_TABLE: Mutex<BTreeMap<Pid, Arc<Process>>> = Mutex::new(BTreeMap::new());
-/// Global run queue of ready processes.
-pub static RUN_QUEUE: Mutex<alloc::collections::VecDeque<Pid>> =
-    Mutex::new(alloc::collections::VecDeque::new());
+/// Global run queue: BTreeMap keyed by priority (0 = highest), each bucket a FIFO.
+pub static RUN_QUEUE: Mutex<BTreeMap<i32, VecDeque<Pid>>> = Mutex::new(BTreeMap::new());
+
+/// Enqueue `pid` into the run queue at an explicit priority level.
+///
+/// Callers that already hold a reference to the process or hold PROCESS_TABLE
+/// must use this variant to avoid a second PROCESS_TABLE lock.
+pub fn enqueue_with_prio(pid: Pid, prio: i32) {
+    RUN_QUEUE.lock()
+        .entry(prio)
+        .or_insert_with(VecDeque::new)
+        .push_back(pid);
+}
+
+/// Enqueue `pid` using the process's stored priority.
+///
+/// Must NOT be called while PROCESS_TABLE is already locked on this HART.
+pub fn enqueue(pid: Pid) {
+    let prio = PROCESS_TABLE.lock()
+        .get(&pid)
+        .map(|p| p.priority.load(Ordering::Relaxed))
+        .unwrap_or(PRIO_NORMAL);
+    enqueue_with_prio(pid, prio);
+}
 
 /// Queue of `(Pid, wakeup_mtime_ticks)` for sleeping processes.
 pub static SLEEP_QUEUE: Mutex<alloc::vec::Vec<(Pid, u64)>> = Mutex::new(alloc::vec::Vec::new());
@@ -289,6 +347,17 @@ pub fn generate_pid() -> Pid {
     NEXT_PID.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Generates a weak random value from the RISC-V `time` CSR for ASLR.
+/// This is not cryptographically secure but sufficient for address
+/// randomization to prevent simple deterministic-exploit patterns.
+fn aslr_rand() -> usize {
+    let cycle = riscv::register::time::read() as usize;
+    let hart = crate::smp::current_hartid();
+    // Simple linear mixing: multiply by a large odd constant and XOR
+    // with the hart ID so different HARTs produce different layouts.
+    cycle.wrapping_mul(0x9E37_79B9).wrapping_add(hart.wrapping_mul(0x10001))
+}
+
 /// Wakes up any sleeping processes whose sleep time has expired.
 ///
 /// This function should be called on each timer tick to handle
@@ -306,8 +375,8 @@ pub fn wake_sleepers() {
             // can't observe the process as Stopped after it appears in the queue.
             if let Some(proc) = PROCESS_TABLE.lock().get(&pid).cloned() {
                 *proc.state.lock() = ProcState::Running;
+                enqueue_with_prio(pid, proc.priority.load(Ordering::Relaxed));
             }
-            RUN_QUEUE.lock().push_back(pid);
         } else {
             i += 1;
         }
@@ -352,7 +421,16 @@ pub fn schedule() -> ! {
         unsafe { riscv::register::sstatus::clear_sie(); }
         let next_pid = {
             let mut rq = RUN_QUEUE.lock();
-            rq.pop_front()
+            // Pop from the lowest-numbered (highest-priority) non-empty bucket.
+            let prio = rq.keys().next().copied();
+            if let Some(p) = prio {
+                let bucket = rq.get_mut(&p).unwrap();
+                let pid = bucket.pop_front();
+                if bucket.is_empty() { rq.remove(&p); }
+                pid
+            } else {
+                None
+            }
         };
 
         if let Some(pid) = next_pid {
@@ -383,7 +461,8 @@ pub fn schedule() -> ! {
                 }
 
                 let tf_ptr = {
-                    let tf = proc.trap_frame.lock();
+                    let mut tf = proc.trap_frame.lock();
+                    tf.kernel_hartid = crate::smp::current_hartid();
                     &(*tf) as *const crate::trap::TrapFrame as usize
                 };
 
@@ -417,6 +496,14 @@ impl Process {
     /// Callers in syscall handlers should translate errors to
     /// [`crate::errno::ENOMEM`].
     pub fn new(ppid: Pid) -> Result<Arc<Self>, &'static str> {
+        // Enforce a per-system process-count ceiling to prevent unbounded resource
+        // exhaustion.  512 concurrent processes is far more than any realistic
+        // workload on this platform.
+        const MAX_PROCESSES: usize = 512;
+        if PROCESS_TABLE.lock().len() >= MAX_PROCESSES {
+            return Err("process limit reached");
+        }
+
         let pid = generate_pid();
 
         let pt_addr = crate::mm::vmm::PageTable::new_process_table()
@@ -451,8 +538,8 @@ impl Process {
             if let Some(parent) = parent_arc {
                 let parent_fds = parent.fds.lock();
                 let mut new_fds = HandleTable::new();
-                for (h, obj) in parent_fds.iter() {
-                    new_fds.insert_at(*h, obj.clone());
+                for (h, entry) in parent_fds.iter() {
+                    new_fds.insert_entry(crate::ipc::handle::encode_handle(*h, entry.generation), entry.clone());
                 }
                 // Inherit FD_CLOEXEC flags so exec in the child closes them correctly.
                 for h in parent_fds.cloexec_handles() {
@@ -474,7 +561,7 @@ impl Process {
             fds
         };
 
-        let (uid, gid, euid, egid, caps, cwd, handlers, restorers, masks, blocked, pgid, sid, ns) = if ppid != 0 {
+        let (uid, gid, euid, egid, caps, prio, cwd, handlers, restorers, masks, blocked, pgid, sid, ns) = if ppid != 0 {
             if let Some(parent) = PROCESS_TABLE.lock().get(&ppid) {
                 (
                     parent.uid.load(Ordering::Relaxed),
@@ -482,6 +569,11 @@ impl Process {
                     parent.euid.load(Ordering::Relaxed),
                     parent.egid.load(Ordering::Relaxed),
                     parent.caps.load(Ordering::Relaxed),
+                    // Always start new processes at PRIO_NORMAL so that
+                    // PRIO_HIGH servers (rs-server, etc.) cannot starve
+                    // PRIO_NORMAL user processes by spawning PRIO_HIGH children.
+                    // kmain raises boot-server priorities explicitly after spawn.
+                    PRIO_NORMAL,
                     parent.cwd.lock().clone(),
                     *parent.signal_handlers.lock(),
                     *parent.signal_restorers.lock(),
@@ -489,16 +581,29 @@ impl Process {
                     parent.blocked_signals.load(Ordering::Relaxed),
                     parent.pgid.load(Ordering::Relaxed),
                     parent.sid.load(Ordering::Relaxed),
-                    crate::namespace::NsSet::fork_from(&parent.ns, 0), // inherit, no new ns
+                    crate::namespace::NsSet::fork_from(&parent.ns.lock(), 0), // inherit, no new ns
                 )
             } else {
-                (0, 0, 0, 0, CAP_NONE, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
+                (0, 0, 0, 0, CAP_NONE, PRIO_NORMAL, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
                  crate::namespace::NsSet::root())
             }
         } else {
-            (0, 0, 0, 0, CAP_NONE, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
+            (0, 0, 0, 0, CAP_NONE, PRIO_NORMAL, String::from("/"), [0; 32], [0; 32], [0; 32], 0, pid, pid,
              crate::namespace::NsSet::root())
         };
+
+        let job = if ppid != 0 {
+            let parent_arc = PROCESS_TABLE.lock().get(&ppid).cloned();
+            if let Some(parent) = parent_arc {
+                parent.job.clone()
+            } else {
+                get_root_job()
+            }
+        } else {
+            get_root_job()
+        };
+
+        job.processes.lock().push(pid);
 
         let proc = Arc::new(Process {
             pid,
@@ -511,15 +616,19 @@ impl Process {
             euid: AtomicU32::new(euid),
             egid: AtomicU32::new(egid),
             caps: AtomicU64::new(caps),
+            priority: AtomicI32::new(prio),
             state: Mutex::new(ProcState::Running),
             fds: Mutex::new(fds),
             children: Mutex::new(Vec::new()),
             trap_frame: Mutex::new(tf),
             satp_val: AtomicUsize::new(satp_val_bits),
-            next_mmap_va: AtomicUsize::new(0x4_0000_0000), // 16 GB – above 4 GB identity map
-            heap_break: AtomicUsize::new(0x2_0000_0000),   // 8 GB initial brk
+            next_mmap_va: AtomicUsize::new((0x4_0000_0000 + (aslr_rand() & 0x0FFF_FFFF)) & !0xFFF), // ASLR offset
+            heap_break: AtomicUsize::new(0x2_0000_0000 + (aslr_rand() & 0x00FF_FFFF)),           // ASLR offset for brk
             kernel_stack_bottom: kstack_bottom,
             cwd: Mutex::new(cwd),
+            job,
+            allocated_pages: AtomicUsize::new(0),
+            clear_tid_ptr: AtomicUsize::new(0),
             wait_target: Mutex::new(None),
             wait_status_ptr: Mutex::new(None),
             wait_result: Mutex::new(VecDeque::new()),
@@ -533,7 +642,7 @@ impl Process {
             signal_handlers: Mutex::new(handlers),
             signal_restorers: Mutex::new(restorers),
             signal_masks: Mutex::new(masks),
-            ns,
+            ns: Mutex::new(ns),
         });
 
         PROCESS_TABLE.lock().insert(pid, proc.clone());

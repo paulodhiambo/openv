@@ -40,3 +40,6 @@ pub mod channel;
 pub mod handle;
 /// Low-level message types used by the IPC system.
 pub mod msg;
+/// Asynchronous port event multiplexing primitives.
+pub mod port;
+

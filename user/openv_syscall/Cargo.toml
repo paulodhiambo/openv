@@ -1,0 +1,7 @@
+[package]
+name = "openv_syscall"
+version = "0.1.0"
+edition = "2024"
+description = "Raw OpenV syscall ABI wrappers for RISC-V 64"
+
+[dependencies]

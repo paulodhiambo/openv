@@ -292,14 +292,15 @@ impl NetDevice for VirtioDriver {
     ///
     /// The number of bytes received, or 0 if no packet is available.
     fn recv(&self, buf: &mut [u8]) -> usize {
-        // Poll RX used ring for a completed receive
+        // Poll RX used ring for one completed receive.
+        // Use pop_one_used() so that exactly one entry is consumed per call;
+        // smoltcp's iface.poll() loops calling receive() until None, which
+        // drains all queued frames without silently discarding descriptors.
         let (rx_pa, rx_len) = {
             let mut rx = self.rx_vq.lock();
-            let done = rx.pop_used();
-            if done.is_empty() {
+            let Some((id, pkt_len)) = rx.pop_one_used() else {
                 return 0;
-            }
-            let (id, pkt_len) = done[0];
+            };
             // Recover physical address from the descriptor before freeing it
             let pa = rx.desc_addr(id) as usize;
             // Return descriptor to free list and immediately re-enqueue for next receive

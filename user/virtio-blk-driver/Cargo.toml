@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 libos = { path = "../libos" }
 spin = "0.9.8"
+driver-abi = { path = "../driver-abi" }

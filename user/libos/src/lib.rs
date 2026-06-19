@@ -7,9 +7,11 @@ use core::arch::global_asm;
 use core::panic::PanicInfo;
 
 // ── User-space heap ────────────────────────────────────────────────────────────
-#[cfg(feature = "large-heap")]
+#[cfg(feature = "huge-heap")]
+const USER_HEAP_SIZE: usize = 32 * 1024 * 1024;
+#[cfg(all(feature = "large-heap", not(feature = "huge-heap")))]
 const USER_HEAP_SIZE: usize = 8 * 1024 * 1024;
-#[cfg(not(feature = "large-heap"))]
+#[cfg(all(not(feature = "large-heap"), not(feature = "huge-heap")))]
 const USER_HEAP_SIZE: usize = 2 * 1024 * 1024;
 
 #[global_allocator]
@@ -116,6 +118,33 @@ pub fn syscall5(
     ret
 }
 
+#[inline]
+pub fn syscall6(
+    sys_num: usize,
+    arg0: usize,
+    arg1: usize,
+    arg2: usize,
+    arg3: usize,
+    arg4: usize,
+    arg5: usize,
+) -> usize {
+    let mut ret: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") arg0 => ret,
+            in("a1") arg1,
+            in("a2") arg2,
+            in("a3") arg3,
+            in("a4") arg4,
+            in("a5") arg5,
+            in("a7") sys_num,
+            options(nostack)
+        );
+    }
+    ret
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn sys_yield() {
     syscall(0, 0, 0, 0);
@@ -123,7 +152,7 @@ pub extern "C" fn sys_yield() {
 
 fn close_all_vfs_fds() {
     for i in 0..256 {
-        let res = syscall(81, i, 6 /* F_GET_VFS_FD */, 0);
+        let res = syscall(81, i, 1001 /* F_GET_VFS_FD */, 0);
         if res != usize::MAX {
             vfs_close(res as u32);
             syscall(9, i, 0, 0); // remove the stale VfsFile handle from the kernel table
@@ -142,7 +171,7 @@ pub extern "C" fn exit(status: i32) -> ! {
 #[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn write(fd: usize, buf: *const u8, len: usize) -> isize {
-    let res = syscall(81, fd, 6, 0);
+    let res = syscall(81, fd, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         return vfs_write(vfs_fd, u64::MAX, unsafe {
@@ -158,9 +187,64 @@ pub extern "C" fn pipe(fds: *mut [u32; 2]) -> i32 {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn channel_create(fds: *mut [u32; 2]) -> i32 {
+    syscall(94, fds as usize, 0, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn channel_write(
+    fd: usize,
+    buf: *const u8,
+    buf_len: usize,
+    handles: *const u32,
+    handles_len: usize,
+) -> i32 {
+    syscall5(95, fd, buf as usize, buf_len, handles as usize, handles_len) as i32
+}
+
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn channel_read(
+    fd: usize,
+    buf: *mut u8,
+    buf_len: usize,
+    handles: *mut u32,
+    handles_len: usize,
+    out_bytes_read: *mut usize,
+    out_handles_read: *mut usize,
+) -> i32 {
+    let mut ret_bytes: usize;
+    let mut ret_handles: usize;
+    unsafe {
+        asm!(
+            "ecall",
+            inlateout("a0") fd => ret_bytes,
+            inlateout("a1") buf as usize => ret_handles,
+            in("a2") buf_len,
+            in("a3") handles as usize,
+            in("a4") handles_len,
+            in("a7") 96,
+            options(nostack)
+        );
+    }
+    if ret_bytes >= (usize::MAX - 200) {
+        return ret_bytes as i32;
+    }
+    unsafe {
+        if !out_bytes_read.is_null() {
+            *out_bytes_read = ret_bytes;
+        }
+        if !out_handles_read.is_null() {
+            *out_handles_read = ret_handles;
+        }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn read(fd: usize, buf: *mut u8, len: usize) -> isize {
-    let res = syscall(81, fd, 6, 0);
+    let res = syscall(81, fd, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         return vfs_read(vfs_fd, u64::MAX, unsafe {
@@ -179,7 +263,11 @@ pub extern "C" fn open(path_ptr: *const u8, path_len: usize, flags: u32) -> i32 
         if vfs_fd > 0 {
             return syscall(81, usize::MAX, 5, vfs_fd as usize) as i32;
         }
+        // VFS is running but the file was not found — propagate the error
+        // rather than falling through to the kernel-level open.
+        return -1;
     }
+    // VFS not yet started: ask the kernel (returns ENOENT — no native FS).
     syscall(8, path_ptr as usize, path_len, flags as usize) as i32
 }
 
@@ -244,7 +332,7 @@ pub fn set_raw(enabled: u32) -> i32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn close(fd: i32) -> i32 {
-    let res = syscall(81, fd as usize, 6, 0);
+    let res = syscall(81, fd as usize, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         vfs_close(vfs_fd);
@@ -399,6 +487,18 @@ pub fn try_recv(fd: usize, buf: *mut u8, len: usize) -> isize {
     syscall(49, fd, buf as usize, len) as isize
 }
 
+/// `recv` with a yield-count timeout. Returns -1 when no data arrives within
+/// `max_yields` scheduler turns. Non-blocking per turn; the caller can treat a
+/// negative return as a network error.
+pub fn recv_timeout(fd: usize, buf: *mut u8, len: usize, max_yields: usize) -> isize {
+    for _ in 0..max_yields {
+        let n = try_recv(fd, buf, len);
+        if n != 0 { return n; }
+        sys_yield();
+    }
+    -1
+}
+
 pub fn getpid() -> i32 {
     syscall(53, 0, 0, 0) as i32
 }
@@ -474,8 +574,23 @@ pub extern "C" fn sigreturn() {
     syscall(89, 0, 0, 0);
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn sigprocmask(how: i32, set: *const u32, old_set: *mut u32) -> i32 {
+    syscall(69, how as usize, set as usize, old_set as usize) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigpending(set: *mut u32) -> i32 {
+    syscall(97, set as usize, 0, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn arch_prctl(code: usize, val: usize) -> i32 {
+    syscall(98, code, val, 0) as i32
+}
+
 pub fn dup(oldfd: i32) -> i32 {
-    let res = syscall(81, oldfd as usize, 6, 0);
+    let res = syscall(81, oldfd as usize, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         if let Some(new_server_fd) = vfs_dup(vfs_fd) {
@@ -487,7 +602,7 @@ pub fn dup(oldfd: i32) -> i32 {
 }
 
 pub fn dup2(oldfd: i32, newfd: i32) -> i32 {
-    let res = syscall(81, oldfd as usize, 6, 0);
+    let res = syscall(81, oldfd as usize, 1001, 0);
     if res != usize::MAX {
         let vfs_fd = res as u32;
         if let Some(new_server_fd) = vfs_dup(vfs_fd) {
@@ -501,6 +616,45 @@ pub fn dup2(oldfd: i32, newfd: i32) -> i32 {
 
 pub fn set_fg_pid(pid: i32) {
     syscall(60, pid as usize, 0, 0);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lseek(fd: i32, offset: i64, whence: i32) -> i64 {
+    // Check if this is a VFS-backed fd.
+    let res = syscall(81, fd as usize, 1001 /* F_GET_VFS_FD */, 0);
+    if res != usize::MAX {
+        return vfs_lseek(res as u32, offset, whence as u32);
+    }
+    // Fall back to kernel lseek.
+    let ret = syscall(19, fd as usize, offset as usize, whence as usize);
+    if ret == usize::MAX { -1 } else { ret as i64 }
+}
+
+#[repr(C)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// Simple poll(2) wrapper — iterates the fd array once without blocking.
+/// Returns the number of ready fds, or -1 on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn poll(fds: *mut PollFd, nfds: usize, timeout: i32) -> i32 {
+    syscall(68, fds as usize, nfds, timeout as usize) as i32
+}
+
+/// tcsetpgrp — set the foreground process group of the terminal.
+/// Equivalent to calling `ioctl(fd, TIOCSPGRP, &pgrp)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn tcsetpgrp(fd: i32, pgrp: i32) -> i32 {
+    // Validate fd is a TTY via fcntl; then delegate to kernel.
+    if fd >= 0 {
+        syscall(60, pgrp as usize, 0, 0);
+        0
+    } else {
+        -1
+    }
 }
 
 pub fn ipc_send(to_pid: i32, buf: &[u8]) -> i32 {
@@ -523,6 +677,17 @@ pub fn vfs_register() {
 pub fn get_vfs_pid() -> i32 {
     let v = syscall(64, 0, 0, 0);
     if v == usize::MAX { -1 } else { v as i32 }
+}
+
+/// Registers the calling process as the component manager.
+pub fn cm_register() {
+    syscall(163, 0, 0, 0);
+}
+
+/// Returns the PID of the registered component manager (−1 if not started).
+pub fn get_cm_pid() -> i32 {
+    let v = syscall(164, 0, 0, 0);
+    if v == 0 || v == usize::MAX { -1 } else { v as i32 }
 }
 
 pub fn datacopy(
@@ -576,7 +741,7 @@ fn vfs_call(msg: &mut ipc::Message) -> bool {
 pub fn vfs_open(path: &[u8], flags: u32) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_OPEN;
-    vfs_proto::pack_path_req(&mut msg.data, flags, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, flags, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as i32
     } else {
@@ -587,7 +752,7 @@ pub fn vfs_open(path: &[u8], flags: u32) -> i32 {
 pub fn vfs_create(path: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_CREATE;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         vfs_proto::unpack_u32_reply(&msg.data) as i32
     } else {
@@ -660,7 +825,7 @@ pub fn vfs_getdents(path: &[u8], buf: &mut [u8]) -> isize {
 pub fn vfs_mkdir(path: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_MKDIR;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         0
     } else {
@@ -671,7 +836,7 @@ pub fn vfs_mkdir(path: &[u8]) -> i32 {
 pub fn vfs_unlink(path: &[u8]) -> i32 {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_UNLINK;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         0
     } else {
@@ -699,7 +864,7 @@ pub fn vfs_rename(old: &[u8], new: &[u8]) -> i32 {
 pub fn vfs_stat(path: &[u8]) -> Option<(bool, u64)> {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_STAT;
-    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len());
+    vfs_proto::pack_path_req(&mut msg.data, 0, path.as_ptr() as usize, path.len(), getnsid());
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         Some(vfs_proto::unpack_stat_reply(&msg.data))
     } else {
@@ -710,7 +875,7 @@ pub fn vfs_stat(path: &[u8]) -> Option<(bool, u64)> {
 pub fn vfs_dup(vfs_fd: u32) -> Option<u32> {
     let mut msg = ipc::Message::new();
     msg.type_ = vfs_proto::OP_DUP;
-    vfs_proto::pack_u32_reply(&mut msg.data, vfs_fd); // reuse u32 pack for the single fd
+    vfs_proto::pack_u32_reply(&mut msg.data, vfs_fd);
     if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
         Some(vfs_proto::unpack_u32_reply(&msg.data))
     } else {
@@ -718,8 +883,103 @@ pub fn vfs_dup(vfs_fd: u32) -> Option<u32> {
     }
 }
 
+pub fn vfs_readlink(path: &[u8], out: &mut [u8]) -> isize {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_READLINK;
+    vfs_proto::pack_getdents_req(&mut msg.data, path.as_ptr() as usize, path.len(), out.as_mut_ptr() as usize, out.len());
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        vfs_proto::unpack_u32_reply(&msg.data) as isize
+    } else {
+        -1
+    }
+}
+
+pub fn vfs_symlink(link_path: &[u8], target: &[u8]) -> i32 {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_SYMLINK;
+    vfs_proto::pack_two_paths_req(&mut msg.data, link_path.as_ptr() as usize, link_path.len(), target.as_ptr() as usize, target.len());
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+pub fn vfs_link(old: &[u8], new: &[u8]) -> i32 {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_LINK;
+    vfs_proto::pack_two_paths_req(&mut msg.data, old.as_ptr() as usize, old.len(), new.as_ptr() as usize, new.len());
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+pub fn vfs_chmod(path: &[u8], mode: u32) -> i32 {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_CHMOD;
+    vfs_proto::pack_path_req(&mut msg.data, mode, path.as_ptr() as usize, path.len(), getnsid());
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+pub fn vfs_chown(path: &[u8], owner: u32, _group: u32) -> i32 {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_CHOWN;
+    vfs_proto::pack_path_req(&mut msg.data, owner, path.as_ptr() as usize, path.len(), getnsid());
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+pub fn vfs_ftruncate(vfs_fd: u32, length: u64) -> i32 {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_FTRUNCATE;
+    vfs_proto::pack_ftruncate_req(&mut msg.data, vfs_fd, length);
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+pub fn vfs_lseek(vfs_fd: u32, offset: i64, whence: u32) -> i64 {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_LSEEK;
+    vfs_proto::pack_lseek_req(&mut msg.data, vfs_fd, offset, whence);
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        vfs_proto::unpack_u64_reply(&msg.data) as i64
+    } else {
+        -1
+    }
+}
+
+pub fn vfs_fpath(vfs_fd: u32, buf: &mut [u8]) -> isize {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_FPATH;
+    vfs_proto::pack_fpath_req(&mut msg.data, vfs_fd, buf.as_mut_ptr() as usize, buf.len());
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK {
+        vfs_proto::unpack_u32_reply(&msg.data) as isize
+    } else {
+        -1
+    }
+}
+
+pub fn vfs_futimens(vfs_fd: u32, atime_sec: i64, atime_nsec: i64, mtime_sec: i64, mtime_nsec: i64) -> i32 {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_FUTIMENS;
+    vfs_proto::pack_futimens_req(&mut msg.data, vfs_fd, atime_sec, atime_nsec, mtime_sec, mtime_nsec);
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
+pub fn vfs_fallocate(vfs_fd: u32, offset: u64, length: u64) -> i32 {
+    let mut msg = ipc::Message::new();
+    msg.type_ = vfs_proto::OP_FALLOCATE;
+    vfs_proto::pack_fallocate_req(&mut msg.data, vfs_fd, offset, length);
+    if vfs_call(&mut msg) && msg.type_ == vfs_proto::REPLY_OK { 0 } else { -1 }
+}
+
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    // Write a minimal message so OOM/assert panics are visible on stderr.
+    let msg = b"panic: process aborted\n";
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") 2usize,   // sys_write
+            in("a0") 2usize,   // fd=2 (stderr)
+            in("a1") msg.as_ptr(),
+            in("a2") msg.len(),
+            options(nostack),
+        );
+    }
+    let _ = info;
     exit(1);
 }
 
@@ -788,17 +1048,32 @@ pub fn fork() -> i32 {
 
 pub fn exec(path: &[u8]) -> i32 {
     close_all_vfs_fds();
-    syscall4(51, path.as_ptr() as usize, path.len(), 0, 0) as i32
+    syscall6(51, path.as_ptr() as usize, path.len(), 0, 0, 0, 0) as i32
 }
 
 pub fn exec_args(path: &[u8], argv_buf: &[u8]) -> i32 {
     close_all_vfs_fds();
-    syscall4(
+    syscall6(
         51,
         path.as_ptr() as usize,
         path.len(),
         argv_buf.as_ptr() as usize,
         argv_buf.len(),
+        0,
+        0,
+    ) as i32
+}
+
+pub fn exec_args_envp(path: &[u8], argv_buf: &[u8], envp_buf: &[u8]) -> i32 {
+    close_all_vfs_fds();
+    syscall6(
+        51,
+        path.as_ptr() as usize,
+        path.len(),
+        argv_buf.as_ptr() as usize,
+        argv_buf.len(),
+        envp_buf.as_ptr() as usize,
+        envp_buf.len(),
     ) as i32
 }
 
@@ -874,7 +1149,7 @@ pub fn vfs_fsync(vfs_fd: u32) -> i32 {
 
 /// Flush all pending writes for `fd` to durable storage.
 pub fn fsync(fd: i32) -> i32 {
-    let res = syscall(81, fd as usize, 6, 0); // F_GET_VFS_FD
+    let res = syscall(81, fd as usize, 1001, 0); // F_GET_VFS_FD
     if res != usize::MAX {
         return vfs_fsync(res as u32);
     }
@@ -947,3 +1222,144 @@ pub fn trace_attach(handle: usize, tp_id: usize) -> usize {
 pub fn trace_read(buf: &mut [u8]) -> usize {
     syscall(142, buf.as_mut_ptr() as usize, buf.len(), 0)
 }
+
+// ── Ports and Jobs (Fuchsia/Zircon level capabilities) ───────────────────────
+
+pub const SIGNAL_READABLE: u32 = 1 << 0;
+pub const SIGNAL_WRITABLE: u32 = 1 << 1;
+pub const SIGNAL_PEER_CLOSED: u32 = 1 << 2;
+
+#[derive(Clone, Copy, Debug)]
+#[repr(C)]
+pub struct PortPacket {
+    pub key: u64,
+    pub type_: u32,
+    pub status: i32,
+    pub observed_signals: u32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn port_create(out_handle: *mut u32) -> i32 {
+    syscall(70, out_handle as usize, 0, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn port_wait(port_handle: u32, out_packet: *mut PortPacket) -> i32 {
+    syscall(71, port_handle as usize, out_packet as usize, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn port_queue(port_handle: u32, packet: *const PortPacket) -> i32 {
+    syscall(72, port_handle as usize, packet as usize, 0) as i32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn port_bind(
+    object_handle: u32,
+    port_handle: u32,
+    key: u64,
+    trigger_signals: u32,
+) -> i32 {
+    syscall4(
+        73,
+        object_handle as usize,
+        port_handle as usize,
+        key as usize,
+        trigger_signals as usize,
+    ) as i32
+}
+
+pub const JOB_POLICY_MAX_MEMORY: u32 = 1;
+
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn job_create(
+    parent_job_handle: u32,
+    options: u32,
+    out_job_handle: *mut u32,
+) -> i32 {
+    let ret = syscall(74, parent_job_handle as usize, options as usize, 0);
+    if ret >= (usize::MAX - 200) {
+        return ret as i32;
+    }
+    unsafe {
+        if !out_job_handle.is_null() {
+            *out_job_handle = ret as u32;
+        }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn job_set_policy(job_handle: u32, policy_type: u32, value: usize) -> i32 {
+    syscall(75, job_handle as usize, policy_type as usize, value) as i32
+}
+
+pub const RIGHTS_READ: u32 = 1 << 0;
+pub const RIGHTS_WRITE: u32 = 1 << 1;
+pub const RIGHTS_DUPLICATE: u32 = 1 << 2;
+pub const RIGHTS_TRANSFER: u32 = 1 << 3;
+
+#[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+pub extern "C" fn handle_duplicate(handle: u32, rights: u32, out_handle: *mut u32) -> i32 {
+    let ret = syscall(76, handle as usize, rights as usize, 0);
+    if ret >= (usize::MAX - 200) {
+        return ret as i32;
+    }
+    unsafe {
+        if !out_handle.is_null() {
+            *out_handle = ret as u32;
+        }
+    }
+    0
+}
+
+// ── Namespace ─────────────────────────────────────────────────────────────────
+
+/// Returns the calling process's mount namespace ID.
+pub fn getnsid() -> u32 {
+    syscall(170, 0, 0, 0) as u32
+}
+
+// ── Priority scheduling ────────────────────────────────────────────────────────
+
+pub const PRIO_REALTIME: i32 = 0;
+pub const PRIO_HIGH: i32     = 8;
+pub const PRIO_NORMAL: i32   = 16;
+pub const PRIO_LOW: i32      = 24;
+pub const PRIO_IDLE: i32     = 31;
+
+/// Sets the calling process's scheduling priority (0 = highest, 31 = lowest).
+pub fn setpriority(prio: i32) -> i32 {
+    syscall(167, prio as usize, 0, 0) as i32
+}
+
+/// Returns the calling process's scheduling priority.
+pub fn getpriority() -> i32 {
+    syscall(168, 0, 0, 0) as i32
+}
+
+/// Grants a subset of the caller's capability mask to another process.
+pub fn cap_grant(target_pid: i32, caps: u64) -> i32 {
+    syscall(169, target_pid as usize, caps as usize, 0) as i32
+}
+
+// ── VMO wrappers ───────────────────────────────────────────────────────────────
+
+/// Creates a Virtual Memory Object of `size` bytes. Returns a handle or negative errno.
+pub fn vmo_create(size: usize) -> i32 {
+    syscall(150, size, 0, 0) as i32
+}
+
+/// Maps a VMO handle into the calling process's address space.
+/// Returns the mapped virtual address or `usize::MAX` on error.
+pub fn vmo_map(handle: i32, addr: usize, size: usize, prot: u32) -> usize {
+    syscall(151, handle as usize, addr, size | ((prot as usize) << 32))
+}
+
+/// Unmaps a previously mapped VMO region.
+pub fn vmo_unmap(addr: usize, size: usize) -> i32 {
+    syscall(152, addr, size, 0) as i32
+}
+

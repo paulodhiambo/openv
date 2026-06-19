@@ -41,7 +41,7 @@
 //! [`Waker`]: https://doc.rust-lang.org/core/task/struct.Waker.html
 //! [`VecDeque`]: https://doc.rust-lang.org/alloc/collections/struct.VecDeque.html
 
-use crate::ipc::handle::{Handle, Koid, generate_koid};
+use crate::ipc::handle::{Koid, generate_koid, EpollInstance};
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -54,15 +54,15 @@ use crate::sync::Mutex;
 /// # Fields
 ///
 /// * `bytes` - The byte payload of the message.
-/// * `handles` - The [`Handle`]s (capabilities) transferred with the
+/// * `handles` - The [`KernelObject`]s (capabilities) transferred with the
 ///   message.
 ///
 /// [`Handle`]: ../handle/struct.Handle.html
 pub struct Message {
     /// The byte payload of the message.
     pub bytes: Vec<u8>,
-    /// The [`Handle`]s (capabilities) transferred with the message.
-    pub handles: Vec<Handle>,
+    /// The [`HandleEntry`]s (capabilities & rights) transferred with the message.
+    pub handles: Vec<crate::ipc::handle::HandleEntry>,
 }
 
 /// The internal state of a channel endpoint.
@@ -102,6 +102,12 @@ pub struct ChannelEndpoint {
     peer: Mutex<Weak<ChannelEndpoint>>,
     /// PID of a process blocked in a synchronous `sys_read` on this endpoint (0 = none).
     pub waiter: AtomicI32,
+    /// Registered signal observers for Port multiplexing.
+    pub observers: Mutex<Vec<crate::ipc::port::SignalObserver>>,
+    /// Epoll instances waiting for readability on this endpoint.
+    pub epoll_waiters: Mutex<Vec<Weak<EpollInstance>>>,
+    /// Direct signal waiters: (pid, signal_mask) — woken when any matching signal fires.
+    pub signal_waiters: Mutex<VecDeque<(i32, u32)>>,
 }
 
 impl ChannelEndpoint {
@@ -130,6 +136,9 @@ impl ChannelEndpoint {
             }),
             peer: Mutex::new(Weak::new()),
             waiter: AtomicI32::new(0),
+            observers: Mutex::new(Vec::new()),
+            epoll_waiters: Mutex::new(Vec::new()),
+            signal_waiters: Mutex::new(VecDeque::new()),
         });
 
         let ep2 = Arc::new(Self {
@@ -141,6 +150,9 @@ impl ChannelEndpoint {
             }),
             peer: Mutex::new(Arc::downgrade(&ep1)),
             waiter: AtomicI32::new(0),
+            observers: Mutex::new(Vec::new()),
+            epoll_waiters: Mutex::new(Vec::new()),
+            signal_waiters: Mutex::new(VecDeque::new()),
         });
 
         *ep1.peer.lock() = Arc::downgrade(&ep2);
@@ -174,10 +186,34 @@ impl ChannelEndpoint {
         // Wake any synchronous (non-async) reader blocked in sys_read.
         let waiter = peer_arc.waiter.swap(0, Ordering::Relaxed);
         if waiter > 0 {
-            crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+            crate::posix::process::enqueue(waiter);
         }
+        // Wake epoll waiters watching the peer for readability.
+        crate::ipc::handle::wake_epoll_waiters(&peer_arc.epoll_waiters);
+        peer_arc.notify_signals(peer_arc.get_signals());
         Ok(())
     }
+
+    /// Writes a message and returns the blocked waiter PID if one was waiting, without enqueuing it in RUN_QUEUE.
+    pub fn write_fast(&self, msg: Message) -> Result<Option<i32>, &'static str> {
+        let peer_arc = self.peer.lock().upgrade().ok_or("Peer closed")?;
+        let mut peer_state = peer_arc.state.lock();
+        peer_state.queue.push_back(msg);
+        if let Some(waker) = peer_state.waker.take() {
+            waker.wake();
+        }
+        drop(peer_state);
+        // Wake epoll waiters watching the peer for readability.
+        crate::ipc::handle::wake_epoll_waiters(&peer_arc.epoll_waiters);
+        let waiter = peer_arc.waiter.swap(0, Ordering::Relaxed);
+        peer_arc.notify_signals(peer_arc.get_signals());
+        if waiter > 0 {
+            Ok(Some(waiter))
+        } else {
+            Ok(None)
+        }
+    }
+
 
     /// Attempts to read a message. Returns `Poll::Pending` and registers
     /// the waker if empty.
@@ -202,6 +238,8 @@ impl ChannelEndpoint {
         let mut state = self.state.lock();
 
         if let Some(msg) = state.queue.pop_front() {
+            drop(state);
+            self.notify_signals(self.get_signals());
             Poll::Ready(Ok(msg))
         } else if state.peer_closed {
             Poll::Ready(Err("Peer closed"))
@@ -217,7 +255,82 @@ impl ChannelEndpoint {
     ///
     /// `Some(msg)` if a message is available, `None` otherwise.
     pub fn try_recv(&self) -> Option<Message> {
-        self.state.lock().queue.pop_front()
+        let res = self.state.lock().queue.pop_front();
+        if res.is_some() {
+            self.notify_signals(self.get_signals());
+        }
+        res
+    }
+
+    /// Attempts to receive a message only if it fits within the specified limits.
+    ///
+    /// If the front message is larger than the limits, returns `Err((bytes_len, handles_len))`.
+    /// If a message fits, it is removed and returned as `Ok(Some(msg))`.
+    /// If the queue is empty, returns `Ok(None)`.
+    pub fn try_recv_constrained(&self, max_bytes: usize, max_handles: usize) -> Result<Option<Message>, (usize, usize)> {
+        let mut state = self.state.lock();
+        if let Some(msg) = state.queue.front() {
+            if msg.bytes.len() > max_bytes || msg.handles.len() > max_handles {
+                return Err((msg.bytes.len(), msg.handles.len()));
+            }
+        }
+        let res = state.queue.pop_front();
+        drop(state);
+        if res.is_some() {
+            self.notify_signals(self.get_signals());
+        }
+        Ok(res)
+    }
+
+    /// Checks if the peer endpoint has been closed.
+    pub fn is_peer_closed(&self) -> bool {
+        self.state.lock().peer_closed
+    }
+
+    /// Computes the current active signal bitmask of the endpoint.
+    pub fn get_signals(&self) -> u32 {
+        let state = self.state.lock();
+        let mut sigs = 0;
+        if !state.queue.is_empty() {
+            sigs |= crate::ipc::port::SIGNAL_READABLE;
+        }
+        if !state.peer_closed {
+            sigs |= crate::ipc::port::SIGNAL_WRITABLE;
+        } else {
+            sigs |= crate::ipc::port::SIGNAL_PEER_CLOSED;
+        }
+        sigs
+    }
+
+    /// Notifies all bound ports and direct waiters if any trigger matches the current active signals.
+    pub fn notify_signals(&self, active_signals: u32) {
+        // Wake direct sys_object_wait_one waiters.
+        {
+            let mut waiters = self.signal_waiters.lock();
+            let mut i = 0;
+            while i < waiters.len() {
+                let (pid, mask) = waiters[i];
+                if active_signals & mask != 0 {
+                    waiters.remove(i);
+                    crate::posix::process::enqueue(pid);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        // Wake port observers.
+        let obs = self.observers.lock();
+        for observer in obs.iter() {
+            let triggered = active_signals & observer.trigger_signals;
+            if triggered != 0 {
+                observer.port.queue_packet(crate::ipc::port::PortPacket {
+                    key: observer.key,
+                    type_: 1,
+                    status: 0,
+                    observed_signals: active_signals,
+                });
+            }
+        }
     }
 }
 
@@ -240,8 +353,13 @@ impl Drop for ChannelEndpoint {
             // Also wake any synchronous reader so it can observe EOF.
             let waiter = peer_arc.waiter.swap(0, Ordering::Relaxed);
             if waiter > 0 {
-                crate::posix::process::RUN_QUEUE.lock().push_back(waiter);
+                crate::posix::process::enqueue(waiter);
             }
+            // Also wake any direct sys_object_wait_one waiters watching the peer.
+            for (pid, _) in peer_arc.signal_waiters.lock().drain(..) {
+                crate::posix::process::enqueue(pid);
+            }
+            peer_arc.notify_signals(peer_arc.get_signals());
         }
     }
 }
