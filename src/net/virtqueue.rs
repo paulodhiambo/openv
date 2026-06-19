@@ -216,6 +216,7 @@ impl VirtQueue {
     ///
     /// `Ok(head_descriptor_index)` on success, or `Err(())` if there
     /// are not enough free descriptors.
+    #[allow(clippy::result_unit_err)]
     pub fn enqueue_chain(&self, buffers: &[(u64, u32, bool)]) -> Result<u16, ()> {
         let mut free = self.free_list.lock();
         if free.len() < buffers.len() {
@@ -275,6 +276,7 @@ impl VirtQueue {
     ///
     /// `Ok(head_descriptor_index)` on success, or `Err(())` if there
     /// are not enough free descriptors.
+    #[allow(clippy::result_unit_err)]
     pub fn enqueue(&self, buf_pa: u64, len: u32, write: bool) -> Result<u16, ()> {
         self.enqueue_chain(&[(buf_pa, len, write)])
     }

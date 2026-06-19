@@ -155,17 +155,17 @@ fn register_epoll_with_fd(
         Some(KernelObject::PipeRead(half)) => {
             half.epoll_waiters
                 .lock()
-                .push(alloc::sync::Arc::downgrade(&ep));
+                .push(alloc::sync::Arc::downgrade(ep));
         }
         Some(KernelObject::Channel(ch)) => {
             ch.epoll_waiters
                 .lock()
-                .push(alloc::sync::Arc::downgrade(&ep));
+                .push(alloc::sync::Arc::downgrade(ep));
         }
         Some(KernelObject::Tty(tty)) => {
             tty.epoll_waiters
                 .lock()
-                .push(alloc::sync::Arc::downgrade(&ep));
+                .push(alloc::sync::Arc::downgrade(ep));
         }
         _ => {}
     }

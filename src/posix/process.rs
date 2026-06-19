@@ -622,7 +622,7 @@ impl Process {
             children: Mutex::new(Vec::new()),
             trap_frame: Mutex::new(tf),
             satp_val: AtomicUsize::new(satp_val_bits),
-            next_mmap_va: AtomicUsize::new(0x4_0000_0000 + (aslr_rand() & 0x0FFF_FFFF) & !0xFFF), // ASLR offset
+            next_mmap_va: AtomicUsize::new((0x4_0000_0000 + (aslr_rand() & 0x0FFF_FFFF)) & !0xFFF), // ASLR offset
             heap_break: AtomicUsize::new(0x2_0000_0000 + (aslr_rand() & 0x00FF_FFFF)),           // ASLR offset for brk
             kernel_stack_bottom: kstack_bottom,
             cwd: Mutex::new(cwd),

@@ -27,7 +27,7 @@ pub fn sys_write(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                 let fg = crate::posix::process::FOREGROUND_PID.load(Ordering::Relaxed);
                 if fg > 0 && pgid != fg {
                     let table = crate::posix::process::PROCESS_TABLE.lock();
-                    for (_, p) in table.iter() {
+                    for p in table.values() {
                         if p.pgid.load(Ordering::Relaxed) == pgid {
                             p.pending_signals.fetch_or(1 << crate::syscall::proc::SIGTTOU, Ordering::Relaxed);
                         }
@@ -109,7 +109,7 @@ pub fn sys_read(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                 if fg > 0 && pgid != fg {
                     // Deliver SIGTTIN to the background process group.
                     let table = crate::posix::process::PROCESS_TABLE.lock();
-                    for (_, p) in table.iter() {
+                    for p in table.values() {
                         if p.pgid.load(Ordering::Relaxed) == pgid {
                             p.pending_signals.fetch_or(1 << crate::syscall::proc::SIGTTIN, Ordering::Relaxed);
                         }
@@ -362,11 +362,9 @@ pub fn sys_close(arg0: usize, tf: &mut TrapFrame) {
     // Release POSIX file locks held by this process on the fd before closing.
     // POSIX requires releasing all locks a process holds on a file when any
     // fd to that file is closed.
-    if let Some(obj) = proc.fds.lock().get(fd) {
-        if let crate::ipc::handle::KernelObject::VfsFile(server_fd) = obj {
-            let lock_id = *server_fd as u64;
-            crate::syscall::ipc::release_fd_locks(lock_id, pid);
-        }
+    if let Some(crate::ipc::handle::KernelObject::VfsFile(server_fd)) = proc.fds.lock().get(fd) {
+        let lock_id = *server_fd as u64;
+        crate::syscall::ipc::release_fd_locks(lock_id, pid);
     }
 
     if proc.fds.lock().remove(fd).is_some() {
@@ -648,7 +646,7 @@ pub fn sys_fstat(arg0: usize, arg1: usize, tf: &mut TrapFrame) {
     let fds = proc.fds.lock();
     match fds.get(arg0 as u32) {
         Some(obj) => {
-            let (mode, rdev) = match &*obj {
+            let (mode, rdev) = match obj {
                 crate::ipc::handle::KernelObject::Tty(_) => (0o020200u32, 0u64),
                 crate::ipc::handle::KernelObject::PipeRead(_) |
                 crate::ipc::handle::KernelObject::PipeWrite(_) => (0o010644u32, 0u64),

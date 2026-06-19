@@ -41,6 +41,7 @@ struct LockEntry {
 static FILE_LOCKS: Mutex<BTreeMap<u64, Vec<LockEntry>>> = Mutex::new(BTreeMap::new());
 
 /// file_id → list of (pid, l_type, l_start, l_end) processes blocked in F_SETLKW.
+#[allow(clippy::type_complexity)]
 static LOCK_WAITERS: Mutex<BTreeMap<u64, Vec<(i32, i16, i64, i64)>>> =
     Mutex::new(BTreeMap::new());
 
@@ -747,7 +748,6 @@ pub fn sys_fcntl(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
                     drop(proc);
                     crate::posix::process::schedule();
                     // NOTE: regs[10] is set to 0 by wake_lock_waiters when woken.
-                    return;
                 }
                 _ => unreachable!(),
             }

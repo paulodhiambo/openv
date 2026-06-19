@@ -884,6 +884,7 @@ pub const SIGTTOU: usize = 22;
 /// * `arg1` (`a1`) - Signal number (0..31). `0` is a permission
 ///   check that does not actually deliver.
 /// * `tf` - Caller's trap frame.
+///
 /// Wake a Stopped process with EINTR so a pending signal is delivered on the
 /// next return-to-user-space.  Must be called while PROCESS_TABLE is held.
 ///

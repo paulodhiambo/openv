@@ -329,7 +329,7 @@ pub fn exit(pid: Pid, status: i32) {
 
         for pgid in pgids {
             let mut is_orphaned = true;
-            for (_, p) in table.iter() {
+            for p in table.values() {
                 if p.pgid.load(Ordering::Relaxed) != pgid { continue; }
                 let ppid = p.ppid.load(Ordering::Relaxed);
                 if ppid == pid { continue; }
@@ -343,7 +343,7 @@ pub fn exit(pid: Pid, status: i32) {
             }
 
             if is_orphaned {
-                for (_, p) in table.iter() {
+                for p in table.values() {
                     if p.pgid.load(Ordering::Relaxed) != pgid { continue; }
                     p.pending_signals.fetch_or(1 << 1 | 1 << 18, Ordering::Relaxed);
                     let mut state = p.state.lock();
