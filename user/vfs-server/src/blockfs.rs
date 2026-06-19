@@ -931,7 +931,7 @@ fn dirent_write(buf: &mut [u8; BLOCK_SIZE], byte_off: usize, ino: u32, name: &[u
     buf[byte_off + 8..byte_off + 8 + name.len()].copy_from_slice(name);
 }
 
-fn dirent_name<'a>(buf: &'a [u8; BLOCK_SIZE], byte_off: usize, name_len: usize) -> &'a [u8] {
+fn dirent_name(buf: &[u8; BLOCK_SIZE], byte_off: usize, name_len: usize) -> &[u8] {
     &buf[byte_off + 8..byte_off + 8 + name_len]
 }
 

@@ -660,6 +660,7 @@ unsafe fn cstr_slice(ptr: *const u8) -> &'static [u8] {
 }
 
 #[unsafe(no_mangle)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub extern "C" fn main(argc: i32, argv: *const *const u8) -> i32 {
     if argc < 2 { return usage(); }
     let cmd = unsafe { cstr_slice(*argv.add(1)) };

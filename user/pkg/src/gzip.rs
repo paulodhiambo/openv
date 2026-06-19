@@ -298,10 +298,10 @@ fn inflate_to<O: InflateOut>(data: &[u8], output: &mut O) -> Option<()> {
                         for _ in 0..repeat { lengths.push(prev); }
                     } else if sym == 17 {
                         let repeat = reader.read_bits(3)? as usize + 3;
-                        for _ in 0..repeat { lengths.push(0); }
+                        lengths.extend(core::iter::repeat_n(0u8, repeat));
                     } else if sym == 18 {
                         let repeat = reader.read_bits(7)? as usize + 11;
-                        for _ in 0..repeat { lengths.push(0); }
+                        lengths.extend(core::iter::repeat_n(0u8, repeat));
                     }
                 }
 

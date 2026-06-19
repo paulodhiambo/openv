@@ -46,7 +46,7 @@ fn extract_name(data: &[u8]) -> Option<String> {
     let name_len = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
     if name_len == 0 || 4 + name_len > data.len() { return None; }
     let name_bytes = &data[4..4 + name_len];
-    core::str::from_utf8(name_bytes).ok().map(|s| String::from(s))
+    core::str::from_utf8(name_bytes).ok().map(String::from)
 }
 
 #[unsafe(no_mangle)]
@@ -118,16 +118,11 @@ pub extern "C" fn main(_argc: usize, _argv: usize) -> i32 {
 
             OP_UNREGISTER => {
                 match extract_name(&msg.data) {
-                    Some(name) => {
-                        // Only allow a component to unregister itself.
-                        if registry.get(&name).copied() == Some(sender) {
-                            registry.remove(&name);
-                            reply.type_ = REPLY_OK;
-                        } else {
-                            reply.type_ = REPLY_ERR;
-                        }
+                    Some(name) if registry.get(&name).copied() == Some(sender) => {
+                        registry.remove(&name);
+                        reply.type_ = REPLY_OK;
                     }
-                    None => { reply.type_ = REPLY_ERR; }
+                    _ => { reply.type_ = REPLY_ERR; }
                 }
             }
 

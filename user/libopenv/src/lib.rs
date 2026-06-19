@@ -15,6 +15,10 @@ use core::ffi::{c_char, c_int, c_void};
 
 /// Open a file. Returns fd on success, -1 on error.
 /// Dispatches to VFS server if available, otherwise falls back to kernel.
+///
+/// # Safety
+///
+/// `path` must be a valid null-terminated C string or null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn openv_open(path: *const c_char, flags: c_int, mode: c_int) -> c_int {
     let _ = mode;
@@ -36,6 +40,10 @@ pub unsafe extern "C" fn openv_open(path: *const c_char, flags: c_int, mode: c_i
 }
 
 /// Read from a file descriptor.
+///
+/// # Safety
+///
+/// `buf` must point to a writable buffer of at least `count` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn openv_read(fd: c_int, buf: *mut c_void, count: usize) -> isize {
     // Check if this fd has a VFS backing.
@@ -48,6 +56,10 @@ pub unsafe extern "C" fn openv_read(fd: c_int, buf: *mut c_void, count: usize) -
 }
 
 /// Write to a file descriptor.
+///
+/// # Safety
+///
+/// `buf` must point to a readable buffer of at least `count` bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn openv_write(fd: c_int, buf: *const c_void, count: usize) -> isize {
     let vfs_fd = unsafe { syscall3(SYS_FCNTL, fd as usize, 6, 0) };
@@ -59,6 +71,10 @@ pub unsafe extern "C" fn openv_write(fd: c_int, buf: *const c_void, count: usize
 }
 
 /// Close a file descriptor.
+///
+/// # Safety
+///
+/// `fd` must be a valid open file descriptor owned by the calling process.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn openv_close(fd: c_int) -> c_int {
     let vfs_fd = unsafe { syscall3(SYS_FCNTL, fd as usize, 6, 0) };

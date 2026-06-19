@@ -559,7 +559,7 @@ impl Ext2State {
             let block_idx = pos / BLOCK_SIZE;
             let _block_off = pos % BLOCK_SIZE;
             let blk = self.get_file_block(&mut inode.clone(), dir_ino, block_idx as u32, false);
-            if blk.is_none() { return None; }
+            blk?;
             let mut buf = [0u8; BLOCK_SIZE];
             if !self.read_block(blk.unwrap(), &mut buf) { return None; }
 

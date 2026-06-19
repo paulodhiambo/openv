@@ -19,6 +19,7 @@ const ITYPE_SYMLINK_ENTRY: u8 = 3;
 
 // ── Block filesystem dispatch ────────────────────────────────────────────────
 
+#[allow(clippy::large_enum_variant)]
 enum BlockFs {
     Ofs(blockfs::OfsState),
     Ext2(ext2::Ext2State),
@@ -84,11 +85,7 @@ impl BlockFs {
                         new_path.push('/');
                         new_path.push_str(components[j]);
                     }
-                    if new_path.is_empty() {
-                        new_path.push('/');
-                    } else {
-                        new_path.push('/');
-                    }
+                    new_path.push('/');
                     new_path.push_str(target);
                 }
                 for j in (i + 1)..n {
@@ -1008,13 +1005,12 @@ fn forward_proc_stat(proc_pid: i32, path: &str) -> Option<(bool, u64)> {
     if path == "/proc" {
         req.data[0..4].copy_from_slice(&0i32.to_le_bytes()); // pid=0
         req.data[4] = 1; // dir query
-    } else if let Some(rest) = path.strip_prefix("/proc/") {
+    } else {
+        let rest = path.strip_prefix("/proc/")?;
         let (pid_str, sub) = rest.split_once('/').unwrap_or((rest, ""));
         let pid: i32 = pid_str.parse().ok()?;
         req.data[0..4].copy_from_slice(&pid.to_le_bytes());
         req.data[4] = if sub.is_empty() { 1 } else { 0 }; // dir vs file
-    } else {
-        return None;
     }
 
     libos::msg_send(proc_pid, &req);
@@ -1474,10 +1470,9 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
                 let (dir_ino, etype) = match ofs.lookup_path(&parent) { Some(r) => r, None => { reply_err(client, msg); return; } };
                 if etype != ITYPE_DIR_ENTRY { reply_err(client, msg); return; }
                 let child_ino = match ofs.create_inode(ITYPE_SYMLINK_ENTRY) { Some(i) => i, None => { reply_err(client, msg); return; } };
-                if ofs.file_write(child_ino, 0, target.as_bytes()).is_err() {
-                    ofs.free_inode(child_ino);
-                    false
-                } else if !ofs.dir_add_entry(dir_ino, &name, child_ino, ITYPE_SYMLINK_ENTRY) {
+                if ofs.file_write(child_ino, 0, target.as_bytes()).is_err()
+                    || !ofs.dir_add_entry(dir_ino, &name, child_ino, ITYPE_SYMLINK_ENTRY)
+                {
                     ofs.free_inode(child_ino);
                     false
                 } else {
