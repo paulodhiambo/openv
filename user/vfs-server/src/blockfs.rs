@@ -42,9 +42,9 @@ pub const ITYPE_FILE: u8 = 1;
 pub const ITYPE_DIR: u8  = 2;
 pub const ITYPE_SYMLINK: u8 = 3;
 
-pub const ITYPE_FILE_ENTRY: u8 = 1;
+#[allow(dead_code)] pub const ITYPE_FILE_ENTRY: u8 = 1;
 pub const ITYPE_DIR_ENTRY: u8  = 2;
-pub const ITYPE_SYMLINK_ENTRY: u8 = 3;
+#[allow(dead_code)] pub const ITYPE_SYMLINK_ENTRY: u8 = 3;
 
 pub const ROOT_INODE: u32 = 0;
 
@@ -515,6 +515,7 @@ impl OfsState {
         None
     }
 
+    #[allow(dead_code)]
     pub fn lookup_path(&mut self, path: &str) -> Option<(u32, u8)> {
         let mut cur_ino  = ROOT_INODE;
         let mut cur_type = ITYPE_DIR_ENTRY;
@@ -645,7 +646,7 @@ impl OfsState {
             for slot in 0..DIRENTRIES_PER_BLOCK {
                 if seen >= total_entries { break; }
                 let byte_off = slot * DIRENTRY_SIZE;
-                let (de_inode, de_name_len, de_entry_type, name_start) = dirent_read(&buf, byte_off);
+                let (de_inode, de_name_len, de_entry_type, _name_start) = dirent_read(&buf, byte_off);
                 seen += 1;
                 if de_name_len == 0 { continue; }
                 let name = dirent_name(&buf, byte_off, de_name_len as usize);

@@ -629,7 +629,7 @@ static FD_FLAGS: Mutex<BTreeMap<(i32, u32), usize>> = Mutex::new(BTreeMap::new()
 
 pub fn sys_fcntl(arg0: usize, arg1: usize, arg2: usize, tf: &mut TrapFrame) {
     use crate::ipc::handle::KernelObject;
-    use crate::posix::process::{PROCESS_TABLE, ProcState, IpcState, enqueue_with_prio};
+    use crate::posix::process::{ProcState, IpcState};
     use crate::mm::vmm::is_user_pointer_valid;
 
     let proc = crate::get_current_proc_or_esrch!(tf);

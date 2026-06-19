@@ -69,10 +69,10 @@ all: build run
 
 # ── Build ──────────────────────────────────────────────────────────────────────
 
-build: build-user initrd build-kernel
+build: build-user initrd build-kernel $(DISK_IMG)
 	@echo 'Build complete.  Run: make run'
 
-build-release: build-user-release initrd build-kernel-release
+build-release: build-user-release initrd build-kernel-release $(DISK_IMG)
 	@echo 'Release build complete.  Run: make run'
 
 build-kernel:

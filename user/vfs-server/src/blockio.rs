@@ -2,6 +2,7 @@ use core::fmt;
 use libos::ipc::Message;
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum FsError {
     NotFound,
     NotFile,
@@ -34,6 +35,7 @@ impl fmt::Display for FsError {
     }
 }
 
+#[allow(dead_code)]
 pub struct InodeInfo {
     pub itype: u8,
     pub size: u32,

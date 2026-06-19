@@ -43,6 +43,7 @@ impl BlockFs {
         self.lookup_path_depth(path, 8, true)
     }
 
+    #[allow(dead_code)]
     fn lookup_path_nofollow(&mut self, path: &str) -> Option<(u32, u8)> {
         self.lookup_path_depth(path, 8, false)
     }
@@ -1598,7 +1599,7 @@ fn dispatch(namespaces: &mut BTreeMap<u32, Vfs>, open_table: &mut OpenTable, mut
             reply_ok(client, msg);
         }
         OP_FUTIMENS => {
-            let (fd, ats, atns, mts, mtns) = unpack_futimens_req(&msg.data);
+            let (fd, ats, _atns, mts, _mtns) = unpack_futimens_req(&msg.data);
             let (path, file_ns) = match open_table.get(fd) {
                 Some(f) => (f.path.clone(), f.ns_id),
                 None => { reply_err(client, msg); return; }
